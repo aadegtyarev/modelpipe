@@ -224,28 +224,6 @@ export function validateConfig(config) {
     if (route.vision !== undefined && typeof route.vision !== "boolean") {
       throw new Error(`${at}.vision: must be a boolean (default true) when present`);
     }
-    // models_url + models_format: OPTIONAL, meaningful only on a glob route — the
-    // provider's own model-listing endpoint, fetched by GET /v1/models?expand=1 to resolve
-    // the glob into the concrete ids it currently matches. base_url is the messages
-    // endpoint and tells us nothing about where a provider's catalog lives (the path
-    // differs per provider), so this is a separate, explicit field — never guessed.
-    // Both or neither: a models_format with no models_url has nothing to parse; a
-    // models_url with no format is ambiguous about how to read the response.
-    if (route.models_url !== undefined) {
-      if (typeof route.models_url !== "string" || route.models_url.length === 0) {
-        throw new Error(`${at}.models_url: must be a non-empty string`);
-      }
-      try {
-        new URL(route.models_url);
-      } catch {
-        throw new Error(`${at}.models_url: not a valid URL`);
-      }
-      if (route.models_format !== "openai" && route.models_format !== "anthropic") {
-        throw new Error(`${at}.models_format: required ("openai" or "anthropic") when models_url is set`);
-      }
-    } else if (route.models_format !== undefined) {
-      throw new Error(`${at}.models_format: only valid when models_url is set`);
-    }
     // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
     // OR a key-swap object { header, keyEnv, scheme? }.
     if (route.auth === "passthrough") continue;
@@ -297,10 +275,6 @@ export function listConfig(config) {
     if (route.forImages !== undefined) out.forImages = route.forImages;
     if (route.forImagesModel !== undefined) out.forImagesModel = route.forImagesModel;
     if (route.vision !== undefined) out.vision = route.vision;
-    if (route.models_url !== undefined) {
-      out.models_url = route.models_url;
-      out.models_format = route.models_format;
-    }
     return out;
   });
   return safe;
@@ -329,148 +303,6 @@ export function listModels(config) {
       for_images: r.forImages === true,                  // the forImages vision-fallback flag
     };
   });
-}
-
-// ── GET /v1/models?expand=1 — glob expansion against the backend's own catalog ────
-//
-// The default listModels() above returns the route table AS CONFIGURED — a glob
-// (`glm-*`) stays a glob. expand=1 resolves a glob route into the CONCRETE ids it
-// currently matches, by fetching the provider's own model-listing endpoint
-// (`models_url`) and filtering its catalog through the same `match` glob. Opt-in via
-// query param so the default response is byte-for-byte unchanged (existing consumers,
-// e.g. --probe, are unaffected).
-
-// A model catalog can be larger than the small 400-error bodies REROUTE_BUFFER_CAP was
-// sized for (a provider can list hundreds of ids) — its own, more generous cap.
-const MODELS_CATALOG_BUFFER_CAP = 256 * 1024;
-// Per-process-instance cache TTL for a fetched catalog — providers don't expect their
-// model-listing endpoint to be hit on every client probe.
-const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
-const MODELS_FETCH_TIMEOUT_MS = 5000;
-
-// Parse a model-catalog response body into an array of model id strings. Both supported
-// `models_format`s ("openai" and "anthropic") ship the same `{ data: [{ id, ... }] }`
-// shape over the wire — the field exists for clarity/forward-compat, not because the
-// parse differs today. Throws on bad JSON or a missing/non-array `data` (fail-closed: the
-// caller falls back to the unexpanded glob rather than serve a partial/garbage id list).
-export function parseModelsCatalog(body) {
-  const parsed = JSON.parse(body.toString("utf8"));
-  if (!parsed || !Array.isArray(parsed.data)) throw new Error("models catalog: response has no data[] array");
-  return parsed.data.map((m) => m && m.id).filter((id) => typeof id === "string");
-}
-
-// Fetch (or return the cached) array of model ids from a route's models_url. `cache` is
-// the per-router-instance Map(models_url → { ids, expiresAt }) passed down from
-// createRouter. Auth mirrors the normal proxy hop: a key-swap route resolves its own
-// backend key (resolveAuthHeader); a passthrough route forwards the CLIENT's incoming
-// auth header unchanged (it has no backend key of its own — same rule as proxyToRoute).
-// Rejects on any failure (bad URL, network error, non-200, oversize/unparseable body) —
-// the caller (expandRouteEntry) catches and falls back to the unexpanded glob; this
-// function never reaches further than one HTTP round trip and never throws past its
-// Promise.
-function fetchModelCatalog(route, req, cache) {
-  const cached = cache.get(route.models_url);
-  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.ids);
-
-  return new Promise((resolve, reject) => {
-    let target;
-    try {
-      target = new URL(route.models_url);
-    } catch (err) {
-      reject(err);
-      return;
-    }
-
-    const headers = {};
-    if (isPassthrough(route)) {
-      if (req.headers["x-api-key"]) headers["x-api-key"] = req.headers["x-api-key"];
-      if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"];
-    } else {
-      let auth;
-      try {
-        auth = resolveAuthHeader(route);
-      } catch (err) {
-        reject(err);
-        return;
-      }
-      headers[auth.name] = auth.value;
-    }
-
-    const client = target.protocol === "http:" ? http : https;
-    const upstreamReq = client.request(
-      {
-        protocol: target.protocol,
-        hostname: target.hostname,
-        port: target.port || (target.protocol === "http:" ? 80 : 443),
-        path: target.pathname + target.search,
-        method: "GET",
-        headers,
-      },
-      (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          reject(new Error(`models_url returned status ${res.statusCode}`));
-          return;
-        }
-        bufferResponse(res, MODELS_CATALOG_BUFFER_CAP, (err, buffered) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          let ids;
-          try {
-            ids = parseModelsCatalog(buffered);
-          } catch (parseErr) {
-            reject(parseErr);
-            return;
-          }
-          cache.set(route.models_url, { ids, expiresAt: Date.now() + MODELS_CACHE_TTL_MS });
-          resolve(ids);
-        });
-      },
-    );
-    upstreamReq.on("error", reject);
-    upstreamReq.setTimeout(MODELS_FETCH_TIMEOUT_MS, () => upstreamReq.destroy(new Error("models_url request timed out")));
-    upstreamReq.end();
-  });
-}
-
-// One route's contribution to the expand=1 listing. `baseEntry` is this route's safe
-// listModels() projection (id/object/host/auth/vision/for_images) — reused so there is
-// one source of truth for those fields; this function only adds `match` + `concrete` and,
-// for an expanded glob, swaps `id` to each matched concrete id.
-//   • match has no `*` (already concrete)         → baseEntry as-is, concrete: true.
-//   • match is a glob, no models_url configured    → baseEntry as-is, concrete: false.
-//   • match is a glob, models_url configured       → fetch the catalog, filter by the
-//     glob, return one entry per matched id, concrete: true.
-//   • ANY failure above (network/auth/parse/no match) → falls back to the unexpanded
-//     glob, concrete: false — a route never throws the whole endpoint down; partial
-//     success (one backend's catalog up, another's down) is the normal case.
-function expandRouteEntry(route, baseEntry, req, cache) {
-  if (!route.match.includes("*")) {
-    return Promise.resolve([{ ...baseEntry, match: route.match, concrete: true }]);
-  }
-  const fallback = [{ ...baseEntry, match: route.match, concrete: false }];
-  if (!route.models_url) return Promise.resolve(fallback);
-  return fetchModelCatalog(route, req, cache)
-    .then((ids) => {
-      const re = globToRegExp(route.match);
-      const matched = ids.filter((id) => re.test(id));
-      if (matched.length === 0) return fallback;
-      return matched.map((id) => ({ ...baseEntry, id, match: route.match, concrete: true }));
-    })
-    .catch(() => fallback);
-}
-
-// The expand=1 view of GET /v1/models — see the section comment above. Built on
-// listModels (one source of truth for the safe per-route fields); each route resolves
-// independently via expandRouteEntry, which never rejects, so Promise.all here can't
-// reject either — one backend's catalog being down never blocks another's expansion or
-// fails the whole endpoint.
-export function expandModels(config, req, cache) {
-  const baseEntries = listModels(config);
-  return Promise.all(config.routes.map((route, i) => expandRouteEntry(route, baseEntries[i], req, cache)))
-    .then((groups) => ({ object: "list", data: groups.flat() }));
 }
 
 // The opt-in stderr logger: a no-op unless MODEL_ROUTER_LOG=1. Logs only the
@@ -742,33 +574,16 @@ export function createRouter(config, options = {}) {
   // so a repeat image call pre-routes to the vision target without the failing first
   // hop. Ephemeral, holds only model ids — never any request payload.
   const nonVisionCache = new Map();
-  // Per-router-instance cache of a backend's fetched model catalog (expand=1). See the
-  // GET /v1/models?expand=1 section above.
-  const modelsCache = new Map();
   return http.createServer((req, res) => {
     // GET /v1/models (and the bare /models) returns the configured routes as a
     // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
     // it needs no request body and never reaches a backend — everything else (POST
     // messages, passthrough, the vision reroute) flows through readBody → forward unchanged.
-    if (req.method === "GET") {
-      const url = new URL(req.url, "http://placeholder"); // base is required by the ctor; never used
-      if (url.pathname === "/v1/models" || url.pathname === "/models") {
-        if (url.searchParams.get("expand") === "1") {
-          // expand=1: resolve each glob route against its backend's own catalog
-          // (models_url). Opt-in — the plain GET below is byte-for-byte unchanged.
-          expandModels(config, req, modelsCache)
-            .then((payload) => {
-              res.writeHead(200, { "content-type": "application/json" });
-              res.end(JSON.stringify(payload));
-            })
-            .catch(() => sendError(res, 502, "failed to build the expanded model listing"));
-          return;
-        }
-        const payload = JSON.stringify({ object: "list", data: listModels(config) });
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(payload);
-        return;
-      }
+    if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
+      const payload = JSON.stringify({ object: "list", data: listModels(config) });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(payload);
+      return;
     }
     readBody(req, maxBytes)
       .then((body) => forward(config, req, res, body, log, nonVisionCache))
