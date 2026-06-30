@@ -6,7 +6,9 @@
     "auth": "EITHER the string \"passthrough\" (forward the client's own auth header unchanged — for a subscription/OAuth session with no backend key) OR an object { header, keyEnv, scheme? }: the header name to send the backend key under, the NAME of the env var holding the key (read at request time, never logged), and an OPTIONAL scheme prefix (\"Bearer\" yields `Authorization: Bearer <key>`; omit for a raw value like `x-api-key: <key>`)",
     "forImages": "OPTIONAL true on exactly ONE route — marks it the vision fallback target. When a backend rejects an image-bearing request with an image-unsupported 400, modelpipe reroutes the request to this route.",
     "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects (e.g. an OpenRouter vendor/model id like google/gemini-2.5-flash-lite). On reroute, ONLY the body's `model` is rewritten to this; the rest of the body (the image bytes) is untouched. This is the one scoped exception to passthrough — the reroute crosses to a different provider, so the client's original model id (which that backend does not know) must be replaced. Fail-closed: a forImages route with no forImagesModel is a config error at startup.",
-    "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision, so an image-bearing request is routed STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot help there. Text-only turns route normally. Inert with no forImages route configured."
+    "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision, so an image-bearing request is routed STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot help there. Text-only turns route normally. Inert with no forImages route configured.",
+    "models_url": "OPTIONAL, meaningful only on a glob route — the provider's OWN model-listing endpoint (NOT base_url + /v1/models: base_url is the messages endpoint, and the catalog path differs per provider). When set, GET /v1/models?expand=1 fetches it and resolves this route's glob into the concrete ids it currently matches. Omit it and the route just stays an unexpanded glob under expand=1 (concrete:false) — modelpipe never guesses the catalog path.",
+    "models_format": "REQUIRED when models_url is set: \"openai\" or \"anthropic\" — both ship the same `{ data: [{ id }] }` shape modelpipe reads; the flag is documentation of which provider convention you copied the URL from."
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "routes": [
@@ -19,6 +21,13 @@
       "match": "deepseek-*",
       "base_url": "https://api.deepseek.com/anthropic",
       "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" }
+    },
+    {
+      "match": "glm-*",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "models_url": "https://api.z.ai/api/paas/v4/models",
+      "models_format": "openai",
+      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY" }
     },
     {
       "match": "vision-*",
