@@ -2,16 +2,22 @@
 // modelpipe — start the passthrough Anthropic-format model router from a routes config.
 //
 //   modelpipe <config.json> [--port N]
+//   modelpipe <config.json> --list
 //
 // Loads + validates the routes config (fail-closed: a missing/bad config exits non-zero
 // with a clear message and serves nothing), starts the router, prints the listen URL to
 // STDERR, and runs until killed (Ctrl-C / SIGTERM). The config's listen.host/port are the
 // default; --port overrides the port. No secret/body logging (set MODEL_ROUTER_LOG=1 for
 // the opt-in `model -> host` routing line on stderr).
+//
+// --list: load + validate the config, print a SAFE JSON summary of the route table to
+// STDOUT, and exit — no server, no network. Lets a client setup dialog discover what
+// this modelpipe is configured for. The summary carries the keyEnv NAME only, never a
+// key value (listConfig in src/router.mjs is the safe-surface whitelist).
 
-import { createRouter, loadConfig } from "../src/router.mjs";
+import { createRouter, loadConfig, listConfig } from "../src/router.mjs";
 
-const USAGE = "usage: modelpipe <config.json> [--port N]";
+const USAGE = "usage: modelpipe <config.json> [--port N] | modelpipe <config.json> --list";
 
 function fail(message) {
   process.stderr.write(`modelpipe: ${message}\n${USAGE}\n`);
@@ -22,6 +28,7 @@ function fail(message) {
 function parseArgs(argv) {
   let configPath = null;
   let port = null;
+  let list = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--port") {
@@ -30,6 +37,8 @@ function parseArgs(argv) {
       port = val;
     } else if (arg.startsWith("--port=")) {
       port = arg.slice("--port=".length);
+    } else if (arg === "--list") {
+      list = true;
     } else if (arg === "-h" || arg === "--help") {
       process.stdout.write(`${USAGE}\n`);
       process.exit(0);
@@ -41,7 +50,7 @@ function parseArgs(argv) {
       fail(`unexpected extra argument "${arg}"`);
     }
   }
-  return { configPath, port };
+  return { configPath, port, list };
 }
 
 function resolvePort(rawPort, config) {
@@ -54,7 +63,7 @@ function resolvePort(rawPort, config) {
 }
 
 function main() {
-  const { configPath, port: rawPort } = parseArgs(process.argv.slice(2));
+  const { configPath, port: rawPort, list } = parseArgs(process.argv.slice(2));
   if (!configPath) fail("a routes config file is required");
 
   let config;
@@ -64,6 +73,13 @@ function main() {
     // Covers a missing file, unreadable file, bad JSON, and a config that fails
     // validateConfig — all fail-closed: report and exit, never serve a half-valid config.
     fail(`could not load config "${configPath}": ${err.message}`);
+  }
+
+  // --list: print the safe route-table summary to STDOUT and exit — no server, no
+  // network. The summary is secret-free (keyEnv NAME only — listConfig is the whitelist).
+  if (list) {
+    process.stdout.write(`${JSON.stringify(listConfig(config), null, 2)}\n`);
+    return;
   }
 
   const host = (config.listen && config.listen.host) || "127.0.0.1";
