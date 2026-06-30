@@ -183,6 +183,15 @@ no server. Each route shows its `match`, `base_url`, the auth header/scheme, the
 env-var **name** (never a key value), and the `forImages` / `forImagesModel` / `vision`
 flags. Useful for a setup dialog or a quick sanity check.
 
+### `GET /v1/models` — the network-facing, stricter view
+
+`GET /v1/models` (or the bare `GET /models`) returns the same route table over HTTP as a
+model listing — the network-facing counterpart to `--list`, but **stricter**: it exposes
+only each route's `match` glob, backend `host`, auth **mode** (`"passthrough"` or `"key"`),
+and vision flags. No key env-var name, no auth header, no base path is ever sent over the
+wire (a network endpoint is reachable by any client, so it must leak less than the
+localhost `--list`). Handy for a setup probe against a running router.
+
 ## Verifying routing — `MODEL_ROUTER_LOG`
 
 ```sh
