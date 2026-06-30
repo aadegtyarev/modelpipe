@@ -1,106 +1,132 @@
 # modelpipe
 
-A passthrough **Anthropic-format** model router. Point any Anthropic-format client
-at one local endpoint, and modelpipe forwards each request to a chosen backend based
-on the model id in the request body — different model tiers to different providers,
-under one `ANTHROPIC_BASE_URL`.
+A passthrough **Anthropic-format** model router. Point an Anthropic-format client
+at one local endpoint and modelpipe forwards each request to a chosen backend based
+on the model id in the request body — route different model ids to different backends,
+all behind a single `ANTHROPIC_BASE_URL`.
 
-**Passthrough, no translator.** Both ends speak the Anthropic Messages API, so there is
-nothing to translate — modelpipe chooses a backend and swaps the auth header. The request
-body is forwarded as-is, with **one** scoped exception: on a vision-fallback reroute the
-body's `model` field is rewritten to the target route's `forImagesModel` (see below),
-because that hop crosses to a different provider. No format translation, ever.
+It is **Claude-Code-first and standalone**: it needs no protocol, no wrapper, and no
+account beyond the backend keys you already have. Start it, point Claude Code at it,
+and your `sonnet`/`opus`/`haiku` aliases land on whichever providers you choose.
 
-## What it does
-
-modelpipe routes **any model-bearing call a client makes** to a chosen Anthropic-format
-backend:
-
-- **The model tiers across different providers** — send `opus`/`sonnet`/`haiku`-class
-  ids to whichever backend you want for each (e.g. Anthropic for one tier, DeepSeek or
-  z.ai GLM for another), all behind a single endpoint.
-- **A guard / auxiliary model** — opt-in; any model id your client emits can get its own
-  route. Ids you do not route are simply left untouched.
-- **An image-turn vision fallback** — when a backend rejects an image-bearing request with
-  an "image not supported" 400, modelpipe reroutes that same request to a configured
-  `forImages` vision backend (reactive catch-400). Any other 400 is relayed verbatim.
-
-It works with **any Anthropic-format client** — the Anthropic SDK, Cline, Cursor's
-Anthropic mode, Claude Code, anything that speaks the Messages API. It is **not**
-Claude-Code-specific. The routing **richness scales with how many distinct model-ids the
-client emits**: a client that only ever sends one model gets one route; a client that
-emits a rich set of ids (Claude Code does) gets the richest routing.
-
-### What modelpipe is NOT
-
-- **Not a translator.** Anthropic Messages API format only, forever. OpenAI-shaped
-  providers are out of scope by design.
-- **Not per-role automatic cross-model review.** Routing *by model id* is all modelpipe
-  does. Automatically running, say, a reviewer agent on a *different* model from the
-  builder is a **separate upstream protocol's** job — that orchestration decides which
-  role gets which model id and is layered *on top of* modelpipe as the transport.
-  modelpipe just carries whatever ids it is handed to the right backend.
-
-## Install
-
-Run it directly with no install:
+## Quick start
 
 ```sh
-npx modelpipe routes.json
+npx modelpipe routes.json            # run with no install
+# or: npm i -g modelpipe && modelpipe routes.json
 ```
 
-Or install globally:
+Requires Node.js >= 18, no dependencies (Node built-ins only). It prints the listen
+URL to stderr and runs until killed (Ctrl-C). Then point your client at it:
 
 ```sh
-npm i -g modelpipe
-modelpipe routes.json
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 ```
 
-Requires Node.js >= 18. No dependencies (Node built-ins only).
+For Claude Code specifically — including the model-alias env recipe and the
+**restart caveat** — read the next section. For any other Anthropic-format client,
+setting `ANTHROPIC_BASE_URL` is usually all you need (see [Other clients](#other-clients)).
 
-## Usage
+Write your route table by copying [`routes.example.json`](routes.example.json) and
+filling in the env-var names it references; provider endpoints come from
+[`providers.json`](providers.json).
 
-1. Write a routes config (see below), e.g. `routes.json`.
-2. Start the router:
+## Claude Code setup
 
-   ```sh
-   modelpipe routes.json            # uses the config's listen.host/port
-   modelpipe routes.json --port 8800   # override the port
-   ```
+This is the load-bearing part. Claude Code decides **which model id it sends** from a
+handful of environment variables; modelpipe decides **where that id goes**. Set the env
+once, restart Claude Code, and every alias routes through the proxy.
 
-   It prints the listen URL to stderr and runs until killed (Ctrl-C).
-3. Point your Anthropic-format client at it:
+### The env recipe
 
-   ```sh
-   export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-   ```
+| Variable | Set it to | What it does |
+| --- | --- | --- |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8787` | Sends every Claude Code request to modelpipe instead of `api.anthropic.com`. |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | your backend's model id for the `sonnet` alias | Resolves `sonnet` to this id, which becomes the `body.model` modelpipe routes on. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | your backend's model id for the `haiku` alias **and** background calls | Resolves `haiku` **and** Claude Code's background/auxiliary calls to this id. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | your backend's model id for the `opus` alias | Resolves `opus` (and `opusplan` in Plan Mode) to this id. |
+| `CLAUDE_CONFIG_DIR` | a separate dir, e.g. `~/.claude-modelpipe` | Keeps this routed profile from disturbing your normal Claude Code config. |
 
-Optional: set `MODEL_ROUTER_LOG=1` for a safe `model -> host` routing line on stderr
-(never a key, body, or header).
+The chain for one request is:
 
-Discover what a config is wired for without starting the router:
+```
+Claude Code alias (sonnet/haiku/opus)
+  → ANTHROPIC_DEFAULT_*_MODEL resolves it to a concrete model id
+  → that id is sent as body.model
+  → modelpipe matches body.model against your routes and forwards to the backend
+```
+
+So the **id you put in `ANTHROPIC_DEFAULT_*_MODEL` must be one your routes target** —
+see [The routing model](#the-routing-model) below.
+
+**The guard / background model.** Claude Code makes background calls (titles, small
+auxiliary tasks) on its `haiku` alias, which resolves via `ANTHROPIC_DEFAULT_HAIKU_MODEL`.
+Set that variable so those calls route to a backend you chose; leave it unset and they
+fall to wherever the default `haiku` id lands. (`ANTHROPIC_SMALL_FAST_MODEL` was the old
+name for this and is deprecated in favour of `ANTHROPIC_DEFAULT_HAIKU_MODEL` — use the
+new one.)
+
+> **Why the env vars take effect here.** Claude Code applies the `ANTHROPIC_DEFAULT_*_MODEL`
+> aliases when `ANTHROPIC_BASE_URL` points at a gateway (which modelpipe is) — not when
+> talking directly to `api.anthropic.com`. Pointing at modelpipe is exactly the condition
+> that turns them on.
+
+### Setting the env — two ways, both read at startup
+
+**(a) `.claude/settings.json` `env` block** — declarative, no wrapper. Claude Code
+applies this block to every session and subprocess it spawns:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-chat",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-chat",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8"
+  }
+}
+```
+
+**(b) A launch wrapper** — export, then exec `claude`:
 
 ```sh
-modelpipe routes.json --list   # safe JSON summary of the route table to stdout
+#!/bin/sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-chat
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-chat
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8
+export CLAUDE_CONFIG_DIR="$HOME/.claude-modelpipe"
+exec claude "$@"
 ```
 
-It prints each route's `match`, `base_url`, auth header/scheme and the key env-var
-**name** (never a key value), plus the `forImages`/`vision` flags — no network, no server.
+### ⚠️ MUST restart Claude Code for any change to take effect
 
-### Claude Code users — leave `CLAUDE_CODE_SUBAGENT_MODEL` unset
+Claude Code reads `ANTHROPIC_BASE_URL` and the model env vars **only at startup**.
+Changing them — in `settings.json` or in your shell — does **not** affect a session
+that is already running. **You must start a new Claude Code session for any change to
+apply.**
 
-modelpipe routes on the model id in each request. Claude Code emits a distinct model id
-per subagent (that is what lets modelpipe route them to different backends). If you set
-`CLAUDE_CODE_SUBAGENT_MODEL`, Claude Code collapses subagent calls onto that one id and
-modelpipe can no longer tell them apart — so **keep `CLAUDE_CODE_SUBAGENT_MODEL` unset**
-and let Claude Code emit its natural per-subagent ids.
+There is no way to point an already-running session at the proxy: a `SessionStart` hook
+fires *after* the API client has already bound to its base URL, and `settings.json` is
+read once at launch. Edit the env, then quit and relaunch.
 
-## Writing a routes config
+## The routing model
+
+modelpipe matches the **literal `body.model`** of each request against each route's
+`match` glob (only `*` is a wildcard), and forwards to the **first** route that matches.
+It does **not** alias or translate — it never rewrites `body.model` except on the one
+vision-reroute hop described below.
+
+The practical rule follows directly: a route's `match` must target the id that actually
+**arrives** — the id Claude Code resolved, not the alias you typed. For a Claude backend
+that is a `claude-*` id; for a cross-provider backend it is that provider's concrete id
+(e.g. `deepseek-chat`, or an OpenRouter `vendor/model`). Put specific routes before broad
+ones, since first-match wins.
+
+## Routes config
 
 A config is JSON: an optional `listen` block and a `routes` array. Each route has a
-`match` glob over the model id, a backend `base_url`, and an `auth` rule. The first route
-whose `match` matches the request's model wins, so **order specific routes before broad
-ones**.
+`match` glob over the model id, a backend `base_url`, and an `auth` rule.
 
 ```json
 {
@@ -116,59 +142,79 @@ ones**.
 }
 ```
 
-See **`routes.example.json`** for a runnable, commented version, and **`providers.json`**
-for a catalog of known Anthropic-format backends (anthropic, deepseek, z.ai GLM,
-openrouter) with their `base_url` and `auth` already filled in — copy a provider's values
-into a route instead of looking them up.
+The full route shape — `match`, `base_url`, `auth` (`passthrough` vs the
+`{ header, keyEnv, scheme? }` key-swap), `forImages` / `forImagesModel`, and the `vision`
+flag — is documented field-by-field in **[`routes.example.json`](routes.example.json)**
+(runnable, commented). **[`providers.json`](providers.json)** is a catalog of known
+Anthropic-format backends (anthropic, deepseek, z.ai GLM, openrouter) with their
+`base_url` and `auth` filled in — copy a provider's values into a route instead of
+looking them up. **Keys live in environment variables, never in the config** — the
+config only names the env var, read at request time and never logged.
 
-### `auth`
+### Vision routing
 
-- `"passthrough"` — forward the client's own auth header unchanged. Use for a
-  subscription / OAuth session that needs no separate backend key (only providers that
-  support a keyless session).
-- `{ "header": "...", "keyEnv": "...", "scheme": "..." }` — swap in a backend key. `header`
-  is where the key goes (`x-api-key`, or `Authorization`); `keyEnv` is the **name of an
-  environment variable** holding the key (read at request time, never logged); `scheme`
-  (optional, e.g. `"Bearer"`) is prepended (`Authorization: Bearer <key>`).
+A model-bearing turn can carry an image. modelpipe handles three cases:
 
-**Keys live in environment variables, never in the config file** — the config only names
-the env var.
+- **Reactive 400 fallback.** When a backend rejects an image-bearing request with an
+  image-unsupported `400`, modelpipe reroutes that same request to the route flagged
+  `forImages: true`. Any other 400 is relayed verbatim.
+- **`forImagesModel` cross-provider rewrite.** The `forImages` route **requires**
+  `forImagesModel` — the id the vision backend expects. On reroute, modelpipe rewrites
+  **only** `body.model` to it (the image bytes are untouched), because that hop crosses
+  to a different provider whose model ids differ. This is the one scoped exception to
+  passthrough; omitting it is a config error caught at startup (fail-closed).
+- **`vision: false` pre-route.** Some backends don't 400 on an image — they soft-refuse
+  with a 200, or invoke their own server-side image tool, neither of which the reactive
+  catch-400 path can detect. Set `vision: false` on a route to declare its backend
+  non-vision: an image-bearing request matched by it goes **straight** to the `forImages`
+  target (with the `forImagesModel` rewrite), never to that backend first. Text-only
+  turns route normally; default is `true`.
 
-### `forImages` / `forImagesModel`
+## Inspecting a config — `--list`
 
-Set `forImages: true` on **exactly one** route to make it the vision fallback target.
-When a backend rejects an image-bearing request with an image-unsupported 400, the
-request is rerouted there.
+Discover what a config is wired for without starting the server:
 
-`forImagesModel` is **required** on that route — the model id the vision backend expects
-(e.g. an OpenRouter `vendor/model` id like `google/gemini-2.5-flash-lite`). On reroute,
-modelpipe rewrites **only** the body's `model` field to it; the rest of the body (the
-image bytes) is untouched. This is the **one scoped exception** to passthrough: the
-reroute crosses to a *different* provider, whose model ids differ from the source
-backend's, so the client's original id would be rejected there. Omitting it is a config
-error caught at startup (fail-closed), not a silent runtime 400.
+```sh
+modelpipe routes.json --list
+```
 
-### `vision` (declare a backend non-vision)
+It prints a **safe JSON summary** of the route table to stdout and exits — no network,
+no server. Each route shows its `match`, `base_url`, the auth header/scheme, the key
+env-var **name** (never a key value), and the `forImages` / `forImagesModel` / `vision`
+flags. Useful for a setup dialog or a quick sanity check.
 
-The reroute above is **reactive** — it waits for a `400` "image not supported". But not
-every backend 400s on an image: some **soft-refuse with a 200** ("I can't see images"),
-some invoke their **own server-side image tool** — neither of which the catch-400 path can
-detect. Set **`vision: false`** on a route to declare its backend non-vision: an
-image-bearing request matched by that route is then sent **straight to the `forImages`
-target** (with the `forImagesModel` rewrite), never to that backend first — no reliance on
-a wire signal. Text-only turns are unaffected (they route normally). Default is `true`
-(assume vision-capable; the reactive 400 fallback still applies). Requires a `forImages`
-route to route to; with none configured the flag is inert.
+## Verifying routing — `MODEL_ROUTER_LOG`
+
+```sh
+MODEL_ROUTER_LOG=1 modelpipe routes.json
+```
+
+Prints one `model -> host` line per request to stderr (`[model-router] <model> -> <host>`)
+so you can confirm exactly which id arrived and where it routed — never a key, body, or
+header. Off by default.
 
 ## Security posture
 
 - Backend keys come only from the named env vars — never inline in the config, never
   logged.
-- The client's incoming auth header is stripped before forwarding on a key-swap route, so
-  a front-key never leaks to a backend or reaches the wrong provider.
-- **Fail-closed:** a request with no model, a model no route matches, or a route whose key
-  env is unset is a 4xx/5xx error — never silently sent to a default backend.
-- No secret / body / header logging. Binds to localhost by default.
+- The client's incoming auth header is **stripped** before forwarding on a key-swap
+  route, so a front-key never leaks to a backend or reaches the wrong provider.
+- **Fail-closed:** a request with no model, a model no route matches, or a route whose
+  key env is unset is a 4xx/5xx error — never silently sent to a default backend.
+- No secret / body / header logging. Binds to **localhost** by default.
+
+## Other clients
+
+modelpipe works with **any Anthropic-format client** — the Anthropic SDK, Cline,
+Cursor's Anthropic mode, and others — anything that speaks the Messages API and honours
+`ANTHROPIC_BASE_URL`. It is not Claude-Code-only by design; Claude Code just gets the
+richest routing because it emits a distinct model id per tier (and per subagent). For
+those clients, set `ANTHROPIC_BASE_URL` to the proxy and route on whatever model ids the
+client sends. The spotlight stays on Claude Code because that is where the alias→model
+env recipe above is load-bearing.
+
+> **Not a translator.** Anthropic Messages API format only, forever — both ends speak it,
+> so there is nothing to translate. OpenAI-shaped providers are out of scope by design.
 
 ## Development
 
@@ -176,9 +222,9 @@ route to route to; with none configured the flag is inert.
 npm test
 ```
 
-The test suite uses stub upstream servers on localhost (no network, no real keys) and
-exercises the router through its real HTTP path: routing, the auth swap, body and streamed
-response passthrough, fail-closed behaviour, the vision fallback, and log safety.
+The suite uses stub upstream servers on localhost (no network, no real keys) and exercises
+the router through its real HTTP path: routing, the auth swap, body and streamed response
+passthrough, fail-closed behaviour, the vision fallback, and log safety.
 
 ## License
 
