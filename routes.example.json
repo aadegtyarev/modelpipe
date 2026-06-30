@@ -1,0 +1,28 @@
+{
+  "_doc": "Worked example route-table for modelpipe (src/router.mjs). Copy it, set the env vars it names, then start the router and point your Anthropic-format client at it: `modelpipe routes.json` then `export ANTHROPIC_BASE_URL=http://127.0.0.1:8787`. The router keys on each request body's `model` and forwards to the FIRST route whose `match` glob matches (so order specific routes before broad ones). Keys are referenced by env-var NAME only — NEVER put a key value in this file. Provider endpoints/auth come from providers.json (verified 2026-06-30).",
+  "_route_shape": {
+    "match": "glob over the model id; only `*` is a wildcard (e.g. claude-* / deepseek-*)",
+    "base_url": "the backend origin (optionally with a base path, e.g. /anthropic); the client's request path is appended",
+    "auth": "EITHER the string \"passthrough\" (forward the client's own auth header unchanged — for a subscription/OAuth session with no backend key) OR an object { header, keyEnv, scheme? }: the header name to send the backend key under, the NAME of the env var holding the key (read at request time, never logged), and an OPTIONAL scheme prefix (\"Bearer\" yields `Authorization: Bearer <key>`; omit for a raw value like `x-api-key: <key>`)",
+    "forImages": "OPTIONAL true on exactly ONE route — marks it the vision fallback target. When a backend rejects an image-bearing request with an image-unsupported 400, modelpipe reroutes the SAME request to this route. The body is never transformed."
+  },
+  "listen": { "host": "127.0.0.1", "port": 8787 },
+  "routes": [
+    {
+      "match": "claude-*",
+      "base_url": "https://api.anthropic.com",
+      "auth": "passthrough"
+    },
+    {
+      "match": "deepseek-*",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" }
+    },
+    {
+      "match": "vision-*",
+      "base_url": "https://api.anthropic.com",
+      "forImages": true,
+      "auth": { "header": "x-api-key", "keyEnv": "ANTHROPIC_API_KEY" }
+    }
+  ]
+}

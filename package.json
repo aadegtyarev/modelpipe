@@ -1,0 +1,25 @@
+{
+  "name": "modelpipe",
+  "version": "0.1.0",
+  "description": "Passthrough Anthropic-format model router: route any model-bearing call from an Anthropic-format client to a chosen backend. No translator.",
+  "type": "module",
+  "bin": {
+    "modelpipe": "./bin/modelpipe.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test/router.test.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "providers.json",
+    "routes.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "Alexander Degtyarev"
+}
