@@ -143,8 +143,9 @@ A config is JSON: an optional `listen` block and a `routes` array. Each route ha
 ```
 
 The full route shape — `match`, `base_url`, `auth` (`passthrough` vs the
-`{ header, keyEnv, scheme? }` key-swap), `forImages` / `forImagesModel`, and the `vision`
-flag — is documented field-by-field in **[`routes.example.json`](routes.example.json)**
+`{ header, keyEnv, scheme? }` key-swap), `forImages` / `forImagesModel`, the `vision`
+flag, and `models_url` / `models_format` (for `GET /v1/models?expand=1`, below) — is
+documented field-by-field in **[`routes.example.json`](routes.example.json)**
 (runnable, commented). **[`providers.json`](providers.json)** is a catalog of known
 Anthropic-format backends (anthropic, deepseek, z.ai GLM, openrouter) with their
 `base_url` and `auth` filled in — copy a provider's values into a route instead of
@@ -180,8 +181,9 @@ modelpipe routes.json --list
 
 It prints a **safe JSON summary** of the route table to stdout and exits — no network,
 no server. Each route shows its `match`, `base_url`, the auth header/scheme, the key
-env-var **name** (never a key value), and the `forImages` / `forImagesModel` / `vision`
-flags. Useful for a setup dialog or a quick sanity check.
+env-var **name** (never a key value), the `forImages` / `forImagesModel` / `vision`
+flags, and `models_url` / `models_format` when set. Useful for a setup dialog or a quick
+sanity check.
 
 ### `GET /v1/models` — the network-facing, stricter view
 
@@ -191,6 +193,52 @@ only each route's `match` glob, backend `host`, auth **mode** (`"passthrough"` o
 and vision flags. No key env-var name, no auth header, no base path is ever sent over the
 wire (a network endpoint is reachable by any client, so it must leak less than the
 localhost `--list`). Handy for a setup probe against a running router.
+
+### `GET /v1/models?expand=1` — concrete ids, not just globs
+
+The plain `GET /v1/models` above lists routes **as configured** — a glob route
+(`glm-*`) is returned as the glob. Add `?expand=1` (also works on the bare `/models`) and
+modelpipe resolves each glob into the **concrete** model ids it currently matches, by
+fetching the backend's own model-listing endpoint:
+
+```sh
+curl -s 'http://127.0.0.1:8787/v1/models?expand=1' | jq
+```
+
+Per route:
+- a `match` with no `*` (already concrete) is returned as-is, `concrete: true`.
+- a glob `match` with a `models_url` configured is expanded: modelpipe fetches
+  `models_url`, filters the result through the same `match` glob, and returns one entry
+  per matched id, `concrete: true`.
+- a glob `match` with **no** `models_url` stays the unexpanded glob, `concrete: false` —
+  modelpipe never guesses a provider's catalog path.
+- **any failure** (no `models_url`, network error, non-200, unparseable body, the route's
+  key env unset) falls back to the unexpanded glob, `concrete: false` — one backend's
+  catalog being unreachable never fails the whole listing or the other routes' entries.
+
+`models_url` is a route config field — `base_url` is the *messages* endpoint, and a
+provider's model-listing path doesn't follow from it, so it's stated explicitly:
+
+```json
+{
+  "match": "glm-*",
+  "base_url": "https://api.z.ai/api/anthropic",
+  "models_url": "https://api.z.ai/api/paas/v4/models",
+  "models_format": "openai",
+  "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY" }
+}
+```
+
+`models_format` is `"openai"` or `"anthropic"` (both ship the same `{ data: [{ id }] }`
+shape modelpipe reads) and is required whenever `models_url` is set. The catalog fetch
+reuses the route's own auth: the backend key for a key-swap route, or — for
+`auth: "passthrough"` — the **client's own incoming auth header**, the same rule as a
+normal passthrough hop.
+
+Without `expand=1` the response is byte-for-byte the same as before (no `match` or
+`concrete` field) — existing consumers (e.g. `--probe`) are unaffected. A fetched catalog
+is cached per router process for a few minutes so a client probe doesn't hammer the
+backend's listing endpoint on every call.
 
 ## Verifying routing — `MODEL_ROUTER_LOG`
 
