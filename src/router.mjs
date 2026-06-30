@@ -10,7 +10,9 @@
 //   mostly passthrough too — a 2xx / SSE streams straight back — with ONE reactive
 //   hop: a specific "image not supported" 400 is buffered, classified, and the same
 //   request is rerouted to the `forImages` vision target; any other 400 is relayed
-//   verbatim.
+//   verbatim. The reroute is the ONE scoped exception to passthrough: it rewrites the
+//   body's `model` to the vision route's `forImagesModel`, because the reroute crosses
+//   to a different provider whose model id differs from the client's (rewriteModelInBody).
 //
 // SECURITY POSTURE (the threat surface this code owns):
 //   • Backend keys come ONLY from env vars named by the route config — never
@@ -91,6 +93,24 @@ export function modelFromBody(body) {
     return typeof parsed.model === "string" ? parsed.model : null;
   } catch {
     return null;
+  }
+}
+
+// Rewrite the `model` field of a JSON request body to `newModel`, returning a NEW
+// Buffer (the original is never mutated). Used ONLY on the vision-reroute hop: the
+// reroute crosses to a different provider, so the client's model id (which that
+// backend does not know) is replaced with the vision route's own `forImagesModel`.
+// This is the single scoped exception to passthrough, on the hop that is already
+// content-aware. Fail-safe: a falsy newModel or an unparseable body is returned
+// unchanged (it would fail downstream regardless) — this never throws.
+export function rewriteModelInBody(body, newModel) {
+  if (!newModel || !body || body.length === 0) return body;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    parsed.model = newModel;
+    return Buffer.from(JSON.stringify(parsed), "utf8");
+  } catch {
+    return body;
   }
 }
 
@@ -182,6 +202,16 @@ export function validateConfig(config) {
     if (route.forImages !== undefined) {
       if (route.forImages !== true) throw new Error(`${at}.forImages: must be true when present`);
       visionCount++;
+      // The vision target rewrites the rerouted request's `model` to this id (the one
+      // scoped exception to passthrough — the reroute crosses to a different provider
+      // whose model id differs from the client's). REQUIRED, fail-closed: a vision route
+      // with no model id would forward the client's id to a backend that does not know
+      // it — a guaranteed runtime 400 — so the omission is caught here at startup.
+      if (typeof route.forImagesModel !== "string" || route.forImagesModel.length === 0) {
+        throw new Error(`${at}.forImagesModel: required non-empty model id on the forImages route`);
+      }
+    } else if (route.forImagesModel !== undefined) {
+      throw new Error(`${at}.forImagesModel: only valid on the forImages route (needs forImages: true)`);
     }
     // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
     // OR a key-swap object { header, keyEnv, scheme? }.
@@ -394,10 +424,12 @@ function makeResponseHandler(ctx) {
           return;
         }
         if (ctx.visionRoute) {
-          // Reroute the SAME buffered request to the vision target; remember the model
-          // so the next image call pre-routes (per-process cache, never the payload).
+          // Reroute the buffered request to the vision target, rewriting only `model`
+          // to the route's forImagesModel (the cross-provider hop); remember the client
+          // model so the next image call pre-routes (per-process cache, never the payload).
           if (ctx.model) ctx.nonVisionCache.set(ctx.model, true);
-          proxyToRoute(ctx.visionRoute, ctx.req, ctx.res, ctx.body, ctx.log, {
+          const visionBody = rewriteModelInBody(ctx.body, ctx.visionRoute.forImagesModel);
+          proxyToRoute(ctx.visionRoute, ctx.req, ctx.res, visionBody, ctx.log, {
             onResponse: makeResponseHandler({ ...ctx, isVisionTarget: true }),
           });
           return;
@@ -435,7 +467,8 @@ function forward(config, req, res, body, log, nonVisionCache) {
     nonVisionCache.has(model) &&
     bodyHasImageBlock(body)
   ) {
-    proxyToRoute(visionRoute, req, res, body, log, {
+    const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
+    proxyToRoute(visionRoute, req, res, visionBody, log, {
       onResponse: makeResponseHandler({ res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: true }),
     });
     return;
