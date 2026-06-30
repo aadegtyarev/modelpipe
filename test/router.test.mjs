@@ -19,6 +19,7 @@ import http from "node:http";
 import {
   createRouter,
   pickRoute,
+  listModels,
   globToRegExp,
   modelFromBody,
   rewriteModelInBody,
@@ -122,6 +123,24 @@ function request(port, payload, { raw } = {}) {
   });
 }
 
+// A GET through the router (for the /v1/models listing intercept). No body; resolves
+// with status + body. Distinct from `request` (POST /v1/messages) so the listing and
+// the routing paths stay separately exercisable.
+function get(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: urlPath, method: "GET" },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 // A tolerant client for the mid-stream-abort case: resolves with whatever partial
 // body arrived no matter HOW the connection ended (clean end, aborted, error, or a
 // req-side error) — the point is to prove the router survives an upstream mid-stream
@@ -194,6 +213,28 @@ async function main() {
   check("pickRoute first match wins", pickRoute("claude-x", sampleRoutes).match, "claude-*");
   check("pickRoute unknown ⇒ null", pickRoute("gpt-4", sampleRoutes), null);
   check("pickRoute empty model ⇒ null", pickRoute("", sampleRoutes), null);
+
+  // ── listModels pure unit (secret-free NETWORK view, projects listConfig) ────
+  const modelsListed = listModels({ routes: sampleRoutes });
+  check("listModels lists every route", modelsListed.length, sampleRoutes.length);
+  check("listModels id is the route match glob", modelsListed[0].id, "claude-*");
+  check("listModels object is \"model\"", modelsListed[0].object, "model");
+  check("listModels host is the base_url host (no path)", modelsListed[1].host, "api.deepseek.com");
+  check("listModels leaks NO base_url path", JSON.stringify(modelsListed).includes("/anthropic"), false);
+  check("listModels auth mode is \"key\" for a key-swap route", modelsListed[0].auth, "key");
+  const secretRoutes = [
+    { match: "x-*", base_url: "https://host.example", auth: { header: "x-api-key", keyEnv: "LEAKME-ENV-NAME" } },
+    { match: "y-*", base_url: "https://host.example", auth: "passthrough", forImages: true },
+  ];
+  const secretListed = listModels({ routes: secretRoutes });
+  const secretBlob = JSON.stringify(secretListed);
+  check("listModels leaks NO key env-var name", secretBlob.includes("LEAKME-ENV-NAME"), false);
+  check("listModels leaks NO auth header name", secretBlob.includes("x-api-key"), false);
+  check("listModels auth \"passthrough\" for a passthrough route", secretListed[1].auth, "passthrough");
+  check("listModels for_images reflects the forImages flag", secretListed[1].for_images, true);
+  check("listModels for_images false when the flag is unset", secretListed[0].for_images, false);
+  check("listModels host null on a bad base_url",
+    listModels({ routes: [{ match: "z-*", base_url: "not-a-url", auth: "passthrough" }] })[0].host, null);
   check("resolveAuthHeader raw value", resolveAuthHeader(sampleRoutes[0], { K: "secret" }).value, "secret");
   check("resolveAuthHeader scheme prepend",
     resolveAuthHeader({ auth: { header: "Authorization", keyEnv: "K", scheme: "Bearer" } }, { K: "secret" }).value,
@@ -450,6 +491,28 @@ async function main() {
     check("mid-stream: client saw the streamed 200 headers", r10.status, 200);
     check("mid-stream: partial chunk reached the client", r10.body.includes("PARTIAL-CHUNK"), true);
     check("mid-stream: connection did not end cleanly (aborted/closed/errored)", r10.how !== "end", true);
+
+    // 11. GET /v1/models: returns the configured routes as a secret-free listing
+    //     (listModels, the network view — stricter than listConfig). Intercepted before
+    //     routing, needs no body, reaches no backend. A POST /v1/messages still routes —
+    //     proving the intercept didn't swallow routing.
+    const m11 = await get(routerPort, "/v1/models");
+    check("GET /v1/models ⇒ 200", m11.status, 200);
+    const m11data = JSON.parse(m11.body);
+    check("GET /v1/models: object is \"list\"", m11data.object, "list");
+    check("GET /v1/models: one entry per route", m11data.data.length, config.routes.length);
+    check("GET /v1/models: entry id is the route match glob", m11data.data[0].id, "claude-*");
+    check("GET /v1/models: entry carries the backend host", typeof m11data.data[0].host, "string");
+    check("GET /v1/models leaks NO key env-var name",
+      m11.body.includes("TEST_ANTHROPIC_KEY") || m11.body.includes("TEST_DEEPSEEK_KEY") || m11.body.includes("TEST_UNSET_KEY_XYZ"), false);
+    check("GET /v1/models leaks NO key value",
+      m11.body.includes("ANT-SECRET-123") || m11.body.includes("DS-SECRET-456"), false);
+    const m11bare = await get(routerPort, "/models");
+    check("GET /models (bare path) ⇒ 200", m11bare.status, 200);
+    const anthropicBefore11 = anthropicStub.received.length;
+    const m11post = await request(routerPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "POST-STILL-ROUTES" }] });
+    check("POST /v1/messages still routes after the models intercept", anthropicStub.received.length, anthropicBefore11 + 1);
+    check("POST /v1/messages still 200 after the models intercept", m11post.status, 200);
   } finally {
     process.stderr.write = realStderrWrite;
     delete process.env.TEST_ANTHROPIC_KEY;
