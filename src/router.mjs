@@ -241,6 +241,45 @@ export function loadConfig(configPath) {
   return validateConfig(config);
 }
 
+// Build a SAFE JSON summary of the route table for discovery (the `--list` CLI mode,
+// so a client setup dialog can read what a modelpipe is configured for instead of
+// re-asking). PURE: reads only the parsed config object, NEVER process.env and NEVER a
+// backend — no secret value is ever in scope.
+//
+// SAFE-SURFACE (whitelist, fail-closed by construction): each field is copied in by
+// name, so an unexpected future config field cannot leak through. Per route we expose
+// only the model glob (`match`), the backend origin (`base_url`), the capability flags
+// (forImages / forImagesModel / vision, when present), and an auth VIEW:
+//   • "passthrough" verbatim — it carries no secret (the client's own auth is forwarded).
+//   • the key-swap object as { header, scheme?, keyEnv } — the env-var NAME only.
+// `keyEnv` is the NAME of the env var holding the key, never the key VALUE: the config
+// by design holds env-var names (SECURITY POSTURE above), so the name is config data,
+// not a secret. The top-level `proxyUrl` is surfaced only when present.
+//
+// Does NOT call validateConfig: an empty/no-routes config yields a well-formed empty
+// list (the discovery contract is "summarise whatever is configured", not "serve it").
+export function listConfig(config) {
+  const safe = {};
+  if (config && config.proxyUrl !== undefined) safe.proxyUrl = config.proxyUrl;
+  const routes = (config && Array.isArray(config.routes)) ? config.routes : [];
+  safe.routes = routes.map((route) => {
+    const out = { match: route.match, base_url: route.base_url };
+    if (route.auth === "passthrough") {
+      out.auth = "passthrough";
+    } else if (route.auth && typeof route.auth === "object") {
+      const authView = { header: route.auth.header };
+      if (route.auth.scheme !== undefined) authView.scheme = route.auth.scheme;
+      authView.keyEnv = route.auth.keyEnv; // the env-var NAME, never a key value
+      out.auth = authView;
+    }
+    if (route.forImages !== undefined) out.forImages = route.forImages;
+    if (route.forImagesModel !== undefined) out.forImagesModel = route.forImagesModel;
+    if (route.vision !== undefined) out.vision = route.vision;
+    return out;
+  });
+  return safe;
+}
+
 // The opt-in stderr logger: a no-op unless MODEL_ROUTER_LOG=1. Logs only the
 // caller-supplied line (which is always model -> hostname) — never a key, body, or header.
 function defaultLogger(env = process.env) {

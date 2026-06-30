@@ -78,6 +78,15 @@ Requires Node.js >= 18. No dependencies (Node built-ins only).
 Optional: set `MODEL_ROUTER_LOG=1` for a safe `model -> host` routing line on stderr
 (never a key, body, or header).
 
+Discover what a config is wired for without starting the router:
+
+```sh
+modelpipe routes.json --list   # safe JSON summary of the route table to stdout
+```
+
+It prints each route's `match`, `base_url`, auth header/scheme and the key env-var
+**name** (never a key value), plus the `forImages`/`vision` flags — no network, no server.
+
 ### Claude Code users — leave `CLAUDE_CODE_SUBAGENT_MODEL` unset
 
 modelpipe routes on the model id in each request. Claude Code emits a distinct model id

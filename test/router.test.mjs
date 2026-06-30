@@ -28,6 +28,7 @@ import {
   isImageUnsupported400,
   pickVisionRoute,
   validateConfig,
+  listConfig,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -270,6 +271,57 @@ async function main() {
   check("validateConfig rejects a non-boolean vision flag", badVisionFlagThrew, true);
   check("validateConfig accepts vision:false",
     validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", vision: false, auth: { header: "x-api-key", keyEnv: "K" } }] }).routes[0].vision, false);
+
+  // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
+  const listSample = {
+    proxyUrl: "http://127.0.0.1:8787",
+    routes: [
+      { match: "claude-*", base_url: "https://api.anthropic.com", auth: "passthrough" },
+      { match: "deepseek-*", base_url: "https://api.deepseek.com/anthropic", auth: { header: "x-api-key", keyEnv: "DEEPSEEK_API_KEY" } },
+      { match: "vision-*", base_url: "https://openrouter.ai/api", forImages: true, forImagesModel: "google/gemini-2.5-flash-lite", auth: { header: "Authorization", scheme: "Bearer", keyEnv: "OPENROUTER_API_KEY" } },
+      { match: "nonvis-*", base_url: "https://nv.example", vision: false, auth: { header: "x-api-key", keyEnv: "NV_KEY" } },
+    ],
+  };
+  const listed = listConfig(listSample);
+  // per-route safe fields: match + base_url present on every route.
+  check("listConfig surfaces match", listed.routes[0].match, "claude-*");
+  check("listConfig surfaces base_url", listed.routes[1].base_url, "https://api.deepseek.com/anthropic");
+  // passthrough auth carried verbatim (no secret).
+  check("listConfig carries passthrough auth verbatim", listed.routes[0].auth, "passthrough");
+  // key-swap auth view: header + keyEnv NAME, scheme when present.
+  check("listConfig surfaces auth.header", listed.routes[1].auth.header, "x-api-key");
+  check("listConfig surfaces auth.keyEnv NAME", listed.routes[1].auth.keyEnv, "DEEPSEEK_API_KEY");
+  check("listConfig surfaces auth.scheme when present", listed.routes[2].auth.scheme, "Bearer");
+  check("listConfig omits auth.scheme when absent", "scheme" in listed.routes[1].auth, false);
+  // capability flags surfaced when present.
+  check("listConfig surfaces forImages", listed.routes[2].forImages, true);
+  check("listConfig surfaces forImagesModel", listed.routes[2].forImagesModel, "google/gemini-2.5-flash-lite");
+  check("listConfig surfaces vision:false", listed.routes[3].vision, false);
+  check("listConfig omits forImages when absent", "forImages" in listed.routes[1], false);
+  check("listConfig omits vision when absent", "vision" in listed.routes[0], false);
+  // proxyUrl surfaced when present.
+  check("listConfig surfaces proxyUrl when present", listed.proxyUrl, "http://127.0.0.1:8787");
+  // NEVER a key value / secret-shaped field: only the keyEnv NAME is present on the auth view.
+  const authKeys = Object.keys(listed.routes[1].auth).sort().join(",");
+  check("listConfig auth view has ONLY header,keyEnv (no value/key/apiKey field)", authKeys, "header,keyEnv");
+  const fullDump = JSON.stringify(listed);
+  check("listConfig dump has NO 'value' field", /"value"\s*:/.test(fullDump), false);
+  check("listConfig dump has NO 'apiKey'/'key' value field", /"(apiKey|key)"\s*:/.test(fullDump), false);
+  check("listConfig carries the env-var NAME, not a value (keyEnv is the NAME)", listed.routes[2].auth.keyEnv, "OPENROUTER_API_KEY");
+  // proxyUrl omitted when absent.
+  const noProxy = listConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: "passthrough" }] });
+  check("listConfig omits proxyUrl when absent", "proxyUrl" in noProxy, false);
+  // empty / no-routes config ⇒ well-formed empty list, no throw.
+  let emptyListThrew = false;
+  let emptyListed;
+  try { emptyListed = listConfig({ routes: [] }); } catch { emptyListThrew = true; }
+  check("listConfig empty routes ⇒ no throw", emptyListThrew, false);
+  check("listConfig empty routes ⇒ well-formed empty list", Array.isArray(emptyListed.routes) && emptyListed.routes.length === 0, true);
+  let noRoutesThrew = false;
+  let noRoutesListed;
+  try { noRoutesListed = listConfig({}); } catch { noRoutesThrew = true; }
+  check("listConfig no routes key ⇒ no throw", noRoutesThrew, false);
+  check("listConfig no routes key ⇒ empty list", Array.isArray(noRoutesListed.routes) && noRoutesListed.routes.length === 0, true);
 
   // ── e2e through the real socket ───────────────────────────────────────────
   const anthropicStub = makeStub();
