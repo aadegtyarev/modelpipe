@@ -13,6 +13,10 @@
 //   verbatim. The reroute is the ONE scoped exception to passthrough: it rewrites the
 //   body's `model` to the vision route's `forImagesModel`, because the reroute crosses
 //   to a different provider whose model id differs from the client's (rewriteModelInBody).
+//   A route may also be DECLARED non-vision (`vision: false`): an image-bearing request
+//   for it is pre-routed to the `forImages` target WITHOUT trying the backend first —
+//   reliable where the backend does not 400 on an image (a 200 soft-refusal, or its own
+//   server-side image tool), which the reactive catch-400 hop cannot detect.
 //
 // SECURITY POSTURE (the threat surface this code owns):
 //   • Backend keys come ONLY from env vars named by the route config — never
@@ -212,6 +216,13 @@ export function validateConfig(config) {
       }
     } else if (route.forImagesModel !== undefined) {
       throw new Error(`${at}.forImagesModel: only valid on the forImages route (needs forImages: true)`);
+    }
+    // vision: OPTIONAL boolean, default true. false ⇒ this route's backend has no vision,
+    // so an image-bearing request is routed straight to the forImages target (forward()),
+    // never sent to this backend first — reliable where the backend does not 400 on an
+    // image (a 200 soft-refusal or a server-side image tool). Must be a boolean when present.
+    if (route.vision !== undefined && typeof route.vision !== "boolean") {
+      throw new Error(`${at}.vision: must be a boolean (default true) when present`);
     }
     // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
     // OR a key-swap object { header, keyEnv, scheme? }.
@@ -458,14 +469,22 @@ function forward(config, req, res, body, log, nonVisionCache) {
 
   const visionRoute = pickVisionRoute(config.routes);
 
-  // Pre-route optimisation: a known non-vision model carrying an image, with a vision
-  // target configured, skips the first call we already know will 400-image.
+  // Pre-route an image-bearing request straight to the vision target, skipping the
+  // non-vision backend call, when the matched route is known non-vision — EITHER:
+  //   • DECLARED non-vision (`vision: false` on the route) — proactive, reliable. Needed
+  //     because a backend that lacks vision does NOT always 400: it may soft-refuse with a
+  //     200 ("I can't see images") or invoke its own server-side image tool, neither of
+  //     which the reactive catch-400 path (makeResponseHandler) can detect. The flag is
+  //     the config-driven escape from wire-detection's blind spots.
+  //   • LEARNED non-vision (cached from a prior 400-image on this model) — the reactive
+  //     optimisation that skips a repeat known-failing first call.
+  // The catch-400 fallback in makeResponseHandler stays for the default (vision unset/true)
+  // route — belt-and-suspenders for a backend that DOES 400.
   if (
     visionRoute &&
     route !== visionRoute &&
-    model &&
-    nonVisionCache.has(model) &&
-    bodyHasImageBlock(body)
+    bodyHasImageBlock(body) &&
+    (route.vision === false || (model && nonVisionCache.has(model)))
   ) {
     const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
     proxyToRoute(visionRoute, req, res, visionBody, log, {
