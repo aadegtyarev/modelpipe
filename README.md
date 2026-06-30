@@ -5,9 +5,11 @@ at one local endpoint, and modelpipe forwards each request to a chosen backend b
 on the model id in the request body — different model tiers to different providers,
 under one `ANTHROPIC_BASE_URL`.
 
-**Passthrough, no translator.** The request body is never transformed; both ends speak
-the Anthropic Messages API, so there is nothing to translate. modelpipe only chooses a
-backend and swaps the auth header.
+**Passthrough, no translator.** Both ends speak the Anthropic Messages API, so there is
+nothing to translate — modelpipe chooses a backend and swaps the auth header. The request
+body is forwarded as-is, with **one** scoped exception: on a vision-fallback reroute the
+body's `model` field is rewritten to the target route's `forImagesModel` (see below),
+because that hop crosses to a different provider. No format translation, ever.
 
 ## What it does
 
@@ -98,8 +100,9 @@ ones**.
     { "match": "claude-*", "base_url": "https://api.anthropic.com", "auth": "passthrough" },
     { "match": "deepseek-*", "base_url": "https://api.deepseek.com/anthropic",
       "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" } },
-    { "match": "vision-*", "base_url": "https://api.anthropic.com", "forImages": true,
-      "auth": { "header": "x-api-key", "keyEnv": "ANTHROPIC_API_KEY" } }
+    { "match": "vision-*", "base_url": "https://openrouter.ai/api", "forImages": true,
+      "forImagesModel": "google/gemini-2.5-flash-lite",
+      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" } }
   ]
 }
 ```
@@ -122,11 +125,19 @@ into a route instead of looking them up.
 **Keys live in environment variables, never in the config file** — the config only names
 the env var.
 
-### `forImages`
+### `forImages` / `forImagesModel`
 
 Set `forImages: true` on **exactly one** route to make it the vision fallback target.
-When a backend rejects an image-bearing request with an image-unsupported 400, the same
+When a backend rejects an image-bearing request with an image-unsupported 400, the
 request is rerouted there.
+
+`forImagesModel` is **required** on that route — the model id the vision backend expects
+(e.g. an OpenRouter `vendor/model` id like `google/gemini-2.5-flash-lite`). On reroute,
+modelpipe rewrites **only** the body's `model` field to it; the rest of the body (the
+image bytes) is untouched. This is the **one scoped exception** to passthrough: the
+reroute crosses to a *different* provider, whose model ids differ from the source
+backend's, so the client's original id would be rejected there. Omitting it is a config
+error caught at startup (fail-closed), not a silent runtime 400.
 
 ## Security posture
 
