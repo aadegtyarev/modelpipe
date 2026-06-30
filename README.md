@@ -139,6 +139,18 @@ reroute crosses to a *different* provider, whose model ids differ from the sourc
 backend's, so the client's original id would be rejected there. Omitting it is a config
 error caught at startup (fail-closed), not a silent runtime 400.
 
+### `vision` (declare a backend non-vision)
+
+The reroute above is **reactive** — it waits for a `400` "image not supported". But not
+every backend 400s on an image: some **soft-refuse with a 200** ("I can't see images"),
+some invoke their **own server-side image tool** — neither of which the catch-400 path can
+detect. Set **`vision: false`** on a route to declare its backend non-vision: an
+image-bearing request matched by that route is then sent **straight to the `forImages`
+target** (with the `forImagesModel` rewrite), never to that backend first — no reliance on
+a wire signal. Text-only turns are unaffected (they route normally). Default is `true`
+(assume vision-capable; the reactive 400 fallback still applies). Requires a `forImages`
+route to route to; with none configured the flag is inert.
+
 ## Security posture
 
 - Backend keys come only from the named env vars — never inline in the config, never
