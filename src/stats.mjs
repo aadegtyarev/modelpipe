@@ -711,10 +711,15 @@ canvas{display:block;width:100%;height:200px}
   <label>deepseek <input id="planPrice_deepseek" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
   <label>openrouter <input id="planPrice_openrouter" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
   <button onclick="savePrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
-  <span style="color:var(--muted);margin-left:10px">Token prices ($/1M in/out, JSON):</span>
-  <input id="tokenPrices" size="50" placeholder='{"glm-5.2":{"input":1.4,"output":4.4}}' style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;flex:1;min-width:200px">
-  <button onclick="saveTokenPrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
 </div>
+<div id="tokenPricesPanel" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:13px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+    <span style="color:var(--muted)">API token prices ($/1M):</span>
+    <button onclick="saveTokenPrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
+  </div>
+  <div id="tpriceRows"></div>
+</div>
+<div class="models" id="models"></div>
 <div class="models" id="models"></div>
 
 <div class="chart-wrap">
@@ -762,21 +767,41 @@ async function savePrices(){
   load();
 }
 async function saveTokenPrices(){
-  try{
-    const tp=JSON.parse($('tokenPrices').value);
-    await fetch("/v1/plans",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({_tokenPrices:tp})});
-    load();
-  }catch(e){$('e').style.display='block';$('e').textContent='Invalid JSON: '+e.message}
+  const tp={};
+  const rows=$('tpriceRows').querySelectorAll('.tprow');
+  for(const r of rows){
+    const mid=r.dataset.model;
+    const inp=parseFloat(r.querySelector('.tpin').value);
+    const out=parseFloat(r.querySelector('.tpout').value);
+    if(!isNaN(inp)&&!isNaN(out)&&inp>=0&&out>=0)tp[mid]={input:inp,output:out};
+  }
+  await fetch("/v1/plans",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({_tokenPrices:tp})});
+  load();
 }
 function toggleSettings(){
-  const s=$('settings');
-  s.style.display=s.style.display==='none'?'flex':'none';
-  if(s.style.display==='flex'){
+  const s=$('settings'),tp=$('tokenPricesPanel');
+  const show=s.style.display==='none';
+  s.style.display=show?'flex':'none';
+  tp.style.display=show?'block':'none';
+  if(show){
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const pp=st.plans||{};
       for(const pid of['anthropic','glm','deepseek','openrouter'])
         $('planPrice_'+pid).value=pp[pid]!=null?pp[pid]:'';
-      $('tokenPrices').value=st.tokenPrices?JSON.stringify(st.tokenPrices):'';
+      // Build token price rows from models in stats
+      const models=st.models||{};
+      const tpOver=st.tokenPrices||{};
+      let rows='';
+      for(const[mid,m]of Object.entries(models)){
+        const p=tpOver[mid]||{input:m.priceInput,output:m.priceOutput};
+        rows+='<div class="tprow" data-model="'+mid+'" style="display:flex;align-items:center;gap:6px;margin:2px 0">'+
+          '<span style="min-width:140px;color:var(--muted)">'+mid+'</span>'+
+          '<span style="color:var(--muted)">in</span><input class="tpin" size="5" value="'+(p.input!=null?p.input:'')+'" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px">'+
+          '<span style="color:var(--muted)">out</span><input class="tpout" size="5" value="'+(p.output!=null?p.output:'')+'" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px">'+
+          '<span style="font-size:11px;color:var(--muted)">per 1M</span></div>';
+      }
+      if(!rows)rows='<span style="color:var(--muted)">no model traffic yet — prices shown from catalog</span>';
+      $('tpriceRows').innerHTML=rows;
     });
   }
 }
