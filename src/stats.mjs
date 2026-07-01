@@ -974,6 +974,7 @@ async function render(stats,quotas){
     const prices=[...new Set(Object.values(stats.models||{}).filter(m=>m.providerId===p.id&&m.priceInput!=null).map(m=>'$'+m.priceInput+'/$'+m.priceOutput))];
     if(prices.length)rows.push('<span class="l">pricing</span> <span style="color:var(--muted)">'+prices.join(' · ')+' per 1M</span>');
 
+    qhtml+=rows.map(r=>'<div class="qrow">'+r+'</div>').join('');
     qhtml+='</div>';
   }
   $("quotas").innerHTML=qhtml||'<span style="color:var(--muted)">quota data pending…</span>';
