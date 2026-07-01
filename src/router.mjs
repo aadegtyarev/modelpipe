@@ -259,6 +259,15 @@ export function validateConfig(config) {
       throw new Error(`config.anthropicPlan: must be one of ${allowed.join(", ")}`);
     }
   }
+  // plans: optional object with per-provider monthly subscription price overrides.
+  // E.g. { anthropic: 200, glm: 64.80 }. Used by dashboard effective-cost display.
+  // If not set, default prices are used (anthropic pro=20 max=200 team=25, glm lite=18 pro=64.80 max=180).
+  if (config.plans !== undefined) {
+    if (typeof config.plans !== "object") throw new Error("config.plans: must be an object { provider: price }");
+    for (const [pid, price] of Object.entries(config.plans)) {
+      if (typeof price !== "number" || price < 0) throw new Error(`config.plans.${pid}: must be a non-negative number (monthly USD)`);
+    }
+  }
 
   return config;
 }
@@ -701,6 +710,9 @@ export function createRouter(config, options = {}) {
         }
         if (config.anthropicPlan) {
           snap.anthropicPlan = config.anthropicPlan;
+        }
+        if (config.plans) {
+          snap.plans = config.plans;
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(snap));

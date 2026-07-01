@@ -768,7 +768,9 @@ async function render(stats,quotas){
   try{const r=await fetch("/v1/models").then(r=>r.json());cfgModels=(r.data||[]).map(m=>{const h=m.host||'';let pid=h;if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';return{...m,pid};});}catch{}
 
   // Session bar — effective cost based on subscriptions
-  const PLAN_PRICES={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
+  const PLAN_DEFAULTS={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
+  const planPrices={...PLAN_DEFAULTS};
+  if(stats.plans)for(const pid of Object.keys(planPrices))if(stats.plans[pid]!=null)planPrices[pid]={...planPrices[pid],_custom:stats.plans[pid]};
   const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
   const modelArr=Object.values(stats.models||{});
   const doneProviders=new Set();
@@ -776,10 +778,11 @@ async function render(stats,quotas){
   for(const m of modelArr){
     if(doneProviders.has(m.providerId))continue;
     doneProviders.add(m.providerId);
-    if(m.providerId==='anthropic'&&stats.anthropicPlan){
-      effectiveCost+=(PLAN_PRICES.anthropic[stats.anthropicPlan]||200)/720*hours;
-    }else if(m.providerId==='glm'&&glmQ.plan){
-      effectiveCost+=(PLAN_PRICES.glm[glmQ.plan]||64.8)/720*hours;
+    const pd=planPrices[m.providerId];
+    const planName=m.providerId==='anthropic'?stats.anthropicPlan:(m.providerId==='glm'?glmQ.plan:null);
+    if(pd&&planName&&pd[planName]!=null){
+      const price=pd._custom!=null?pd._custom:pd[planName];
+      effectiveCost+=price/720*hours;
     }else{
       effectiveCost+=modelArr.filter(x=>x.providerId===m.providerId).reduce((s,x)=>s+(x.cost||0),0);
     }
@@ -866,13 +869,12 @@ async function render(stats,quotas){
     }
     // Anthropic plan comparison
     if(p.id==='anthropic'&&stats.anthropicPlan){
-      const PRICES={pro:20,max:200,team:25};
-      const plan=PRICES[stats.anthropicPlan]||20;
-      const hours=Math.max(0.1,(Date.now()-(stats.session.startedAt||Date.now()))/3600000);
+      const defPrice={pro:20,max:200,team:25}[stats.anthropicPlan]||20;
+      const planPrice=(stats.plans&&stats.plans.anthropic!=null)?stats.plans.anthropic:defPrice;
+      const planRate=planPrice/720;
       const apiRate=p.cost/hours;
-      const planRate=plan/720;
-      const v=apiRate>planRate?'plan saves ~$'+(apiRate*720-plan).toFixed(0)+'/mo':'API ~$'+(apiRate*720).toFixed(0)+'/mo';
-      rows.push('<span class="l">plan vs API</span> <span style="color:'+(apiRate>planRate?'var(--green)':'var(--orange)')+'">'+v+' (Max $'+plan+'/mo)</span>');
+      const v=apiRate>planRate?'plan saves ~$'+(apiRate*720-planPrice).toFixed(0)+'/mo':'API ~$'+(apiRate*720).toFixed(0)+'/mo';
+      rows.push('<span class="l">plan vs API</span> <span style="color:'+(apiRate>planRate?'var(--green)':'var(--orange)')+'">'+v+' ($'+planPrice+'/mo)</span>');
     }
     if(p.id==='glm'){
       if(glmQ.fiveHour){
