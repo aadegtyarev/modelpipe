@@ -154,6 +154,28 @@ Anthropic-format backends (anthropic, deepseek, z.ai GLM, openrouter) with their
 looking them up. **Keys live in environment variables, never in the config** — the
 config only names the env var, read at request time and never logged.
 
+### Config fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `listen` | `{host, port}` | `127.0.0.1:8787` | Bind address and port. |
+| `maxBodyBytes` | number | `26214400` (25 MB) | Request body size cap; 413 if exceeded. |
+| `dashboard` | boolean | `false` | Enable the monitoring dashboard (see below). |
+| `glmPlan` | `"lite"` `"pro"` `"max"` | `"pro"` | GLM Coding Plan tier for quota bars. Only used when `dashboard: true`. |
+| `proxyUrl` | string | — | Public URL of this proxy, surfaced in `modelpipe --list` output. |
+| `routes[]` | array | required | Route entries (see below). |
+
+### Route fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `match` | string | **required** | Glob pattern over the model id (`*` is the only wildcard). First match wins — order specific before broad. |
+| `base_url` | string (URL) | **required** | Backend origin. The client's `/v1/messages` path is appended. |
+| `auth` | string or object | **required** | `"passthrough"` forwards the client's auth header unchanged. Object `{header, keyEnv, scheme?}` swaps in a backend key: `header` is the header name (e.g. `x-api-key`), `keyEnv` is the **name** of the env var holding the key (never the key value), `scheme` is an optional prefix (e.g. `"Bearer"` → `Authorization: Bearer <key>`). |
+| `vision` | boolean | `true` | `false` declares this backend has no vision. Image-bearing requests skip straight to the `forImages` target — needed when a backend doesn't 400 on images (soft-200 refusal, server-side image tool). Text-only calls route normally. |
+| `forImages` | boolean | — | Set `true` on **exactly one** route to mark it the vision fallback target. |
+| `forImagesModel` | string | **required** if `forImages` | The model id the vision backend expects. On reroute, `body.model` is rewritten to this (the only passthrough exception). |
+
 | Config field | Default | Meaning |
 | --- | --- | --- |
 | `dashboard` | `false` | Enable the usage dashboard (see below). |

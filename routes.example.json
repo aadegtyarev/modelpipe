@@ -1,35 +1,50 @@
 {
   "_doc": "Worked example route-table for modelpipe (src/router.mjs). Copy it, set the env vars it names, then start the router and point your Anthropic-format client at it: `modelpipe routes.json` then `export ANTHROPIC_BASE_URL=http://127.0.0.1:8787`. The router keys on each request body's `model` and forwards to the FIRST route whose `match` glob matches (so order specific routes before broad ones). Keys are referenced by env-var NAME only — NEVER put a key value in this file. Provider endpoints/auth come from providers.json (verified 2026-06-30).",
   "_route_shape": {
-    "match": "glob over the model id; only `*` is a wildcard (e.g. claude-* / deepseek-*)",
-    "base_url": "the backend origin (optionally with a base path, e.g. /anthropic); the client's request path is appended",
-    "auth": "EITHER the string \"passthrough\" (forward the client's own auth header unchanged — for a subscription/OAuth session with no backend key) OR an object { header, keyEnv, scheme? }: the header name to send the backend key under, the NAME of the env var holding the key (read at request time, never logged), and an OPTIONAL scheme prefix (\"Bearer\" yields `Authorization: Bearer <key>`; omit for a raw value like `x-api-key: <key>`)",
+    "match": "REQUIRED string — glob over the model id; only `*` is a wildcard (e.g. claude-* / deepseek-* / google/*)",
+    "base_url": "REQUIRED string — the backend origin (optionally with a base path, e.g. /anthropic); the client's /v1/messages path is appended",
+    "auth": "REQUIRED — EITHER the string \"passthrough\" (forward the client's own auth header unchanged — for a subscription/OAuth session with no backend key) OR an object { header, keyEnv, scheme? }: the header name to send the backend key under, the NAME of the env var holding the key (read at request time, never logged), and an OPTIONAL scheme prefix (\"Bearer\" yields `Authorization: Bearer <key>`; omit for a raw value like `x-api-key: <key>`)",
     "forImages": "OPTIONAL true on exactly ONE route — marks it the vision fallback target. When a backend rejects an image-bearing request with an image-unsupported 400, modelpipe reroutes the request to this route.",
-    "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects (e.g. an OpenRouter vendor/model id like google/gemini-2.5-flash-lite). On reroute, ONLY the body's `model` is rewritten to this; the rest of the body (the image bytes) is untouched. This is the one scoped exception to passthrough — the reroute crosses to a different provider, so the client's original model id (which that backend does not know) must be replaced. Fail-closed: a forImages route with no forImagesModel is a config error at startup.",
-    "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision, so an image-bearing request is routed STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot help there. Text-only turns route normally. Inert with no forImages route configured."
+    "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects (e.g. an OpenRouter vendor/model id like google/gemini-2.5-flash-lite). On reroute, ONLY the body's `model` is rewritten to this; the rest of the body (the image bytes) is untouched. Fail-closed: a forImages route with no forImagesModel is a config error at startup.",
+    "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision capability. An image-bearing request matched by this route goes STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot detect those. Text-only turns route normally. Inert with no forImages route configured."
+  },
+  "_config_shape": {
+    "listen": "OPTIONAL { host, port } — default 127.0.0.1:8787",
+    "dashboard": "OPTIONAL boolean, default false — enables the /dashboard monitoring page, /v1/stats, /v1/quotas, /v1/sessions, and per-model usage tracking (zero-buffer, never impacts latency)",
+    "glmPlan": "OPTIONAL string lite|pro|max, default pro — only used when dashboard:true. Selects the GLM Coding Plan tier for an artificial 5-hour/weekly quota bar estimated from token counts × API pricing. The exact percentage is on https://z.ai/manage-apikey/subscription.",
+    "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB) — request body size cap; requests exceeding it get a 413",
+    "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog"
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
-  "_dashboard_doc": "OPTIONAL boolean, default false. When true, modelpipe collects per-provider usage stats (input/output tokens, request count, RPS, ratelimit headers), polls external quota APIs (DeepSeek balance, OpenRouter credits), and exposes three endpoints: GET /v1/stats (JSON usage snapshot), GET /v1/quotas (JSON quota snapshot), GET /dashboard (HTML page with auto-refresh). Also set glmPlan below to match your GLM Coding Plan tier for an approximate 5-hour/weekly quota bar.",
   "glmPlan": "pro",
-  "_glmPlan_doc": "OPTIONAL string lite|pro|max (default pro). Only effective when dashboard is true. Selects the GLM Coding Plan tier for artificial 5-hour/weekly quota estimation based on token counts × API pricing. The exact percentage is on https://z.ai/manage-apikey/subscription — this is a proxy-side approximation.",
   "routes": [
     {
       "match": "claude-*",
       "base_url": "https://api.anthropic.com",
-      "auth": "passthrough"
+      "auth": "passthrough",
+      "_note": "Anthropic route: claude-* ids land at api.anthropic.com with the client's own auth (OAuth/subscription). Change auth to { header: x-api-key, keyEnv: ANTHROPIC_API_KEY } if using an API key instead."
+    },
+    {
+      "match": "glm-*",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY" },
+      "_note": "GLM route: e.g. set ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.2 and sonnet calls land here. ZAI_API_KEY is the Coding Plan token from z.ai console."
     },
     {
       "match": "deepseek-*",
       "base_url": "https://api.deepseek.com/anthropic",
-      "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" }
+      "vision": false,
+      "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" },
+      "_note": "DeepSeek route: vision:false — DeepSeek soft-refuses images with a 200, so image-bearing requests are pre-routed straight to the forImages target without hitting DeepSeek first. DEEPSEEK_API_KEY is from platform.deepseek.com."
     },
     {
-      "match": "vision-*",
+      "match": "google/*",
       "base_url": "https://openrouter.ai/api",
       "forImages": true,
       "forImagesModel": "google/gemini-2.5-flash-lite",
-      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" }
+      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" },
+      "_note": "Vision fallback: marks this route as the forImages target. When any backend rejects an image, the request is rerouted here with body.model rewritten to forImagesModel. Also catches direct google/* calls."
     }
   ]
 }
