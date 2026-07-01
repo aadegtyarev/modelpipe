@@ -44,6 +44,8 @@ const PRICE_MAP = {
   "glm-5.2":               { input: 1.4,  output: 4.4  },
   "GLM-5-Turbo":           { input: 1.2,  output: 4.0  },
   "glm-5-turbo":           { input: 1.2,  output: 4.0  },
+  "GLM-5.1":               { input: 1.4,  output: 4.4  },
+  "glm-5.1":               { input: 1.4,  output: 4.4  },
   "GLM-5":                 { input: 1.0,  output: 3.2  },
   "glm-5":                 { input: 1.0,  output: 3.2  },
   "GLM-4.7":               { input: 0.6,  output: 2.2  },
