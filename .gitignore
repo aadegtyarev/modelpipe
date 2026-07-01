@@ -6,3 +6,5 @@ npm-debug.log*
 .env.*
 routes.json
 routes.local.json
+.playwright-mcp/
+*.png
