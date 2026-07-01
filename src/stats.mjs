@@ -301,12 +301,6 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
     },
 
     flush(callback) {
-      if (inputTokens === 0 && outputTokens === 0 && totalBuffer.length > 0) {
-        try {
-          const tmp = `/tmp/mp-dump-${providerId}-${Date.now()}.txt`;
-          fs.writeFileSync(tmp, totalBuffer.slice(0, 32768));
-        } catch {}
-      }
       // If the SSE parser didn't catch tokens, try fallback parsing
       if (inputTokens === 0 && outputTokens === 0) {
         if (totalBuffer.trim().startsWith("{")) {
