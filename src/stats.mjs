@@ -720,14 +720,11 @@ function ago(ts){const s=Math.floor((Date.now()-ts)/1000);return s<5?"now":s<60?
 function usd(v){return'$'+v.toFixed(3)}
 function pricestr(pin,pout){if(pin==null)return'price —';return'$'+pin+'/$'+pout+' per 1M in/out'}
 
-function getPlanPrice(pid,stats,glmQ,savedPrices){
+function getPlanPrice(pid,stats,glmQ){
   const defs={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
   const planName=pid==='anthropic'?stats.anthropicPlan:(pid==='glm'?glmQ.plan:null);
   const defPrice=(defs[pid]||{})[planName]||0;
-  let price=defPrice;
-  if(stats.plans&&stats.plans[pid]!=null)price=stats.plans[pid];
-  if(savedPrices[pid]!=null)price=savedPrices[pid];
-  return price;
+  return (stats.plans&&stats.plans[pid]!=null)?stats.plans[pid]:defPrice;
 }
 
 const COLORS=['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#79c0ff','#f0883e','#56d364'];
@@ -735,26 +732,25 @@ const colors={};
 
 let histMode=null; // null = live, id = viewing historical session
 
-// Settings: load/save plan prices from localStorage
-function loadPrices(){
-  try{return JSON.parse(localStorage.getItem('mp_plans')||'{}')}catch{return{}}
-}
-function savePrices(){
+// Settings: save prices to server config
+async function savePrices(){
   const p={};
   for(const pid of['anthropic','glm','deepseek','openrouter']){
     const v=parseFloat($('planPrice_'+pid).value);
-    if(v>=0)p[pid]=v;
+    if(!isNaN(v)&&v>=0)p[pid]=v;
   }
-  localStorage.setItem('mp_plans',JSON.stringify(p));
+  await fetch("/v1/plans",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(p)});
   load();
 }
 function toggleSettings(){
   const s=$('settings');
   s.style.display=s.style.display==='none'?'flex':'none';
   if(s.style.display==='flex'){
-    const p=loadPrices();
-    for(const pid of['anthropic','glm','deepseek','openrouter'])
-      $('planPrice_'+pid).value=p[pid]!=null?p[pid]:'';
+    fetch("/v1/stats").then(r=>r.json()).then(st=>{
+      const pp=st.plans||{};
+      for(const pid of['anthropic','glm','deepseek','openrouter'])
+        $('planPrice_'+pid).value=pp[pid]!=null?pp[pid]:'';
+    });
   }
 }
 
@@ -811,7 +807,6 @@ async function render(stats,quotas){
 
   // Session bar — effective cost based on subscriptions
   const PLAN_DEFAULTS={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
-  const savedPrices=loadPrices();
   const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
   const modelArr=Object.values(stats.models||{});
   const doneProviders=new Set();
@@ -820,11 +815,9 @@ async function render(stats,quotas){
     if(doneProviders.has(m.providerId))continue;
     doneProviders.add(m.providerId);
     const planName=m.providerId==='anthropic'?stats.anthropicPlan:(m.providerId==='glm'?glmQ.plan:null);
-    // Price priority: localStorage > config.plans > defaults
     const defPrice=(PLAN_DEFAULTS[m.providerId]||{})[planName];
-    let price=(stats.plans&&stats.plans[m.providerId]!=null)?stats.plans[m.providerId]:defPrice;
-    if(savedPrices[m.providerId]!=null)price=savedPrices[m.providerId];
-    if(planName||savedPrices[m.providerId]!=null){
+    const price=(stats.plans&&stats.plans[m.providerId]!=null)?stats.plans[m.providerId]:defPrice;
+    if(planName||(stats.plans&&stats.plans[m.providerId]!=null)){
       effectiveCost+=(price||0)/720*hours;
     }else{
       effectiveCost+=modelArr.filter(x=>x.providerId===m.providerId).reduce((s,x)=>s+(x.cost||0),0);
@@ -921,7 +914,7 @@ async function render(stats,quotas){
       rows.push('<span class="l">multiplier</span> <span style="color:'+(glmQ.multiplier>1?'var(--orange)':'var(--green)')+'">'+glmQ.multiplierLabel+'</span>');
     }
     // 3. Plan vs API (any provider with a price)
-    const pp=getPlanPrice(p.id,stats,glmQ,savedPrices);
+    const pp=getPlanPrice(p.id,stats,glmQ);
     if(pp>0&&p.requests>0){
       const planRate=pp/720;
       const apiRate=p.cost/hours;

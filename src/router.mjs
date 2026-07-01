@@ -738,6 +738,21 @@ export function createRouter(config, options = {}) {
       res.end(JSON.stringify({ ok: true, startedAt: stats.snapshot().session.startedAt }));
       return;
     }
+    // POST /v1/plans — update subscription prices in-memory
+    if (dashboard && req.method === "POST" && req.url === "/v1/plans") {
+      readBody(req, 4096).then((body) => {
+        try {
+          const plans = JSON.parse(body.toString("utf8"));
+          if (typeof plans !== "object") throw new Error("must be an object");
+          config.plans = { ...(config.plans || {}), ...plans };
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, plans: config.plans }));
+        } catch (e) {
+          sendError(res, 400, `invalid plans: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid plans"));
+      return;
+    }
 
     // GET /v1/models (and the bare /models) returns the configured routes as a
     // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
