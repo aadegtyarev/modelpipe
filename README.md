@@ -125,12 +125,15 @@ ones, since first-match wins.
 
 ## Routes config
 
-A config is JSON: an optional `listen` block and a `routes` array. Each route has a
-`match` glob over the model id, a backend `base_url`, and an `auth` rule.
+A config is JSON: an optional `listen` block, optional dashboard flags, and a `routes`
+array. Each route has a `match` glob over the model id, a backend `base_url`, and an
+`auth` rule.
 
 ```json
 {
   "listen": { "host": "127.0.0.1", "port": 8787 },
+  "dashboard": true,
+  "glmPlan": "pro",
   "routes": [
     { "match": "claude-*", "base_url": "https://api.anthropic.com", "auth": "passthrough" },
     { "match": "deepseek-*", "base_url": "https://api.deepseek.com/anthropic",
@@ -150,6 +153,11 @@ Anthropic-format backends (anthropic, deepseek, z.ai GLM, openrouter) with their
 `base_url` and `auth` filled in — copy a provider's values into a route instead of
 looking them up. **Keys live in environment variables, never in the config** — the
 config only names the env var, read at request time and never logged.
+
+| Config field | Default | Meaning |
+| --- | --- | --- |
+| `dashboard` | `false` | Enable the usage dashboard (see below). |
+| `glmPlan` | `"pro"` | GLM Coding Plan tier: `"lite"`, `"pro"`, or `"max"`. Only used when `dashboard` is true — selects the budget for artificial 5-hour / weekly quota bars. |
 
 ### Vision routing
 
@@ -201,6 +209,47 @@ MODEL_ROUTER_LOG=1 modelpipe routes.json
 Prints one `model -> host` line per request to stderr (`[model-router] <model> -> <host>`)
 so you can confirm exactly which id arrived and where it routed — never a key, body, or
 header. Off by default.
+
+## Dashboard
+
+When `"dashboard": true` is set in the config, modelpipe collects per-request usage data
+and serves a live monitoring page at `http://127.0.0.1:8787/dashboard`. No installation
+required — the page is embedded in the proxy process.
+
+**What it shows:**
+
+- **Session bar** — total cost, requests, tokens, start time.
+- **Model cards** — each model with its provider, API pricing ($X/$Y per 1M in/out),
+  tokens consumed, and dollar cost. Models sorted by spend.
+- **Token chart** — cumulative tokens per model over time (last 200 requests).
+- **Quotas** — DeepSeek balance, OpenRouter daily credits, Anthropic RPM/TPM rate limits
+  (captured from response headers; for the Rate Limits API, set `ANTHROPIC_API_KEY` in
+  `.env` even if the traffic route stays passthrough).
+- **GLM Coding Plan** — artificial 5-hour and weekly quota bars estimated from token
+  counts × API pricing. The plan–vs–raw-API comparison shows whether the subscription
+  pays off. Displays the current peak/off-peak multiplier in local time.
+- **Request log** — last 50 requests with timestamp, model, tokens in/out, cost,
+  duration (ms).
+- **Session management** — "New Session" button resets counters and archives the current
+  session; history dropdown selects any of the last 20 sessions. Sessions persist to
+  `~/.modelpipe/sessions.json` across proxy restarts.
+
+**Pricing catalog.** Built-in prices for `claude-*`, `deepseek-*`, `glm-*`, and
+`google/gemini-*` models. Unknown models show `price —` in the card and $0.00 cost
+(they still count tokens and appear in the chart). The catalog lives in `src/stats.mjs`
+(`PRICE_MAP`) — add entries there for models not yet covered.
+
+**API endpoints** (only when `dashboard: true`):
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /v1/stats` | Per-model usage, session totals, timeline (last 200), GLM quota estimation. |
+| `GET /v1/quotas` | External quota snapshot: DeepSeek balance, OpenRouter credits, Anthropic rate limits. |
+| `GET /v1/sessions` | Archived session history (up to 20). |
+| `POST /v1/sessions/reset` | Archives current session and starts a new one. |
+
+All endpoints are JSON, secret-free (no keys, no env-var names, only aggregated counts),
+served only on localhost.
 
 ## Security posture
 
