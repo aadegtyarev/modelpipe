@@ -16,6 +16,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import zlib from "node:zlib";
 
 // Persistence file for session history (survives restarts)
 const SESSIONS_FILE = path.join(os.homedir(), ".modelpipe", "sessions.json");
@@ -240,11 +241,30 @@ export class StatsCollector {
 // NEVER buffers the full response — each chunk is pushed through as soon as it
 // arrives.
 
+// Wrap upstream response with gunzip if it's compressed, returning the readable
+// stream to pipe from and a headers object with Content-Encoding stripped.
+export function decompressIfNeeded(upstreamRes) {
+  const ce = (upstreamRes.headers["content-encoding"] || "").toLowerCase();
+  if (ce.includes("gzip") || ce.includes("deflate") || ce.includes("br")) {
+    const headers = { ...upstreamRes.headers };
+    delete headers["content-encoding"];
+    delete headers["content-length"];
+    let stream = upstreamRes;
+    if (ce.includes("gzip") || ce.includes("deflate")) {
+      stream = upstreamRes.pipe(zlib.createUnzip());
+    } else if (ce.includes("br")) {
+      stream = upstreamRes.pipe(zlib.createBrotliDecompress());
+    }
+    return { stream, headers, decompressed: true };
+  }
+  return { stream: upstreamRes, headers: upstreamRes.headers, decompressed: false };
+}
+
 export function createUsageTracker(stats, { providerId, model, startTime }) {
   let buffer = "";
   let inputTokens = 0;
   let outputTokens = 0;
-  let totalBuffer = ""; // for non-streaming JSON accumulation
+  let totalBuffer = "";
 
   return new Transform({
     transform(chunk, _encoding, callback) {
@@ -252,15 +272,22 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
       const text = chunk.toString("utf8");
       buffer += text;
       totalBuffer += text;
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-      for (const raw of events) {
-        const eventType = raw.match(/^event:\s*(\S+)/m)?.[1];
-        if (!eventType) continue;
-        const dataLine = raw.match(/^data:\s*(.+)/m)?.[1];
-        if (!dataLine) continue;
+      // Split on double-newline (handles \n\n and \r\n\r\n)
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || "";
+      for (const raw of parts) {
+        let eventType = null, dataStr = null;
+        for (const line of raw.split(/\r?\n/)) {
+          const m = line.match(/^event:\s*(.+)/);
+          if (m) eventType = m[1].trim();
+          else {
+            const d = line.match(/^data:\s*(.+)/);
+            if (d) dataStr = d[1];
+          }
+        }
+        if (!eventType || !dataStr) continue;
         try {
-          const data = JSON.parse(dataLine);
+          const data = JSON.parse(dataStr);
           if (eventType === "message_start" && data.message && data.message.usage) {
             inputTokens += data.message.usage.input_tokens || 0;
           } else if (eventType === "message_delta" && data.usage) {
@@ -274,17 +301,47 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
     },
 
     flush(callback) {
-      // If we didn't catch any SSE usage events, try parsing the full body as
-      // a non-streaming JSON response (has top-level `usage`).
-      if (inputTokens === 0 && outputTokens === 0 && totalBuffer.trim().startsWith("{")) {
+      if (inputTokens === 0 && outputTokens === 0 && totalBuffer.length > 0) {
         try {
-          const json = JSON.parse(totalBuffer.trim());
-          if (json.usage) {
-            inputTokens = json.usage.input_tokens || 0;
-            outputTokens = json.usage.output_tokens || 0;
-          }
-        } catch {
-          /* not parseable JSON — leave tokens at 0 */
+          const tmp = `/tmp/mp-dump-${providerId}-${Date.now()}.txt`;
+          fs.writeFileSync(tmp, totalBuffer.slice(0, 32768));
+        } catch {}
+      }
+      // If the SSE parser didn't catch tokens, try fallback parsing
+      if (inputTokens === 0 && outputTokens === 0) {
+        if (totalBuffer.trim().startsWith("{")) {
+          // Non-streaming JSON response
+          try {
+            const json = JSON.parse(totalBuffer.trim());
+            if (json.usage) {
+              inputTokens = json.usage.input_tokens || 0;
+              outputTokens = json.usage.output_tokens || 0;
+            }
+          } catch { /* not parseable */ }
+        } else if (totalBuffer.includes("data:")) {
+          // SSE stream — parse accumulated events as a last resort
+          try {
+            for (const raw of totalBuffer.split(/\r?\n\r?\n/)) {
+              let eventType = null, dataStr = null;
+              for (const line of raw.split(/\r?\n/)) {
+                const m = line.match(/^event:\s*(.+)/);
+                if (m) eventType = m[1].trim();
+                else {
+                  const d = line.match(/^data:\s*(.+)/);
+                  if (d) dataStr = d[1];
+                }
+              }
+              if (!eventType || !dataStr) continue;
+              try {
+                const data = JSON.parse(dataStr);
+                if (eventType === "message_start" && data.message && data.message.usage) {
+                  inputTokens += data.message.usage.input_tokens || 0;
+                } else if (eventType === "message_delta" && data.usage) {
+                  outputTokens += data.usage.output_tokens || 0;
+                }
+              } catch { /* skip malformed */ }
+            }
+          } catch { /* ignore parse errors */ }
         }
       }
       if (stats && providerId) {

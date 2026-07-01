@@ -46,6 +46,7 @@ import { fileURLToPath } from "node:url";
 import {
   StatsCollector, QuotaPoller, DASHBOARD_HTML,
   createUsageTracker, providerIdFromUrl, computeGlmQuota,
+  decompressIfNeeded,
 } from "./stats.mjs";
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
@@ -423,13 +424,14 @@ function pipeResponse(upstreamRes, res, ctx = null) {
   }
 
   if (ctx && ctx.stats && upstreamRes.statusCode < 400) {
+    const { stream, headers, decompressed } = decompressIfNeeded(upstreamRes);
     const tracker = createUsageTracker(ctx.stats, {
       providerId: ctx.providerId,
       model: ctx.model,
       startTime: ctx.startTime,
     });
-    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-    upstreamRes.pipe(tracker).pipe(res);
+    res.writeHead(upstreamRes.statusCode || 502, headers);
+    stream.pipe(tracker).pipe(res);
   } else {
     res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
     upstreamRes.pipe(res);
