@@ -30,8 +30,6 @@ import {
   pickVisionRoute,
   validateConfig,
   listConfig,
-  parseModelsCatalog,
-  expandModels,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -128,10 +126,10 @@ function request(port, payload, { raw } = {}) {
 // A GET through the router (for the /v1/models listing intercept). No body; resolves
 // with status + body. Distinct from `request` (POST /v1/messages) so the listing and
 // the routing paths stay separately exercisable.
-function get(port, urlPath, headers = {}) {
+function get(port, urlPath) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { hostname: "127.0.0.1", port, path: urlPath, method: "GET", headers },
+      { hostname: "127.0.0.1", port, path: urlPath, method: "GET" },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -207,20 +205,6 @@ async function main() {
     rewriteModelInBody(Buffer.from('{"model":"glm-x"}'), "").toString(), '{"model":"glm-x"}');
   check("rewriteModelInBody bad json ⇒ body unchanged (fail-safe)",
     rewriteModelInBody(Buffer.from("not json"), "vendor/m").toString(), "not json");
-
-  // ── parseModelsCatalog pure unit (expand=1 catalog parsing, no network) ───────
-  check("parseModelsCatalog reads data[].id",
-    JSON.stringify(parseModelsCatalog(Buffer.from('{"data":[{"id":"a-1"},{"id":"a-2"}]}'))), '["a-1","a-2"]');
-  check("parseModelsCatalog drops a non-string id",
-    JSON.stringify(parseModelsCatalog(Buffer.from('{"data":[{"id":"a-1"},{"id":42},{"notid":"x"}]}'))), '["a-1"]');
-  check("parseModelsCatalog empty data ⇒ empty array",
-    JSON.stringify(parseModelsCatalog(Buffer.from('{"data":[]}'))), "[]");
-  let badCatalogThrew = false;
-  try { parseModelsCatalog(Buffer.from('{"models":[]}')); } catch { badCatalogThrew = true; }
-  check("parseModelsCatalog throws when data[] is missing", badCatalogThrew, true);
-  let nonJsonCatalogThrew = false;
-  try { parseModelsCatalog(Buffer.from("not json")); } catch { nonJsonCatalogThrew = true; }
-  check("parseModelsCatalog throws on bad JSON", nonJsonCatalogThrew, true);
 
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },
@@ -328,28 +312,6 @@ async function main() {
   check("validateConfig rejects a non-boolean vision flag", badVisionFlagThrew, true);
   check("validateConfig accepts vision:false",
     validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", vision: false, auth: { header: "x-api-key", keyEnv: "K" } }] }).routes[0].vision, false);
-  check("validateConfig accepts models_url + models_format",
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", models_url: "https://a.example/v1/models", models_format: "openai", auth: { header: "x-api-key", keyEnv: "K" } }] }).routes[0].models_format, "openai");
-  let modelsUrlNoFormatThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", models_url: "https://a.example/v1/models", auth: { header: "x-api-key", keyEnv: "K" } }] });
-  } catch { modelsUrlNoFormatThrew = true; }
-  check("validateConfig rejects models_url without models_format", modelsUrlNoFormatThrew, true);
-  let badModelsFormatThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", models_url: "https://a.example/v1/models", models_format: "weird", auth: { header: "x-api-key", keyEnv: "K" } }] });
-  } catch { badModelsFormatThrew = true; }
-  check("validateConfig rejects an unknown models_format", badModelsFormatThrew, true);
-  let badModelsUrlThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", models_url: "not-a-url", models_format: "openai", auth: { header: "x-api-key", keyEnv: "K" } }] });
-  } catch { badModelsUrlThrew = true; }
-  check("validateConfig rejects a non-URL models_url", badModelsUrlThrew, true);
-  let strayModelsFormatThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", models_format: "openai", auth: { header: "x-api-key", keyEnv: "K" } }] });
-  } catch { strayModelsFormatThrew = true; }
-  check("validateConfig rejects models_format without models_url", strayModelsFormatThrew, true);
 
   // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
   const listSample = {
@@ -359,7 +321,6 @@ async function main() {
       { match: "deepseek-*", base_url: "https://api.deepseek.com/anthropic", auth: { header: "x-api-key", keyEnv: "DEEPSEEK_API_KEY" } },
       { match: "vision-*", base_url: "https://openrouter.ai/api", forImages: true, forImagesModel: "google/gemini-2.5-flash-lite", auth: { header: "Authorization", scheme: "Bearer", keyEnv: "OPENROUTER_API_KEY" } },
       { match: "nonvis-*", base_url: "https://nv.example", vision: false, auth: { header: "x-api-key", keyEnv: "NV_KEY" } },
-      { match: "glm-*", base_url: "https://api.z.ai/api/anthropic", models_url: "https://api.z.ai/api/paas/v4/models", models_format: "openai", auth: { header: "Authorization", scheme: "Bearer", keyEnv: "ZAI_KEY" } },
     ],
   };
   const listed = listConfig(listSample);
@@ -379,9 +340,6 @@ async function main() {
   check("listConfig surfaces vision:false", listed.routes[3].vision, false);
   check("listConfig omits forImages when absent", "forImages" in listed.routes[1], false);
   check("listConfig omits vision when absent", "vision" in listed.routes[0], false);
-  check("listConfig surfaces models_url", listed.routes[4].models_url, "https://api.z.ai/api/paas/v4/models");
-  check("listConfig surfaces models_format", listed.routes[4].models_format, "openai");
-  check("listConfig omits models_url when absent", "models_url" in listed.routes[0], false);
   // proxyUrl surfaced when present.
   check("listConfig surfaces proxyUrl when present", listed.proxyUrl, "http://127.0.0.1:8787");
   // NEVER a key value / secret-shaped field: only the keyEnv NAME is present on the auth view.
@@ -425,42 +383,6 @@ async function main() {
   });
   const mPort = await listen(midStub);
 
-  // A provider model-catalog stub for GET /v1/models?expand=1 (src/router.mjs
-  // fetchModelCatalog). mode "ok" → a {data:[{id},...]} catalog mixing ids that DO and
-  // do NOT match the glob under test (proves the filter, not just the fetch); "error" →
-  // 500; "badjson" → 200 with an unparseable body. Both failure modes must fall back to
-  // the unexpanded glob (concrete:false), never break the endpoint.
-  function makeCatalogStub(initialMode) {
-    const received = [];
-    let mode = initialMode;
-    const server = http.createServer((req, res) => {
-      received.push({ url: req.url, headers: req.headers });
-      if (mode === "ok") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "glm-4.6" }, { id: "glm-4.5-air" }, { id: "gpt-4-turbo" }] }));
-        return;
-      }
-      if (mode === "badjson") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end("not json");
-        return;
-      }
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "catalog unavailable" }));
-    });
-    return { server, received, setMode: (m) => { mode = m; } };
-  }
-  // Three FIXED-mode stubs (not mode-switched) so the per-process catalog cache
-  // (keyed by models_url, see MODELS_CACHE_TTL_MS) can never make one scenario's earlier
-  // success mask a later failure test against the same URL — each scenario gets its own
-  // models_url, so a single expand=1 call (no waiting on cache TTL) exercises all of them.
-  const catalogStub = makeCatalogStub("ok");
-  const catalogErrorStub = makeCatalogStub("error");
-  const catalogBadJsonStub = makeCatalogStub("badjson");
-  const catalogPort = await listen(catalogStub.server);
-  const catalogErrorPort = await listen(catalogErrorStub.server);
-  const catalogBadJsonPort = await listen(catalogBadJsonStub.server);
-
   process.env.TEST_ANTHROPIC_KEY = "ANT-SECRET-123";
   process.env.TEST_DEEPSEEK_KEY = "DS-SECRET-456";
   delete process.env.TEST_UNSET_KEY_XYZ;
@@ -483,21 +405,6 @@ async function main() {
       // upstream connect-refused ⇒ 502; mid-stream socket drop ⇒ headersSent abort.
       { match: "dead-*", base_url: `http://127.0.0.1:${deadPort}`, auth: { header: "x-api-key", keyEnv: "TEST_ANTHROPIC_KEY" } },
       { match: "midstream-*", base_url: `http://127.0.0.1:${mPort}`, auth: { header: "x-api-key", keyEnv: "TEST_ANTHROPIC_KEY" } },
-      // expand=1 fixtures (src/router.mjs expandModels):
-      // already-concrete (no `*`) ⇒ returned as-is, concrete:true, no catalog fetch.
-      { match: "literal-model-1", base_url: `http://127.0.0.1:${aPort}`, auth: { header: "x-api-key", keyEnv: "TEST_ANTHROPIC_KEY" } },
-      // glob + models_url ⇒ expanded against the catalog stub, filtered by the glob.
-      { match: "glm-*", base_url: `http://127.0.0.1:${dPort}`, models_url: `http://127.0.0.1:${catalogPort}/v1/models`, models_format: "openai", auth: { header: "Authorization", scheme: "Bearer", keyEnv: "TEST_DEEPSEEK_KEY" } },
-      // glob + models_url, but the route's OWN key env is unset ⇒ catalog fetch fails
-      // closed ⇒ falls back to the unexpanded glob (concrete:false), endpoint still 200.
-      { match: "noupstream-*", base_url: `http://127.0.0.1:${aPort}`, models_url: `http://127.0.0.1:${catalogPort}/v1/models`, models_format: "openai", auth: { header: "x-api-key", keyEnv: "TEST_UNSET_KEY_XYZ" } },
-      // glob + models_url + auth:"passthrough" ⇒ the catalog fetch carries the CLIENT's
-      // own incoming auth header (no backend key to swap in).
-      { match: "ptglob-*", base_url: `http://127.0.0.1:${pPort}`, auth: "passthrough", models_url: `http://127.0.0.1:${catalogPort}/v1/models`, models_format: "openai" },
-      // glob + models_url, but the CATALOG BACKEND itself fails: 500 / unparseable body.
-      // Both must fall back to the unexpanded glob, never break the endpoint.
-      { match: "errglob-*", base_url: `http://127.0.0.1:${aPort}`, models_url: `http://127.0.0.1:${catalogErrorPort}/v1/models`, models_format: "openai", auth: { header: "x-api-key", keyEnv: "TEST_ANTHROPIC_KEY" } },
-      { match: "badjsonglob-*", base_url: `http://127.0.0.1:${aPort}`, models_url: `http://127.0.0.1:${catalogBadJsonPort}/v1/models`, models_format: "openai", auth: { header: "x-api-key", keyEnv: "TEST_ANTHROPIC_KEY" } },
     ],
   };
   const router = createRouter(config);
@@ -606,70 +513,6 @@ async function main() {
     const m11post = await request(routerPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "POST-STILL-ROUTES" }] });
     check("POST /v1/messages still routes after the models intercept", anthropicStub.received.length, anthropicBefore11 + 1);
     check("POST /v1/messages still 200 after the models intercept", m11post.status, 200);
-    // without expand, the response carries neither new field — locks in byte-for-byte
-    // backward compatibility for an existing consumer (e.g. --probe).
-    check("GET /v1/models (no expand) has no \"match\" field", "match" in m11data.data[0], false);
-    check("GET /v1/models (no expand) has no \"concrete\" field", "concrete" in m11data.data[0], false);
-
-    // 12. GET /v1/models?expand=1: globs resolved against each route's models_url. Carries
-    // a client front-key so the passthrough-route catalog-fetch case (12d) is exercisable.
-    const m12 = await get(routerPort, "/v1/models?expand=1", { "x-api-key": "CLIENT-FRONT-KEY" });
-    check("GET /v1/models?expand=1 ⇒ 200", m12.status, 200);
-    const m12data = JSON.parse(m12.body);
-    const byMatch = (match) => m12data.data.filter((e) => e.match === match);
-
-    // 12a. already-concrete (no `*`): returned as-is, concrete:true, no catalog hit.
-    const literalEntries = byMatch("literal-model-1");
-    check("expand: concrete route ⇒ exactly one entry", literalEntries.length, 1);
-    check("expand: concrete route id unchanged", literalEntries[0].id, "literal-model-1");
-    check("expand: concrete route is concrete:true", literalEntries[0].concrete, true);
-
-    // 12b. glob + models_url: expanded to the catalog ids that match THIS route's glob —
-    // "gpt-4-turbo" (also in the stub's catalog) must be filtered OUT.
-    const glmEntries = byMatch("glm-*");
-    const glmIds = glmEntries.map((e) => e.id).sort();
-    check("expand: glm-* expands to exactly its matching catalog ids",
-      JSON.stringify(glmIds), JSON.stringify(["glm-4.5-air", "glm-4.6"]));
-    check("expand: glm-* entries are concrete:true", glmEntries.every((e) => e.concrete === true), true);
-    check("expand: glm-* entries carry the backend host (from listModels), not the catalog host",
-      glmEntries.every((e) => e.host === `127.0.0.1:${dPort}`), true);
-    check("expand: glm-* expansion did not leak the backend key",
-      m12.body.includes("DS-SECRET-456"), false);
-
-    // 12c. glob + models_url but the route's own key env is unset: the catalog fetch
-    // fails closed (resolveAuthHeader throws) ⇒ falls back to the unexpanded glob —
-    // the endpoint still answers 200 (one route's failure doesn't break the others).
-    const noUpstreamEntries = byMatch("noupstream-*");
-    check("expand: unset-key route falls back to exactly one (glob) entry", noUpstreamEntries.length, 1);
-    check("expand: unset-key route id is the unexpanded glob", noUpstreamEntries[0].id, "noupstream-*");
-    check("expand: unset-key route is concrete:false", noUpstreamEntries[0].concrete, false);
-
-    // 12d. glob + models_url with no glob match in the catalog (the stub's ids are all
-    // glm-*/gpt-4-turbo, none start with "ptglob-") ⇒ falls back to the glob, BUT the
-    // catalog fetch DID happen carrying the CLIENT's own auth header (passthrough — no
-    // backend key to swap in for this route).
-    const ptglobEntries = byMatch("ptglob-*");
-    check("expand: zero-match passthrough route falls back to the glob", ptglobEntries.length, 1);
-    check("expand: zero-match passthrough route is concrete:false", ptglobEntries[0].concrete, false);
-    const ptCatalogReq = catalogStub.received.find((r) => r.headers["x-api-key"] === "CLIENT-FRONT-KEY");
-    check("expand: passthrough route's catalog fetch carried the CLIENT's own auth header, not a backend key",
-      Boolean(ptCatalogReq), true);
-
-    // 12e. routes with NO models_url stay an unexpanded glob, concrete:false, regardless
-    // of expand=1 (e.g. claude-*, deepseek-*) — same as the non-expand response.
-    const claudeEntries = byMatch("claude-*");
-    check("expand: a route with no models_url stays the glob", claudeEntries.length, 1);
-    check("expand: a route with no models_url is concrete:false", claudeEntries[0].concrete, false);
-
-    // 12f. glob + models_url, but the CATALOG BACKEND itself fails (500 / unparseable
-    // body): falls back to the unexpanded glob — fail-safe, the endpoint stays 200
-    // rather than failing the whole listing over one backend's outage.
-    const errEntries = byMatch("errglob-*");
-    check("expand: catalog backend 500 ⇒ falls back to exactly one (glob) entry", errEntries.length, 1);
-    check("expand: catalog backend 500 ⇒ concrete:false", errEntries[0].concrete, false);
-    const badJsonEntries = byMatch("badjsonglob-*");
-    check("expand: catalog backend bad JSON ⇒ falls back to exactly one (glob) entry", badJsonEntries.length, 1);
-    check("expand: catalog backend bad JSON ⇒ concrete:false", badJsonEntries[0].concrete, false);
   } finally {
     process.stderr.write = realStderrWrite;
     delete process.env.TEST_ANTHROPIC_KEY;
@@ -680,9 +523,6 @@ async function main() {
     await close(bearerStub.server);
     await close(passthroughStub.server);
     await close(midStub);
-    await close(catalogStub.server);
-    await close(catalogErrorStub.server);
-    await close(catalogBadJsonStub.server);
   }
 
   // ── vision fallback e2e (reactive catch-400 reroute) ──────────────────────

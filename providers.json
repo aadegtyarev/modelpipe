@@ -5,8 +5,7 @@
     "base_url": "the backend ORIGIN plus the path prefix that precedes /v1/messages. The router appends the client's request path (/v1/messages) to this base path — so the prefix here, plus /v1/messages, must equal the provider's real Anthropic endpoint. OVERRIDABLE per route (regional hosts, a dashboard-specific URL).",
     "models": "glob patterns over the model id that select this provider (only `*` is a wildcard)",
     "auth": "{ header, scheme?, keyEnv } — the header to send the backend key under, an optional scheme prefix (e.g. \"Bearer\" → `Authorization: Bearer <key>`), and the env-var NAME holding the key (read at request time, never logged). A route may OVERRIDE this with the string \"passthrough\" to forward the client's incoming auth header unchanged (no backend key) — allowed only for a provider whose `supports_passthrough` is true.",
-    "supports_passthrough": "true when the provider can run keyless via auth:\"passthrough\" (a subscription/OAuth session needs no API key for it); absent ⇒ false",
-    "models_url / models_format": "OPTIONAL — the provider's own model-listing endpoint + response shape (\"openai\" or \"anthropic\", both `{ data: [{ id }] }`), for GET /v1/models?expand=1 to resolve a glob route into concrete ids. Present only where the provider's catalog endpoint is known; absent ⇒ a route copying this provider stays an unexpanded glob under expand=1."
+    "supports_passthrough": "true when the provider can run keyless via auth:\"passthrough\" (a subscription/OAuth session needs no API key for it); absent ⇒ false"
   },
   "providers": [
     {
@@ -29,9 +28,7 @@
       "base_url": "https://api.z.ai/api/anthropic",
       "models": ["GLM-*", "glm-*"],
       "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY" },
-      "models_url": "https://api.z.ai/api/paas/v4/models",
-      "models_format": "openai",
-      "_note": "z.ai GLM Coding Plan SPECIFICALLY (verified 2026-06-30): base path /api/anthropic → /api/anthropic/v1/messages, Authorization: Bearer with the Coding-Plan token (ZAI_API_KEY). base_url is overridable per route for a regional host (open.bigmodel.cn) or a dashboard-specific Coding-Plan URL. The coding/paas/v4 URL is GLM's NON-Anthropic native endpoint for /v1/messages — but it IS the model-listing endpoint (models_url) for GET /v1/models?expand=1, an OpenAI-shaped {data:[{id}]} catalog, same Bearer key."
+      "_note": "z.ai GLM Coding Plan SPECIFICALLY (verified 2026-06-30): base path /api/anthropic → /api/anthropic/v1/messages, Authorization: Bearer with the Coding-Plan token (ZAI_API_KEY). base_url is overridable per route for a regional host (open.bigmodel.cn) or a dashboard-specific Coding-Plan URL. The coding/paas/v4 URL is GLM's NON-Anthropic native endpoint, NOT this one."
     },
     {
       "id": "openrouter",
