@@ -43,6 +43,10 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  StatsCollector, QuotaPoller, DASHBOARD_HTML,
+  createUsageTracker, providerIdFromUrl, computeGlmQuota,
+} from "./stats.mjs";
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
 
@@ -232,6 +236,23 @@ export function validateConfig(config) {
     if (typeof route.auth.keyEnv !== "string" || route.auth.keyEnv.length === 0) throw new Error(`${at}.auth.keyEnv: missing`);
   }
   if (visionCount > 1) throw new Error("config.routes: at most one route may set forImages: true (the vision fallback target)");
+
+  // dashboard: optional boolean (default false). When true, modelpipe collects
+  // per-provider usage stats (tokens, requests, RPS), polls external quota APIs,
+  // and serves /v1/stats, /v1/quotas, and /dashboard endpoints.
+  if (config.dashboard !== undefined && config.dashboard !== true && config.dashboard !== false) {
+    throw new Error("config.dashboard: must be a boolean (default false) when present");
+  }
+  // glmPlan: optional string, "lite" | "pro" | "max" (default "pro"). Only used
+  // when dashboard is true. Selects the GLM Coding Plan tier for artificial quota
+  // estimation.
+  if (config.glmPlan !== undefined) {
+    const allowed = ["lite", "pro", "max"];
+    if (!allowed.includes(config.glmPlan)) {
+      throw new Error(`config.glmPlan: must be one of ${allowed.join(", ")}`);
+    }
+  }
+
   return config;
 }
 
@@ -382,18 +403,37 @@ const REROUTE_BUFFER_CAP = 64 * 1024;
 
 // Stream an upstream response straight back to the client — SSE/chunked passthrough.
 // A success (2xx) and every non-reroutable status take this path: nothing is buffered.
-function pipeResponse(upstreamRes, res) {
-  // Mid-stream upstream failure (the backend drops the socket after we began
-  // streaming): the response headers are already sent, so sendError can only tear the
-  // client connection down — never a write-after-headers crash.
+// When `ctx` is provided (dashboard enabled), the SSE stream is intercepted by a
+// zero-buffer Transform that extracts usage (input/output tokens) for stats recording,
+// and ratelimit headers are captured.
+function pipeResponse(upstreamRes, res, ctx = null) {
   const onUpstreamFail = () => {
+    if (ctx && ctx.stats) {
+      ctx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+    }
     if (res.headersSent) res.destroy();
     else sendError(res, 502, "upstream response error");
   };
   upstreamRes.on("error", onUpstreamFail);
   upstreamRes.on("aborted", onUpstreamFail);
-  res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-  upstreamRes.pipe(res);
+
+  // Capture ratelimit headers for Anthropic
+  if (ctx && ctx.stats && ctx.providerId) {
+    ctx.stats.recordRatelimitHeaders(ctx.providerId, upstreamRes.headers);
+  }
+
+  if (ctx && ctx.stats && upstreamRes.statusCode < 400) {
+    const tracker = createUsageTracker(ctx.stats, {
+      providerId: ctx.providerId,
+      model: ctx.model,
+      startTime: ctx.startTime,
+    });
+    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+    upstreamRes.pipe(tracker).pipe(res);
+  } else {
+    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+    upstreamRes.pipe(res);
+  }
 }
 
 // Read a (small) upstream response fully into a buffer, bounded by `cap`. Only used
@@ -431,20 +471,30 @@ function relayBuffered(res, status, upstreamHeaders, buffered) {
 // Send the buffered request to one backend route and hand its response to `onResponse`
 // (or stream it straight back when none is given). Pure routing + per-backend auth
 // swap — the body buffer is never transformed (passthrough; image bytes untouched).
-function proxyToRoute(route, req, res, body, log, { onResponse } = {}) {
+// `statsCtx` (optional): { stats, startTime } — when dashboard is enabled, carries the
+// stats collector and request start time for usage tracking.
+function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {}) {
   const passthrough = isPassthrough(route);
   let auth = null;
   if (!passthrough) {
     try {
       auth = resolveAuthHeader(route);
     } catch (err) {
+      if (statsCtx && statsCtx.stats) {
+        statsCtx.stats.record({
+          providerId: providerIdFromUrl(route.base_url),
+          model: modelFromBody(body),
+          durationMs: Date.now() - statsCtx.startTime,
+          inputTokens: 0, outputTokens: 0, status: err.status || 500,
+        });
+      }
       sendError(res, err.status || 500, err.message);
       return;
     }
   }
 
   const upstream = new URL(route.base_url);
-  log(`${modelFromBody(body)} -> ${upstream.host}`); // safe: model + hostname only, never key/body/header
+  log(`${modelFromBody(body)} -> ${upstream.host}`);
 
   // Passthrough keeps the client's auth header; key-swap drops it and sets the backend's.
   const headers = sanitizeHeaders(req.headers, upstream.host, { keepClientAuth: passthrough });
@@ -454,6 +504,9 @@ function proxyToRoute(route, req, res, body, log, { onResponse } = {}) {
   // A dropped/aborted client connection must not crash the process or leave the
   // upstream hanging.
   res.on("error", () => {});
+
+  const providerId = providerIdFromUrl(route.base_url);
+  const model = modelFromBody(body);
 
   const client = upstream.protocol === "http:" ? http : https;
   const upstreamReq = client.request(
@@ -465,9 +518,16 @@ function proxyToRoute(route, req, res, body, log, { onResponse } = {}) {
       method: req.method,
       headers,
     },
-    onResponse || ((upstreamRes) => pipeResponse(upstreamRes, res)),
+    onResponse || ((upstreamRes) => pipeResponse(upstreamRes, res, statsCtx
+      ? { stats: statsCtx.stats, providerId, model, startTime: statsCtx.startTime }
+      : null)),
   );
-  upstreamReq.on("error", () => sendError(res, 502, "upstream request failed"));
+  upstreamReq.on("error", () => {
+    if (statsCtx && statsCtx.stats) {
+      statsCtx.stats.record({ providerId, model, durationMs: Date.now() - statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+    }
+    sendError(res, 502, "upstream request failed");
+  });
   if (body.length) upstreamReq.write(body);
   upstreamReq.end();
 }
@@ -481,7 +541,9 @@ function makeResponseHandler(ctx) {
     // 2xx and every other non-400 stream straight back — a success / SSE is NEVER
     // buffered, so streaming stays intact.
     if (status !== 400) {
-      pipeResponse(upstreamRes, ctx.res);
+      pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
+        ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
+        : null);
       return;
     }
     // A 400: buffer the small error body and classify it.
@@ -495,6 +557,9 @@ function makeResponseHandler(ctx) {
         if (ctx.isVisionTarget) {
           // Loop guard: the vision target itself can't take the image — clear error,
           // never re-reroute (no infinite loop).
+          if (ctx.statsCtx && ctx.statsCtx.stats) {
+            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 422 });
+          }
           sendError(ctx.res, 422, "vision route cannot process this image request; not rerouting (loop guard)");
           return;
         }
@@ -506,15 +571,22 @@ function makeResponseHandler(ctx) {
           const visionBody = rewriteModelInBody(ctx.body, ctx.visionRoute.forImagesModel);
           proxyToRoute(ctx.visionRoute, ctx.req, ctx.res, visionBody, ctx.log, {
             onResponse: makeResponseHandler({ ...ctx, isVisionTarget: true }),
+            statsCtx: ctx.statsCtx,
           });
           return;
         }
         // No vision fallback configured — fail LOUD with a clear error, never the raw
         // cryptic upstream 400.
+        if (ctx.statsCtx && ctx.statsCtx.stats) {
+          ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 422 });
+        }
         sendError(ctx.res, 422, `model "${ctx.model}" cannot process images and no vision fallback is configured`);
         return;
       }
       // An ambiguous 400 (a real bad request) — relay it as-is, never reroute.
+      if (ctx.statsCtx && ctx.statsCtx.stats) {
+        ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
+      }
       relayBuffered(ctx.res, status, headers, buffered);
     });
   };
@@ -523,7 +595,8 @@ function makeResponseHandler(ctx) {
 // Route one buffered request to its backend, with the reactive vision fallback.
 // `nonVisionCache` is a per-process Map(model → true) of models a backend has already
 // rejected for images — ephemeral state, never the payload.
-function forward(config, req, res, body, log, nonVisionCache) {
+// `statsCtx` (optional): { stats } — when dashboard is enabled.
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null) {
   const model = modelFromBody(body);
   const route = pickRoute(model, config.routes);
   if (!route) {
@@ -532,6 +605,7 @@ function forward(config, req, res, body, log, nonVisionCache) {
   }
 
   const visionRoute = pickVisionRoute(config.routes);
+  const providerId = providerIdFromUrl(route.base_url);
 
   // Pre-route an image-bearing request straight to the vision target, skipping the
   // non-vision backend call, when the matched route is known non-vision — EITHER:
@@ -552,15 +626,17 @@ function forward(config, req, res, body, log, nonVisionCache) {
   ) {
     const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
     proxyToRoute(visionRoute, req, res, visionBody, log, {
-      onResponse: makeResponseHandler({ res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: true }),
+      onResponse: makeResponseHandler({ res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: true, providerId: providerIdFromUrl(visionRoute.base_url), statsCtx }),
+      statsCtx,
     });
     return;
   }
 
   proxyToRoute(route, req, res, body, log, {
     onResponse: makeResponseHandler({
-      res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute,
+      res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx,
     }),
+    statsCtx,
   });
 }
 
@@ -574,7 +650,72 @@ export function createRouter(config, options = {}) {
   // so a repeat image call pre-routes to the vision target without the failing first
   // hop. Ephemeral, holds only model ids — never any request payload.
   const nonVisionCache = new Map();
-  return http.createServer((req, res) => {
+
+  // Dashboard stats + quota polling (enabled by config.dashboard)
+  let stats = null;
+  let quotaPoller = null;
+  const dashboard = config.dashboard === true;
+  if (dashboard) {
+    stats = new StatsCollector();
+    // Collect keyEnv names from the routes config
+    const keyEnvs = {};
+    for (const route of config.routes) {
+      if (route.auth && typeof route.auth === "object" && route.auth.keyEnv) {
+        const pid = providerIdFromUrl(route.base_url);
+        if (pid === "deepseek" || pid === "openrouter") {
+          keyEnvs[pid] = route.auth.keyEnv;
+        }
+      }
+    }
+    // Anthropic uses a separate env var for Rate Limits API polling (optional —
+    // the traffic route can stay passthrough while a separate key polls limits).
+    if (process.env.ANTHROPIC_API_KEY) {
+      keyEnvs.anthropic = "ANTHROPIC_API_KEY";
+    }
+    if (Object.keys(keyEnvs).length > 0) {
+      quotaPoller = new QuotaPoller(keyEnvs);
+      quotaPoller.start(30000);
+    }
+  }
+
+  const server = http.createServer((req, res) => {
+    // Dashboard endpoints (before body reading)
+    if (dashboard && req.method === "GET") {
+      if (req.url === "/dashboard") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(DASHBOARD_HTML);
+        return;
+      }
+      if (req.url === "/v1/stats") {
+        const snap = stats.snapshot();
+        if (config.glmPlan) {
+          snap.glmQuota = computeGlmQuota(snap.timeline, config.glmPlan);
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(snap));
+        return;
+      }
+      if (req.url === "/v1/quotas") {
+        const quotas = quotaPoller ? quotaPoller.snapshot() : {};
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(quotas));
+        return;
+      }
+      if (req.url === "/v1/sessions") {
+        const history = stats.sessionHistory();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(history));
+        return;
+      }
+    }
+    // POST /v1/sessions/reset — start a new session (archives current)
+    if (dashboard && req.method === "POST" && req.url === "/v1/sessions/reset") {
+      stats.reset();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, startedAt: stats.snapshot().session.startedAt }));
+      return;
+    }
+
     // GET /v1/models (and the bare /models) returns the configured routes as a
     // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
     // it needs no request body and never reaches a backend — everything else (POST
@@ -586,9 +727,23 @@ export function createRouter(config, options = {}) {
       return;
     }
     readBody(req, maxBytes)
-      .then((body) => forward(config, req, res, body, log, nonVisionCache))
+      .then((body) => {
+        const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
+        forward(config, req, res, body, log, nonVisionCache, statsCtx);
+      })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });
+
+  // Expose stats + quotaPoller for teardown in tests
+  server._modelpipe = { stats, quotaPoller };
+
+  // Archive session on graceful shutdown
+  server.on("close", () => {
+    if (stats) stats.shutdown();
+    if (quotaPoller) quotaPoller.stop();
+  });
+
+  return server;
 }
 
 // CLI entry: node src/router.mjs <config.json>  (or MODEL_ROUTER_CONFIG=<path>).

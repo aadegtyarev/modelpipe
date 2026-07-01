@@ -9,6 +9,10 @@
     "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision, so an image-bearing request is routed STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot help there. Text-only turns route normally. Inert with no forImages route configured."
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
+  "dashboard": false,
+  "_dashboard_doc": "OPTIONAL boolean, default false. When true, modelpipe collects per-provider usage stats (input/output tokens, request count, RPS, ratelimit headers), polls external quota APIs (DeepSeek balance, OpenRouter credits), and exposes three endpoints: GET /v1/stats (JSON usage snapshot), GET /v1/quotas (JSON quota snapshot), GET /dashboard (HTML page with auto-refresh). Also set glmPlan below to match your GLM Coding Plan tier for an approximate 5-hour/weekly quota bar.",
+  "glmPlan": "pro",
+  "_glmPlan_doc": "OPTIONAL string lite|pro|max (default pro). Only effective when dashboard is true. Selects the GLM Coding Plan tier for artificial 5-hour/weekly quota estimation based on token counts × API pricing. The exact percentage is on https://z.ai/manage-apikey/subscription — this is a proxy-side approximation.",
   "routes": [
     {
       "match": "claude-*",
