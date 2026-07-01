@@ -721,10 +721,12 @@ function usd(v){return'$'+v.toFixed(3)}
 function pricestr(pin,pout){if(pin==null)return'price —';return'$'+pin+'/$'+pout+' per 1M in/out'}
 
 function getPlanPrice(pid,stats,glmQ){
+  // Direct price from config.plans — works for any provider
+  if(stats.plans&&stats.plans[pid]!=null)return stats.plans[pid];
+  // Default tier-based prices
   const defs={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
   const planName=pid==='anthropic'?stats.anthropicPlan:(pid==='glm'?glmQ.plan:null);
-  const defPrice=(defs[pid]||{})[planName]||0;
-  return (stats.plans&&stats.plans[pid]!=null)?stats.plans[pid]:defPrice;
+  return (defs[pid]||{})[planName]||0;
 }
 
 const COLORS=['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#79c0ff','#f0883e','#56d364'];
@@ -806,7 +808,6 @@ async function render(stats,quotas){
   try{const r=await fetch("/v1/models").then(r=>r.json());cfgModels=(r.data||[]).map(m=>{const h=m.host||'';let pid=h;if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';return{...m,pid};});}catch{}
 
   // Session bar — effective cost based on subscriptions
-  const PLAN_DEFAULTS={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
   const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
   const modelArr=Object.values(stats.models||{});
   const doneProviders=new Set();
@@ -814,11 +815,9 @@ async function render(stats,quotas){
   for(const m of modelArr){
     if(doneProviders.has(m.providerId))continue;
     doneProviders.add(m.providerId);
-    const planName=m.providerId==='anthropic'?stats.anthropicPlan:(m.providerId==='glm'?glmQ.plan:null);
-    const defPrice=(PLAN_DEFAULTS[m.providerId]||{})[planName];
-    const price=(stats.plans&&stats.plans[m.providerId]!=null)?stats.plans[m.providerId]:defPrice;
-    if(planName||(stats.plans&&stats.plans[m.providerId]!=null)){
-      effectiveCost+=(price||0)/720*hours;
+    const price=getPlanPrice(m.providerId,stats,glmQ);
+    if(price>0){
+      effectiveCost+=price/720*hours;
     }else{
       effectiveCost+=modelArr.filter(x=>x.providerId===m.providerId).reduce((s,x)=>s+(x.cost||0),0);
     }
