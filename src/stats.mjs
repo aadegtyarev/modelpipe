@@ -767,7 +767,7 @@ function render(stats,quotas){
   if(glm.comparison){
     const c=glm.comparison;
     const v=c.apiMonthlyEstimate>c.subscriptionMonthly?'plan saves ~$'+(c.apiMonthlyEstimate-c.subscriptionMonthly).toFixed(2)+'/mo':'raw API ~$'+c.apiMonthlyEstimate.toFixed(2)+'/mo';
-    qhtml+='<div class="q"><span class="label">Plan vs API</span> '+v+'</div>';
+    qhtml+='<div class="q"><span class="label">GLM: Plan vs API</span> '+v+'</div>';
   }
   $("quotas").innerHTML=qhtml||'<span style="color:var(--muted)">quota data pending…</span>';
 
