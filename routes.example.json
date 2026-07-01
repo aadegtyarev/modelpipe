@@ -18,6 +18,8 @@
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
   "glmPlan": "pro",
+  "anthropicPlan": "max",
+  "_anthropicPlan_doc": "OPTIONAL string pro|max|team. Only used when dashboard:true. Selects the Anthropic subscription tier for effective-cost display and plan-vs-API comparison in the provider card.",
   "routes": [
     {
       "match": "claude-*",
