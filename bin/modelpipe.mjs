@@ -98,6 +98,11 @@ function main() {
     process.stderr.write(
       `modelpipe: point your client at it — export ANTHROPIC_BASE_URL=http://${host}:${addr.port}\n`,
     );
+    if (config.dashboard === true) {
+      process.stderr.write(
+        `modelpipe: dashboard → http://${host}:${addr.port}/dashboard\n`,
+      );
+    }
   });
 
   const shutdown = () => server.close(() => process.exit(0));
