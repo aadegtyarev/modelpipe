@@ -688,6 +688,15 @@ canvas{display:block;width:100%;height:200px}
   <select id="sessSelect" onchange="showHistory()" style="background:var(--card-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:13px">
     <option value="">live</option>
   </select>
+  <button onclick="toggleSettings()" style="background:var(--card-bg);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin-left:auto">⚙</button>
+</div>
+<div id="settings" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:13px;gap:10px;flex-wrap:wrap">
+  <span style="color:var(--muted)">Plan prices ($/mo):</span>
+  <label>anthropic <input id="planPrice_anthropic" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
+  <label>glm <input id="planPrice_glm" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
+  <label>deepseek <input id="planPrice_deepseek" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
+  <label>openrouter <input id="planPrice_openrouter" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
+  <button onclick="savePrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
 </div>
 <div class="models" id="models"></div>
 
@@ -711,10 +720,43 @@ function ago(ts){const s=Math.floor((Date.now()-ts)/1000);return s<5?"now":s<60?
 function usd(v){return'$'+v.toFixed(3)}
 function pricestr(pin,pout){if(pin==null)return'price —';return'$'+pin+'/$'+pout+' per 1M in/out'}
 
+function getPlanPrice(pid,stats,glmQ,savedPrices){
+  const defs={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
+  const planName=pid==='anthropic'?stats.anthropicPlan:(pid==='glm'?glmQ.plan:null);
+  const defPrice=(defs[pid]||{})[planName]||0;
+  let price=defPrice;
+  if(stats.plans&&stats.plans[pid]!=null)price=stats.plans[pid];
+  if(savedPrices[pid]!=null)price=savedPrices[pid];
+  return price;
+}
+
 const COLORS=['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#79c0ff','#f0883e','#56d364'];
 const colors={};
 
 let histMode=null; // null = live, id = viewing historical session
+
+// Settings: load/save plan prices from localStorage
+function loadPrices(){
+  try{return JSON.parse(localStorage.getItem('mp_plans')||'{}')}catch{return{}}
+}
+function savePrices(){
+  const p={};
+  for(const pid of['anthropic','glm','deepseek','openrouter']){
+    const v=parseFloat($('planPrice_'+pid).value);
+    if(v>=0)p[pid]=v;
+  }
+  localStorage.setItem('mp_plans',JSON.stringify(p));
+  load();
+}
+function toggleSettings(){
+  const s=$('settings');
+  s.style.display=s.style.display==='none'?'flex':'none';
+  if(s.style.display==='flex'){
+    const p=loadPrices();
+    for(const pid of['anthropic','glm','deepseek','openrouter'])
+      $('planPrice_'+pid).value=p[pid]!=null?p[pid]:'';
+  }
+}
 
 async function newSession(){
   await fetch("/v1/sessions/reset",{method:"POST"});
@@ -769,8 +811,7 @@ async function render(stats,quotas){
 
   // Session bar — effective cost based on subscriptions
   const PLAN_DEFAULTS={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
-  const planPrices={...PLAN_DEFAULTS};
-  if(stats.plans)for(const pid of Object.keys(planPrices))if(stats.plans[pid]!=null)planPrices[pid]={...planPrices[pid],_custom:stats.plans[pid]};
+  const savedPrices=loadPrices();
   const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
   const modelArr=Object.values(stats.models||{});
   const doneProviders=new Set();
@@ -778,11 +819,13 @@ async function render(stats,quotas){
   for(const m of modelArr){
     if(doneProviders.has(m.providerId))continue;
     doneProviders.add(m.providerId);
-    const pd=planPrices[m.providerId];
     const planName=m.providerId==='anthropic'?stats.anthropicPlan:(m.providerId==='glm'?glmQ.plan:null);
-    if(pd&&planName&&pd[planName]!=null){
-      const price=pd._custom!=null?pd._custom:pd[planName];
-      effectiveCost+=price/720*hours;
+    // Price priority: localStorage > config.plans > defaults
+    const defPrice=(PLAN_DEFAULTS[m.providerId]||{})[planName];
+    let price=(stats.plans&&stats.plans[m.providerId]!=null)?stats.plans[m.providerId]:defPrice;
+    if(savedPrices[m.providerId]!=null)price=savedPrices[m.providerId];
+    if(planName||savedPrices[m.providerId]!=null){
+      effectiveCost+=(price||0)/720*hours;
     }else{
       effectiveCost+=modelArr.filter(x=>x.providerId===m.providerId).reduce((s,x)=>s+(x.cost||0),0);
     }
@@ -848,13 +891,8 @@ async function render(stats,quotas){
     // Session cost (always available)
     rows.push('<span class="l">session</span> <span>'+usd(p.cost)+' · '+fmt(p.requests)+' req · '+fmt(p.tokens)+' tok</span>');
 
-    if(p.id==='deepseek'&&qs.deepseek){
-      rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
-    }
-    if(p.id==='openrouter'&&qs.openrouter){
-      const o=qs.openrouter;
-      rows.push('<span class="l">credits</span> <span>'+o.limit_remaining.toFixed(4)+' / '+o.limit+' '+o.limit_reset+'</span>');
-    }
+    // Provider-specific data
+    // 1. Limits/balance/credits
     if(p.id==='anthropic'){
       const rem=Number(rl["anthropic-ratelimit-requests-remaining"]||0);
       const lim=Number(rl["anthropic-ratelimit-requests-limit"]||0);
@@ -867,15 +905,14 @@ async function render(stats,quotas){
       if(olim)rows.push('<span class="l">OTPM</span> <span>'+fmt(orem)+' / '+fmt(olim)+'</span>');
       if(!lim&&!ilim&&!olim)rows.push('<span class="l">limits</span> <span style="color:var(--muted)">— (no traffic yet)</span>');
     }
-    // Anthropic plan comparison
-    if(p.id==='anthropic'&&stats.anthropicPlan){
-      const defPrice={pro:20,max:200,team:25}[stats.anthropicPlan]||20;
-      const planPrice=(stats.plans&&stats.plans.anthropic!=null)?stats.plans.anthropic:defPrice;
-      const planRate=planPrice/720;
-      const apiRate=p.cost/hours;
-      const v=apiRate>planRate?'plan saves ~$'+(apiRate*720-planPrice).toFixed(0)+'/mo':'API ~$'+(apiRate*720).toFixed(0)+'/mo';
-      rows.push('<span class="l">plan vs API</span> <span style="color:'+(apiRate>planRate?'var(--green)':'var(--orange)')+'">'+v+' ($'+planPrice+'/mo)</span>');
+    if(p.id==='deepseek'&&qs.deepseek){
+      rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
     }
+    if(p.id==='openrouter'&&qs.openrouter){
+      const o=qs.openrouter;
+      rows.push('<span class="l">credits</span> <span>'+o.limit_remaining.toFixed(4)+' / '+o.limit+' '+o.limit_reset+'</span>');
+    }
+    // 2. Quotas (GLM)
     if(p.id==='glm'){
       if(glmQ.fiveHour){
         rows.push('<span class="l">5h quota</span> <span>'+glmQ.fiveHour.pct+'% · '+fmt(glmQ.fiveHour.inputTokens+glmQ.fiveHour.outputTokens)+' tok</span>');
@@ -883,18 +920,17 @@ async function render(stats,quotas){
       }
       rows.push('<span class="l">multiplier</span> <span style="color:'+(glmQ.multiplier>1?'var(--orange)':'var(--green)')+'">'+glmQ.multiplierLabel+'</span>');
     }
-    // Price info
+    // 3. Plan vs API (any provider with a price)
+    const pp=getPlanPrice(p.id,stats,glmQ,savedPrices);
+    if(pp>0&&p.requests>0){
+      const planRate=pp/720;
+      const apiRate=p.cost/hours;
+      const v=apiRate>planRate?'plan saves ~$'+(apiRate*720-pp).toFixed(0)+'/mo':'API ~$'+(apiRate*720).toFixed(0)+'/mo';
+      rows.push('<span class="l">plan vs API</span> <span style="color:'+(apiRate>planRate?'var(--green)':'var(--orange)')+'">'+v+' ($'+pp+'/mo)</span>');
+    }
+    // 4. Pricing
     const prices=[...new Set(Object.values(stats.models||{}).filter(m=>m.providerId===p.id&&m.priceInput!=null).map(m=>'$'+m.priceInput+'/$'+m.priceOutput))];
     if(prices.length)rows.push('<span class="l">pricing</span> <span style="color:var(--muted)">'+prices.join(' · ')+' per 1M</span>');
-
-    qhtml+=rows.map(r=>'<div class="qrow">'+r+'</div>').join('');
-
-    // GLM comparison
-    if(p.id==='glm'&&glmQ.comparison){
-      const c=glmQ.comparison;
-      const v=c.apiMonthlyEstimate>c.subscriptionMonthly?'plan saves ~$'+(c.apiMonthlyEstimate-c.subscriptionMonthly).toFixed(2)+'/mo':'raw API ~$'+c.apiMonthlyEstimate.toFixed(2)+'/mo';
-      qhtml+='<div class="qrow"><span class="l">plan vs API</span> <span style="color:'+(c.apiMonthlyEstimate>c.subscriptionMonthly?'var(--green)':'var(--orange)')+'">'+v+'</span></div>';
-    }
 
     qhtml+='</div>';
   }
