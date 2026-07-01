@@ -858,6 +858,7 @@ async function render(stats,quotas){
   try{const r=await fetch("/v1/models").then(r=>r.json());cfgModels=(r.data||[]).map(m=>{const h=m.host||'';let pid=h;if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';return{...m,pid};});}catch{}
 
   // Session bar — effective cost based on subscriptions
+  const glmQ=stats.glmQuota||{};
   const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
   const modelArr=Object.values(stats.models||{});
   const doneProviders=new Set();
@@ -909,7 +910,6 @@ async function render(stats,quotas){
   let qhtml='';
   const qs=quotas||{};
   const rl=(stats.ratelimits||{}).anthropic||{};
-  const glmQ=stats.glmQuota||{};
 
   const providerSet=new Set();
   const providers=[];
