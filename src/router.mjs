@@ -253,6 +253,12 @@ export function validateConfig(config) {
       throw new Error(`config.glmPlan: must be one of ${allowed.join(", ")}`);
     }
   }
+  if (config.anthropicPlan !== undefined) {
+    const allowed = ["pro", "max", "team"];
+    if (!allowed.includes(config.anthropicPlan)) {
+      throw new Error(`config.anthropicPlan: must be one of ${allowed.join(", ")}`);
+    }
+  }
 
   return config;
 }
@@ -692,6 +698,9 @@ export function createRouter(config, options = {}) {
         const snap = stats.snapshot();
         if (config.glmPlan) {
           snap.glmQuota = computeGlmQuota(snap.timeline, config.glmPlan);
+        }
+        if (config.anthropicPlan) {
+          snap.anthropicPlan = config.anthropicPlan;
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(snap));

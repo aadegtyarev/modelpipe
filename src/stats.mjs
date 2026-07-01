@@ -767,9 +767,27 @@ async function render(stats,quotas){
   let cfgModels=[];
   try{const r=await fetch("/v1/models").then(r=>r.json());cfgModels=(r.data||[]).map(m=>{const h=m.host||'';let pid=h;if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';return{...m,pid};});}catch{}
 
-  // Session bar
+  // Session bar — effective cost based on subscriptions
+  const PLAN_PRICES={anthropic:{pro:20,max:200,team:25},glm:{lite:18,pro:64.8,max:180}};
+  const hours=Math.max(0.1,(Date.now()-(s.startedAt||Date.now()))/3600000);
+  const modelArr=Object.values(stats.models||{});
+  const doneProviders=new Set();
+  let effectiveCost=0;
+  for(const m of modelArr){
+    if(doneProviders.has(m.providerId))continue;
+    doneProviders.add(m.providerId);
+    if(m.providerId==='anthropic'&&stats.anthropicPlan){
+      effectiveCost+=(PLAN_PRICES.anthropic[stats.anthropicPlan]||200)/720*hours;
+    }else if(m.providerId==='glm'&&glmQ.plan){
+      effectiveCost+=(PLAN_PRICES.glm[glmQ.plan]||64.8)/720*hours;
+    }else{
+      effectiveCost+=modelArr.filter(x=>x.providerId===m.providerId).reduce((s,x)=>s+(x.cost||0),0);
+    }
+  }
+
   $("session").innerHTML=
-    '<div class="stat">'+usd(s.cost||0)+'<span class="lbl">session cost</span></div>'+
+    '<div class="stat">'+usd(s.cost||0)+'<span class="lbl">raw API</span></div>'+
+    '<div class="stat">'+usd(effectiveCost)+'<span class="lbl">effective</span></div>'+
     '<div class="stat">'+fmt(s.requests||0)+'<span class="lbl">requests</span></div>'+
     '<div class="stat">'+fmt(s.tokens||0)+'<span class="lbl">tokens</span></div>'+
     (s.startedAt?'<div class="stat">'+(new Date(s.startedAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false}))+'<span class="lbl">started</span></div>':'');
@@ -845,6 +863,16 @@ async function render(stats,quotas){
       const olim=Number(rl["anthropic-ratelimit-output-tokens-limit"]||0);
       if(olim)rows.push('<span class="l">OTPM</span> <span>'+fmt(orem)+' / '+fmt(olim)+'</span>');
       if(!lim&&!ilim&&!olim)rows.push('<span class="l">limits</span> <span style="color:var(--muted)">— (no traffic yet)</span>');
+    }
+    // Anthropic plan comparison
+    if(p.id==='anthropic'&&stats.anthropicPlan){
+      const PRICES={pro:20,max:200,team:25};
+      const plan=PRICES[stats.anthropicPlan]||20;
+      const hours=Math.max(0.1,(Date.now()-(stats.session.startedAt||Date.now()))/3600000);
+      const apiRate=p.cost/hours;
+      const planRate=plan/720;
+      const v=apiRate>planRate?'plan saves ~$'+(apiRate*720-plan).toFixed(0)+'/mo':'API ~$'+(apiRate*720).toFixed(0)+'/mo';
+      rows.push('<span class="l">plan vs API</span> <span style="color:'+(apiRate>planRate?'var(--green)':'var(--orange)')+'">'+v+' (Max $'+plan+'/mo)</span>');
     }
     if(p.id==='glm'){
       if(glmQ.fiveHour){
