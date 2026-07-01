@@ -602,9 +602,12 @@ h1 .badge{font-size:14px;padding:2px 8px;border-radius:4px;color:var(--green);bo
 canvas{display:block;width:100%;height:200px}
 
 /* Quotas row */
-.quotas{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;font-size:13px}
-.quotas .q{background:var(--card-bg);border:1px solid var(--border);border-radius:6px;padding:6px 12px;white-space:nowrap}
-.quotas .q .label{color:var(--muted);margin-right:4px}
+.quotas{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-bottom:14px}
+.qcard{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px}
+.qhead{font-size:15px;font-weight:600;margin-bottom:6px}
+.qrow{display:flex;justify-content:space-between;font-size:13px;padding:1px 0}
+.qrow .l{color:var(--muted);min-width:75px}
+.qrow .l+.l{text-align:right}
 
 /* Log */
 .log{font-size:14px;color:var(--muted)}
@@ -704,8 +707,12 @@ async function load(){
   if(auto)setTimeout(load,2000);
 }
 
-function render(stats,quotas){
+async function render(stats,quotas){
   const s=stats.session||{};
+
+  // Fetch configured providers from /v1/models
+  let cfgModels=[];
+  try{const r=await fetch("/v1/models").then(r=>r.json());cfgModels=(r.data||[]).map(m=>{const h=m.host||'';let pid=h;if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';return{...m,pid};});}catch{}
 
   // Session bar
   $("session").innerHTML=
@@ -739,35 +746,74 @@ function render(stats,quotas){
   // Chart
   drawChart(stats.timeline||[]);
 
-  // Quotas row
+  // Quotas — unified provider cards from configured routes
   let qhtml='';
   const qs=quotas||{};
-  if(qs.deepseek){
-    const d=qs.deepseek;
-    qhtml+='<div class="q"><span class="label">DeepSeek</span> $'+d.total_balance+'</div>';
-  }
-  if(qs.openrouter){
-    const o=qs.openrouter;
-    const used=o.limit-o.limit_remaining;
-    qhtml+='<div class="q"><span class="label">OpenRouter</span> '+used.toFixed(4)+'/'+o.limit+' '+o.limit_reset+'</div>';
-  }
-  const glm=(stats.glmQuota||{});
-  if(glm.fiveHour){
-    qhtml+='<div class="q"><span class="label">GLM 5h</span> '+glm.fiveHour.pct+'%</div>';
-    qhtml+='<div class="q"><span class="label">GLM week</span> '+glm.weekly.pct+'%</div>';
-    qhtml+='<div class="q" style="color:'+(glm.multiplier>1?'var(--orange)':'var(--green)')+'"><span class="label">GLM</span> '+glm.multiplierLabel+'</div>';
-  }
-  const rl=(stats.ratelimits||{}).anthropic;
-  if(rl){
-    const rem=Number(rl["anthropic-ratelimit-requests-remaining"]||0);
-    const lim=Number(rl["anthropic-ratelimit-requests-limit"]||0);
-    if(lim)qhtml+='<div class="q"><span class="label">Anthropic RPM</span> '+fmt(rem)+'/'+fmt(lim)+'</div>';
-  }
-  // Plan vs API
-  if(glm.comparison){
-    const c=glm.comparison;
-    const v=c.apiMonthlyEstimate>c.subscriptionMonthly?'plan saves ~$'+(c.apiMonthlyEstimate-c.subscriptionMonthly).toFixed(2)+'/mo':'raw API ~$'+c.apiMonthlyEstimate.toFixed(2)+'/mo';
-    qhtml+='<div class="q"><span class="label">GLM: Plan vs API</span> '+v+'</div>';
+  const rl=(stats.ratelimits||{}).anthropic||{};
+  const glmQ=stats.glmQuota||{};
+
+  const providerSet=new Set();
+  const providers=[];
+  cfgModels.forEach(m=>{
+    if(!m.pid||providerSet.has(m.pid))return;
+    providerSet.add(m.pid);
+    const sm=Object.values(stats.models||{}).filter(m2=>m2.providerId===m.pid);
+    const totalCost=sm.reduce((s,m2)=>s+(m2.cost||0),0);
+    const totalReqs=sm.reduce((s,m2)=>s+(m2.requests||0),0);
+    const totalTokens=sm.reduce((s,m2)=>s+(m2.inputTokens||0)+(m2.outputTokens||0),0);
+    const online=sm.some(m2=>m2.lastRequestAt>Date.now()-300000);
+    providers.push({id:m.pid,host:m.host,cost:totalCost,requests:totalReqs,tokens:totalTokens,online});
+  });
+
+  for(const p of providers){
+    qhtml+='<div class="qcard"><div class="qhead">'+
+      '<span style="color:'+(p.online?'var(--green)':'var(--muted)')+'">'+(p.online?'●':'○')+'</span> '+
+      p.id+'</div>';
+
+    const rows=[];
+    // Session cost (always available)
+    rows.push('<span class="l">session</span> <span>'+usd(p.cost)+' · '+fmt(p.requests)+' req · '+fmt(p.tokens)+' tok</span>');
+
+    if(p.id==='deepseek'&&qs.deepseek){
+      rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
+    }
+    if(p.id==='openrouter'&&qs.openrouter){
+      const o=qs.openrouter;
+      rows.push('<span class="l">credits</span> <span>'+o.limit_remaining.toFixed(4)+' / '+o.limit+' '+o.limit_reset+'</span>');
+    }
+    if(p.id==='anthropic'){
+      const rem=Number(rl["anthropic-ratelimit-requests-remaining"]||0);
+      const lim=Number(rl["anthropic-ratelimit-requests-limit"]||0);
+      if(lim)rows.push('<span class="l">RPM</span> <span>'+fmt(rem)+' / '+fmt(lim)+'</span>');
+      const irem=Number(rl["anthropic-ratelimit-input-tokens-remaining"]||0);
+      const ilim=Number(rl["anthropic-ratelimit-input-tokens-limit"]||0);
+      if(ilim)rows.push('<span class="l">ITPM</span> <span>'+fmt(irem)+' / '+fmt(ilim)+'</span>');
+      const orem=Number(rl["anthropic-ratelimit-output-tokens-remaining"]||0);
+      const olim=Number(rl["anthropic-ratelimit-output-tokens-limit"]||0);
+      if(olim)rows.push('<span class="l">OTPM</span> <span>'+fmt(orem)+' / '+fmt(olim)+'</span>');
+      if(!lim&&!ilim&&!olim)rows.push('<span class="l">limits</span> <span style="color:var(--muted)">— (no traffic yet)</span>');
+    }
+    if(p.id==='glm'){
+      if(glmQ.fiveHour){
+        rows.push('<span class="l">5h quota</span> <span>'+glmQ.fiveHour.pct+'% · '+fmt(glmQ.fiveHour.inputTokens+glmQ.fiveHour.outputTokens)+' tok</span>');
+        rows.push('<span class="l">week quota</span> <span>'+glmQ.weekly.pct+'% · '+fmt(glmQ.weekly.inputTokens+glmQ.weekly.outputTokens)+' tok</span>');
+      }
+      rows.push('<span class="l">multiplier</span> <span style="color:'+(glmQ.multiplier>1?'var(--orange)':'var(--green)')+'">'+glmQ.multiplierLabel+'</span>');
+    }
+    // Price info
+    const prices=[...new Set(Object.values(stats.models||{}).filter(m=>m.providerId===p.id&&m.priceInput!=null).map(m=>'$'+m.priceInput+'/$'+m.priceOutput))];
+    if(prices.length)rows.push('<span class="l">pricing</span> <span style="color:var(--muted)">'+prices.join(' · ')+' per 1M</span>');
+
+    qhtml+=rows.map(r=>'<div class="qrow">'+r+'</div>').join('');
+
+    // GLM comparison
+    if(p.id==='glm'&&glmQ.comparison){
+      const c=glmQ.comparison;
+      const v=c.apiMonthlyEstimate>c.subscriptionMonthly?'plan saves ~$'+(c.apiMonthlyEstimate-c.subscriptionMonthly).toFixed(2)+'/mo':'raw API ~$'+c.apiMonthlyEstimate.toFixed(2)+'/mo';
+      qhtml+='<div class="qrow"><span class="l">plan vs API</span> <span style="color:'+(c.apiMonthlyEstimate>c.subscriptionMonthly?'var(--green)':'var(--orange)')+'">'+v+'</span></div>';
+    }
+
+    qhtml+='</div>';
   }
   $("quotas").innerHTML=qhtml||'<span style="color:var(--muted)">quota data pending…</span>';
 
