@@ -55,9 +55,24 @@ const PRICE_MAP = {
   "google/gemini-2.5-pro":  { input: 2.5, output: 10  },
 };
 
-export function modelPrice(model) {
+// Direct API token prices — overridable via config.tokenPrices.
+// Priority: config.tokenPrices > PRICE_MAP.
+export function modelPrice(model, tokenPrices = null) {
+  if (tokenPrices && tokenPrices[model]) return tokenPrices[model];
+  // Fuzzy: try matching by prefix (e.g. "claude-opus-*" matches any claude-opus variant)
+  if (tokenPrices) {
+    for (const [key, p] of Object.entries(tokenPrices)) {
+      if (key.includes("*") && globMatch(key, model)) return p;
+    }
+  }
   return PRICE_MAP[model] || null;
 }
+
+function globMatch(pattern, str) {
+  return new RegExp("^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(str);
+}
+
+// PURE STATS
 
 export class StatsCollector {
   #providers = new Map();
@@ -115,7 +130,7 @@ export class StatsCollector {
     }
   }
 
-  snapshot() {
+  snapshot(tokenPrices = null) {
     const now = Date.now();
     const cutoff = now - WINDOW_SEC * 1000;
     const recent = this.#timeline.filter((e) => e.ts >= cutoff);
@@ -123,7 +138,7 @@ export class StatsCollector {
     const perModel = {};
     for (const [mid, m] of this.#models) {
       const r = recent.filter((e) => e.model === mid);
-      const price = modelPrice(mid);
+      const price = modelPrice(mid, tokenPrices);
       const cost = price
         ? (m.inputTokens * price.input / 1_000_000) + (m.outputTokens * price.output / 1_000_000)
         : 0;
@@ -152,9 +167,8 @@ export class StatsCollector {
     const ratelimits = {};
     for (const [id, rl] of this.#ratelimitHeaders) ratelimits[id] = rl;
 
-    // Attach cost to each timeline entry so the dashboard JS doesn't need price lookup
     const timeline = this.#timeline.slice(-200).map((e) => {
-      const pr = modelPrice(e.model);
+      const pr = modelPrice(e.model, tokenPrices);
       const cost = pr ? (e.inputTokens * pr.input + e.outputTokens * pr.output) / 1_000_000 : 0;
       return { ...e, cost };
     });
@@ -697,6 +711,9 @@ canvas{display:block;width:100%;height:200px}
   <label>deepseek <input id="planPrice_deepseek" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
   <label>openrouter <input id="planPrice_openrouter" size="5" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:13px"></label>
   <button onclick="savePrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
+  <span style="color:var(--muted);margin-left:10px">Token prices ($/1M in/out, JSON):</span>
+  <input id="tokenPrices" size="50" placeholder='{"glm-5.2":{"input":1.4,"output":4.4}}' style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px;flex:1;min-width:200px">
+  <button onclick="saveTokenPrices()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
 </div>
 <div class="models" id="models"></div>
 
@@ -744,6 +761,13 @@ async function savePrices(){
   await fetch("/v1/plans",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(p)});
   load();
 }
+async function saveTokenPrices(){
+  try{
+    const tp=JSON.parse($('tokenPrices').value);
+    await fetch("/v1/plans",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({_tokenPrices:tp})});
+    load();
+  }catch(e){$('e').style.display='block';$('e').textContent='Invalid JSON: '+e.message}
+}
 function toggleSettings(){
   const s=$('settings');
   s.style.display=s.style.display==='none'?'flex':'none';
@@ -752,6 +776,7 @@ function toggleSettings(){
       const pp=st.plans||{};
       for(const pid of['anthropic','glm','deepseek','openrouter'])
         $('planPrice_'+pid).value=pp[pid]!=null?pp[pid]:'';
+      $('tokenPrices').value=st.tokenPrices?JSON.stringify(st.tokenPrices):'';
     });
   }
 }

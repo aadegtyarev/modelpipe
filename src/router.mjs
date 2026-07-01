@@ -268,6 +268,17 @@ export function validateConfig(config) {
       if (typeof price !== "number" || price < 0) throw new Error(`config.plans.${pid}: must be a non-negative number (monthly USD)`);
     }
   }
+  // tokenPrices: optional per-model API price overrides ($ per 1M tokens).
+  // E.g. { "claude-opus-*": { input: 15, output: 75 }, "glm-5.2": { input: 1.2, output: 4.0 } }.
+  // Model keys can use * globs. Falls back to built-in PRICE_MAP.
+  if (config.tokenPrices !== undefined) {
+    if (typeof config.tokenPrices !== "object") throw new Error("config.tokenPrices: must be an object { model: { input, output } }");
+    for (const [key, p] of Object.entries(config.tokenPrices)) {
+      if (!p || typeof p.input !== "number" || typeof p.output !== "number") {
+        throw new Error(`config.tokenPrices.${key}: must be { input: number, output: number }`);
+      }
+    }
+  }
 
   return config;
 }
@@ -704,7 +715,7 @@ export function createRouter(config, options = {}) {
         return;
       }
       if (req.url === "/v1/stats") {
-        const snap = stats.snapshot();
+        const snap = stats.snapshot(config.tokenPrices || null);
         if (config.glmPlan) {
           snap.glmQuota = computeGlmQuota(snap.timeline, config.glmPlan);
         }
@@ -713,6 +724,9 @@ export function createRouter(config, options = {}) {
         }
         if (config.plans) {
           snap.plans = config.plans;
+        }
+        if (config.tokenPrices) {
+          snap.tokenPrices = config.tokenPrices;
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(snap));
@@ -738,19 +752,25 @@ export function createRouter(config, options = {}) {
       res.end(JSON.stringify({ ok: true, startedAt: stats.snapshot().session.startedAt }));
       return;
     }
-    // POST /v1/plans — update subscription prices in-memory
+    // POST /v1/plans — update subscription prices and/or token prices in-memory
     if (dashboard && req.method === "POST" && req.url === "/v1/plans") {
       readBody(req, 4096).then((body) => {
         try {
-          const plans = JSON.parse(body.toString("utf8"));
-          if (typeof plans !== "object") throw new Error("must be an object");
-          config.plans = { ...(config.plans || {}), ...plans };
+          const data = JSON.parse(body.toString("utf8"));
+          if (typeof data !== "object") throw new Error("must be an object");
+          const { _tokenPrices, ...plans } = data;
+          if (Object.keys(plans).length > 0) {
+            config.plans = { ...(config.plans || {}), ...plans };
+          }
+          if (_tokenPrices) {
+            config.tokenPrices = { ...(config.tokenPrices || {}), ..._tokenPrices };
+          }
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: true, plans: config.plans }));
+          res.end(JSON.stringify({ ok: true, plans: config.plans, tokenPrices: config.tokenPrices }));
         } catch (e) {
-          sendError(res, 400, `invalid plans: ${e.message}`);
+          sendError(res, 400, `invalid: ${e.message}`);
         }
-      }).catch(() => sendError(res, 400, "invalid plans"));
+      }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
 
