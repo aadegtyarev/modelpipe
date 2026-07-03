@@ -27,6 +27,8 @@ import {
   isPassthrough,
   bodyHasImageBlock,
   isImageUnsupported400,
+  isFailoverTrigger,
+  pickFailoverModel,
   pickVisionRoute,
   validateConfig,
   listConfig,
@@ -86,6 +88,32 @@ function makeModeStub(initialMode) {
     });
   });
   return { server, received, setMode: (m) => { mode = m; } };
+}
+
+// A stub that returns a configurable status code and body. `responseStatus` and
+// `responseBody` can be updated at any time via the returned setters.
+function makeFlexStub(initialStatus = 200, initialBody = null) {
+  const received = [];
+  let status = initialStatus;
+  let body = initialBody;
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      received.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString("utf8") });
+      const responseBody = body || JSON.stringify({ id: "ok", model: JSON.parse(Buffer.concat(chunks).toString("utf8")).model || "unknown" });
+      const ct = status >= 400 ? "application/json" : "text/event-stream";
+      res.writeHead(status, { "content-type": ct });
+      if (status < 400) {
+        res.write("chunk-A;");
+        res.write("chunk-B;");
+        res.end("chunk-C");
+      } else {
+        res.end(typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody));
+      }
+    });
+  });
+  return { server, received, setStatus: (s) => { status = s; }, setBody: (b) => { body = b; } };
 }
 
 function listen(server) {
@@ -312,6 +340,74 @@ async function main() {
   check("validateConfig rejects a non-boolean vision flag", badVisionFlagThrew, true);
   check("validateConfig accepts vision:false",
     validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", vision: false, auth: { header: "x-api-key", keyEnv: "K" } }] }).routes[0].vision, false);
+
+  // ── failover config validation ─────────────────────────────────────────────
+  check("validateConfig accepts valid failover config",
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "a-*": "b" } }).failover["a-*"], "b");
+  let foEmptyKeyThrew = false;
+  try {
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "": "b" } });
+  } catch { foEmptyKeyThrew = true; }
+  check("validateConfig rejects empty failover key", foEmptyKeyThrew, true);
+  let foEmptyValThrew = false;
+  try {
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "a-*": "" } });
+  } catch { foEmptyValThrew = true; }
+  check("validateConfig rejects empty failover value", foEmptyValThrew, true);
+  let foBadTypeThrew = false;
+  try {
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: "not-an-object" });
+  } catch { foBadTypeThrew = true; }
+  check("validateConfig rejects non-object failover", foBadTypeThrew, true);
+  let foBadCooldownThrew = false;
+  try {
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failoverRecoveryIntervalMs: 500 });
+  } catch { foBadCooldownThrew = true; }
+  check("validateConfig rejects failoverRecoveryIntervalMs < 1000", foBadCooldownThrew, true);
+  check("validateConfig accepts failoverRecoveryIntervalMs",
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failoverRecoveryIntervalMs: 5000 }).failoverRecoveryIntervalMs, 5000);
+
+  // ── isFailoverTrigger (pure, no network) ───────────────────────────────────
+  const rateLimitBody429 = Buffer.from('{"error":{"message":"rate limit exceeded"}}');
+  check("isFailoverTrigger: 429 always triggers", isFailoverTrigger(429, Buffer.from("")), true);
+  check("isFailoverTrigger: 529 always triggers", isFailoverTrigger(529, Buffer.from("")), true);
+  check("isFailoverTrigger: 503 + rate-limit message triggers", isFailoverTrigger(503, rateLimitBody429), true);
+  check("isFailoverTrigger: 503 + temp unavailable triggers",
+    isFailoverTrigger(503, Buffer.from('{"error":{"message":"temporarily unavailable"}}')), true);
+  check("isFailoverTrigger: 503 + overloaded triggers",
+    isFailoverTrigger(503, Buffer.from('{"error":{"message":"server overloaded"}}')), true);
+  check("isFailoverTrigger: 503 ambiguous does NOT trigger",
+    isFailoverTrigger(503, Buffer.from('{"error":{"message":"internal server error"}}')), false);
+  check("isFailoverTrigger: 400 + rate-limit message triggers", isFailoverTrigger(400, rateLimitBody429), true);
+  check("isFailoverTrigger: 400 + ambiguous message does NOT trigger",
+    isFailoverTrigger(400, Buffer.from('{"error":{"message":"messages: roles must alternate"}}')), false);
+  check("isFailoverTrigger: 402 + 'credit balance' triggers",
+    isFailoverTrigger(402, Buffer.from('{"error":{"message":"Your credit balance is too low"}}')), true);
+  check("isFailoverTrigger: 403 + 'organization disabled' triggers",
+    isFailoverTrigger(403, Buffer.from('{"error":{"message":"Organization is disabled"}}')), true);
+  check("isFailoverTrigger: 200 never triggers", isFailoverTrigger(200, rateLimitBody429), false);
+  check("isFailoverTrigger: bad json ⇒ false", isFailoverTrigger(503, Buffer.from("not json")), false);
+  check("isFailoverTrigger: empty body ⇒ false", isFailoverTrigger(503, Buffer.from("")), false);
+  check("isFailoverTrigger: 500 + 'try again later' triggers",
+    isFailoverTrigger(500, Buffer.from('{"error":{"message":"try again later"}}')), true);
+  check("isFailoverTrigger: 502 + 'cannot process' triggers",
+    isFailoverTrigger(502, Buffer.from('{"error":{"message":"cannot process request"}}')), true);
+  check("isFailoverTrigger: 503 + 'capacity' triggers",
+    isFailoverTrigger(503, Buffer.from('{"error":{"message":"at capacity"}}')), true);
+  check("isFailoverTrigger: 403 + 'account disabled' triggers",
+    isFailoverTrigger(403, Buffer.from('{"error":{"message":"account is disabled"}}')), true);
+  check("isFailoverTrigger: 402 + 'payment required' triggers",
+    isFailoverTrigger(402, Buffer.from('{"error":{"message":"payment required"}}')), true);
+  check("isFailoverTrigger: 500 + 'quota exceeded' triggers",
+    isFailoverTrigger(500, Buffer.from('{"error":{"message":"quota exceeded"}}')), true);
+
+  // ── pickFailoverModel (pure) ───────────────────────────────────────────────
+  check("pickFailoverModel matches by glob", pickFailoverModel({ "claude-*": "glm-5.1" }, "claude-opus-4-8"), "glm-5.1");
+  check("pickFailoverModel no match returns null", pickFailoverModel({ "claude-*": "glm-5.1" }, "deepseek-chat"), null);
+  check("pickFailoverModel null config ⇒ null", pickFailoverModel(null, "any"), null);
+  check("pickFailoverModel empty string model ⇒ null", pickFailoverModel({ "a-*": "b" }, ""), null);
+  check("pickFailoverModel exact match", pickFailoverModel({ "glm-5.1": "deepseek-v4-pro" }, "glm-5.1"), "deepseek-v4-pro");
+  check("pickFailoverModel first match wins", pickFailoverModel({ "claude-*": "glm-5.1", "claude-opus-*": "deepseek" }, "claude-opus-4-8"), "glm-5.1");
 
   // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
   const listSample = {
@@ -670,6 +766,181 @@ async function main() {
     await close(noVisionRouter);
     await close(aStub.server);
     await close(bStub.server);
+  }
+
+  // ── failover e2e (reactive reroute + pre-route + chain + depth guard) ──────
+  // Stub A (primary for claude-*), Stub B (backup glm-5.1), Stub C (backup for glm-5.1).
+  const foA = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
+  const foB = makeFlexStub(200); // backup: returns success
+  const foC = makeFlexStub(200); // chain backup
+  const foAPort = await listen(foA.server);
+  const foBPort = await listen(foB.server);
+  const foCPort = await listen(foC.server);
+
+  process.env.TEST_FO_KEY = "FO-SECRET-999";
+  process.env.MODEL_ROUTER_LOG = "1";
+  const foLogCapture = [];
+  const foRealStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { foLogCapture.push(String(chunk)); return foRealStderrWrite(chunk, ...rest); };
+
+  const failoverConfig = {
+    listen: { host: "127.0.0.1", port: 0 },
+    failover: { "claude-*": "glm-5.1", "glm-5.1": "deepseek-v4-pro" },
+    failoverRecoveryIntervalMs: 30000,
+    routes: [
+      { match: "claude-*", base_url: `http://127.0.0.1:${foAPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+      { match: "glm-5.1", base_url: `http://127.0.0.1:${foBPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+      { match: "deepseek-*", base_url: `http://127.0.0.1:${foCPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+    ],
+  };
+  const foRouter = createRouter(failoverConfig);
+  const foPort = await listen(foRouter);
+
+  try {
+    // F1. 429 from primary → failover to backup, client gets backup's 200.
+    foA.setStatus(429);
+    foA.setBody('{"error":{"message":"rate limit exceeded"}}');
+    foB.setStatus(200);
+    const f1 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F1-BODY" }] });
+    check("F1 failover: primary A received the call", foA.received.length, 1);
+    check("F1 failover: backup B received the rerouted call", foB.received.length, 1);
+    check("F1 failover: client gets B's 200", f1.status, 200);
+    check("F1 failover: B got the rewritten model id", JSON.parse(foB.received[0].body).model, "glm-5.1");
+    check("F1 failover: B got the body intact", JSON.parse(foB.received[0].body).messages[0].content, "F1-BODY");
+    check("F1 failover: B got the backend key", foB.received[0].headers["x-api-key"], "FO-SECRET-999");
+
+    // F2. Pre-route: second request skips the failed primary, goes straight to backup.
+    const aBefore2 = foA.received.length;
+    const bBefore2 = foB.received.length;
+    const f2 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F2-BODY" }] });
+    check("F2 pre-route: A was NOT hit (skip failed primary)", foA.received.length, aBefore2);
+    check("F2 pre-route: B served it directly", foB.received.length, bBefore2 + 1);
+    check("F2 pre-route: client gets B's 200", f2.status, 200);
+
+    // F3. 529 from primary → always triggers failover (status-only trigger).
+    foC.setStatus(200);
+    // For F3 we need a fresh failover state — clear it first.
+    foRouter._modelpipe.failoverState.clear();
+    foC.received.length = 0;
+    foA.setStatus(529);
+    foA.setBody("{}");
+    foB.setStatus(200);
+    const aBefore3 = foA.received.length;
+    const bBefore3 = foB.received.length;
+    const f3 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F3" }] });
+    check("F3: 529 triggers failover", f3.status, 200);
+    check("F3: A was hit (529)", foA.received.length, aBefore3 + 1);
+    check("F3: B served the reroute", foB.received.length, bBefore3 + 1);
+
+    // F4. Ambiguous 503 (no rate-limit message) → NOT failed over, error relayed verbatim.
+    foRouter._modelpipe.failoverState.clear();
+    foA.setStatus(503);
+    foA.setBody('{"error":{"message":"internal server error"}}');
+    const aBefore4 = foA.received.length;
+    const bBefore4 = foB.received.length;
+    const f4 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F4" }] });
+    check("F4 ambiguous 503: NOT failed over", f4.status, 503);
+    check("F4 ambiguous 503: error relayed verbatim", f4.body.includes("internal server error"), true);
+    check("F4 ambiguous 503: A hit once", foA.received.length, aBefore4 + 1);
+    check("F4 ambiguous 503: B NOT touched", foB.received.length, bBefore4);
+
+    // F5. Chain failover: A 429 → B 429 → C 200. Depth = 2 hops.
+    foRouter._modelpipe.failoverState.clear();
+    foA.setStatus(429);
+    foA.setBody('{"error":{"message":"rate limit exceeded"}}');
+    foB.setStatus(429);
+    foB.setBody('{"error":{"message":"rate limit exceeded"}}');
+    foC.setStatus(200);
+    const aBefore5 = foA.received.length;
+    const bBefore5 = foB.received.length;
+    const cBefore5 = foC.received.length;
+    const f5 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F5" }] });
+    check("F5 chain: A was hit (first hop)", foA.received.length, aBefore5 + 1);
+    check("F5 chain: B was hit (second hop)", foB.received.length, bBefore5 + 1);
+    check("F5 chain: C served the final response", foC.received.length, cBefore5 + 1);
+    check("F5 chain: client gets C's 200", f5.status, 200);
+    check("F5 chain: C got the rewritten model", JSON.parse(foC.received[foC.received.length - 1].body).model, "deepseek-v4-pro");
+
+    // F6. Non-rate-limit 400 is NOT failed over — relayed as-is.
+    foRouter._modelpipe.failoverState.clear();
+    foA.setStatus(400);
+    foA.setBody('{"error":{"message":"messages: roles must alternate"}}');
+    const aBefore6 = foA.received.length;
+    const bBefore6 = foB.received.length;
+    const f6 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F6" }] });
+    check("F6: 400 NOT failed over", f6.status, 400);
+    check("F6: error relayed verbatim", f6.body.includes("roles must alternate"), true);
+    check("F6: A hit once", foA.received.length, aBefore6 + 1);
+    check("F6: B NOT touched", foB.received.length, bBefore6);
+
+    // F7. log safety for failover: model+status logged, NO keys/secrets/body.
+    const foLogText = foLogCapture.join("");
+    check("F-log: names failover model -> backup", foLogText.includes("claude-opus-4-8 -> glm-5.1"), true);
+    check("F-log: leaks NO backend key", foLogText.includes("FO-SECRET-999"), false);
+    check("F-log: leaks NO body sentinel", foLogText.includes("F1-BODY") || foLogText.includes("F2-BODY"), false);
+  } finally {
+    process.stderr.write = foRealStderrWrite;
+    delete process.env.TEST_FO_KEY;
+    delete process.env.MODEL_ROUTER_LOG;
+    // ── F8-F10: fresh stubs + router for clean state ───────────────────────
+    process.env.TEST_FO_KEY = "FO-SECRET-999";
+    const foA2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
+    const foB2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
+    const foC2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
+    const foA2Port = await listen(foA2.server);
+    const foB2Port = await listen(foB2.server);
+    const foC2Port = await listen(foC2.server);
+
+    const fo2Config = {
+      listen: { host: "127.0.0.1", port: 0 },
+      failover: { "claude-*": "glm-5.1", "glm-5.1": "deepseek-v4-pro" },
+      failoverRecoveryIntervalMs: 1000,
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${foA2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+        { match: "glm-5.1", base_url: `http://127.0.0.1:${foB2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${foC2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
+      ],
+    };
+    const fo2Router = createRouter(fo2Config);
+    const fo2Port = await listen(fo2Router);
+
+    try {
+      // F8. Depth guard: chain A→B→C all 429, deepseek has no pair → relay C's 429.
+      const f8 = await request(fo2Port, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F8" }] });
+      check("F8 depth guard: A was hit (hop 0)", foA2.received.length, 1);
+      check("F8 depth guard: B was hit (hop 1)", foB2.received.length, 1);
+      check("F8 depth guard: C was hit (hop 2, no backup)", foC2.received.length, 1);
+      check("F8 depth guard: client gets C's 429 relayed", f8.status, 429);
+
+      // F9. Model with route but no failover pair: 503 → relay error as-is.
+      foC2.setStatus(503);
+      foC2.setBody('{"error":{"message":"rate limit exceeded"}}');
+      const cBefore9 = foC2.received.length;
+      const f9 = await request(fo2Port, { model: "deepseek-v4-pro", messages: [{ role: "user", content: "F9" }] });
+      check("F9 no-backup: C was hit once", foC2.received.length, cBefore9 + 1);
+      check("F9 no-backup: error relayed verbatim", f9.status, 503);
+
+      // F10. Recovery ping: probe succeeds → failoverState cleared.
+      fo2Router._modelpipe.failoverState.set("claude-opus-4-8", { enteredAt: 1 }); // ancient timestamp
+      foA2.setStatus(200); // primary healthy
+      const pinger = fo2Router._modelpipe.failoverPinger;
+      if (pinger) {
+        await pinger.poll();
+        check("F10 recovery ping: failoverState cleared after probe",
+          fo2Router._modelpipe.failoverState.has("claude-opus-4-8"), false);
+      }
+    } finally {
+      delete process.env.TEST_FO_KEY;
+      await close(fo2Router);
+      await close(foA2.server);
+      await close(foB2.server);
+      await close(foC2.server);
+    }
+
+    await close(foRouter);
+    await close(foA.server);
+    await close(foB.server);
+    await close(foC.server);
   }
 
   if (fails.length) {

@@ -50,6 +50,7 @@ import {
 } from "./stats.mjs";
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
+const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per request
 
 // Hop-specific headers the router always recomputes for the upstream — never
 // forwarded verbatim.
@@ -163,6 +164,41 @@ export function isImageUnsupported400(status, body) {
   }
   if (typeof message !== "string") return false;
   return /image/i.test(message) && /(support|block)/i.test(message);
+}
+
+// True when an upstream error is a retryable signal — rate-limit, overload, or
+// account/org issue — that warrants failing over to a backup model.
+// 429/529 are always triggers (unambiguous rate-limit / overload).
+// Other 4xx/5xx trigger only when the body mentions a recognisable keyword:
+// rate-limit, overload, capacity, account/credit/org issues.
+// An ambiguous error (e.g. "messages: roles must alternate") does NOT match,
+// so a real bad request is relayed as-is. Fail-safe to false on any parse miss.
+export function isFailoverTrigger(status, body) {
+  if (status === 429 || status === 529) return true;
+  // Only classify 400-599 (exclude 2xx/3xx, and very unusual 1xx).
+  if (status < 400 || status >= 600) return false;
+  let message;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    message = parsed && parsed.error && parsed.error.message;
+  } catch {
+    return false;
+  }
+  if (typeof message !== "string") return false;
+  return /(rate\s*limit|temporarily\s*unavailable|overloaded|try\s*again\s*later|cannot\s*process|capacity|credit\s*balance|organization\s*(is\s*)?disabled|account\s*(is\s*)?disabled|payment\s*required|quota\s*exceeded)/i.test(message);
+}
+
+// The first failover pair whose key glob matches the model id; null when no
+// failover config is present or no pair matches. Keys are model globs (same `*`
+// syntax as route match), values are the backup model id to rewrite the body to.
+export function pickFailoverModel(failoverConfig, model) {
+  if (!failoverConfig || typeof failoverConfig !== "object") return null;
+  if (typeof model !== "string" || model.length === 0) return null;
+  for (const [pattern, backup] of Object.entries(failoverConfig)) {
+    if (typeof pattern !== "string" || typeof backup !== "string") continue;
+    if (globToRegExp(pattern).test(model)) return backup;
+  }
+  return null;
 }
 
 // True when a route forwards the client's incoming auth header unchanged instead of
@@ -279,6 +315,29 @@ export function validateConfig(config) {
       }
     }
   }
+  // failover: optional object mapping model globs to backup model ids. E.g.
+  // { "claude-opus-*": "glm-5.1", "glm-5.1": "deepseek-v4-pro" }.
+  // When a matched model's upstream returns a rate-limit / temporary-unavailable
+  // error, the router rewrites the body's model to the backup id and reroutes.
+  if (config.failover !== undefined) {
+    if (!config.failover || typeof config.failover !== "object") throw new Error("config.failover: must be an object { modelGlob: backupModelId }");
+    for (const [pattern, backup] of Object.entries(config.failover)) {
+      if (typeof pattern !== "string" || pattern.length === 0) throw new Error(`config.failover: key "${pattern}" must be a non-empty model glob`);
+      if (typeof backup !== "string" || backup.length === 0) throw new Error(`config.failover: value for "${pattern}" must be a non-empty backup model id`);
+      try {
+        globToRegExp(pattern);
+      } catch (e) {
+        throw new Error(`config.failover: key "${pattern}" is not a valid glob: ${e.message}`);
+      }
+    }
+  }
+  // failoverRecoveryIntervalMs: optional number, default 60000. Min time between
+  // recovery pings to a failed-over primary. Must be >= 1000.
+  if (config.failoverRecoveryIntervalMs !== undefined) {
+    if (typeof config.failoverRecoveryIntervalMs !== "number" || config.failoverRecoveryIntervalMs < 1000) {
+      throw new Error("config.failoverRecoveryIntervalMs: must be a number >= 1000");
+    }
+  }
 
   return config;
 }
@@ -309,6 +368,8 @@ export function loadConfig(configPath) {
 export function listConfig(config) {
   const safe = {};
   if (config && config.proxyUrl !== undefined) safe.proxyUrl = config.proxyUrl;
+  // failover maps model globs → backup model ids; model ids and globs are not secrets.
+  if (config && config.failover !== undefined) safe.failover = config.failover;
   const routes = (config && Array.isArray(config.routes)) ? config.routes : [];
   safe.routes = routes.map((route) => {
     const out = { match: route.match, base_url: route.base_url };
@@ -560,27 +621,102 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {})
   upstreamReq.end();
 }
 
-// Build the response handler that realises the reactive vision fallback. `ctx` carries
-// the in-flight request; `isVisionTarget` is true when the route being answered IS the
-// `forImages` route (so a 400-image from it is the loop-guard case, never a re-reroute).
+// Build the response handler that realises the reactive vision fallback AND failover
+// reroute. `ctx` carries the in-flight request; `isVisionTarget` is true when the route
+// being answered IS the `forImages` route (so a 400-image from it is the loop-guard case,
+// never a re-reroute). `failoverHopCount` is the number of failover hops already taken
+// for this request (starts at 0, max MAX_FAILOVER_HOPS — chain-depth guard).
 function makeResponseHandler(ctx) {
   return (upstreamRes) => {
     const status = upstreamRes.statusCode || 502;
-    // 2xx and every other non-400 stream straight back — a success / SSE is NEVER
+
+    // Fast path — success / SSE (2xx) and every other non-error that is neither a
+    // 400 (vision classifier) nor a failover-candidate status. These are NEVER
     // buffered, so streaming stays intact.
-    if (status !== 400) {
+    // Buffer only real failover candidates + 400 (vision path): 400 for account/org
+    // issues, 429/529 for unambiguous rate-limit/overload, 5xx for server errors.
+    // Other 4xx (401, 403, 404, etc.) stream straight back — they're client errors
+    // that failover can't fix, so buffering them is wasted work + changes delivery
+    // semantics for oversized error bodies.
+    const isFailoverCandidate = ctx.failoverConfig
+      && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
+    if (status !== 400 && !isFailoverCandidate) {
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
         ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
         : null);
       return;
     }
-    // A 400: buffer the small error body and classify it.
+
+    // Buffer the (small) error body and classify it — either for failover or vision.
     bufferResponse(upstreamRes, REROUTE_BUFFER_CAP, (err, buffered, headers) => {
       if (err) {
         if (!ctx.res.headersSent) sendError(ctx.res, 502, "upstream error response could not be relayed");
         else ctx.res.destroy();
         return;
       }
+
+      // 1. FAILOVER CHECK: a rate-limit or temporary-unavailable error from a backend
+      //    that has a configured backup model → reroute to the backup.
+      if (isFailoverCandidate && isFailoverTrigger(status, buffered)) {
+        // Chain-depth guard — prevent infinite failover loops.
+        const hop = ctx.failoverHopCount || 0;
+        if (hop >= MAX_FAILOVER_HOPS) {
+          if (ctx.statsCtx && ctx.statsCtx.stats) {
+            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+          }
+          sendError(ctx.res, 502, `failover chain limit (${MAX_FAILOVER_HOPS} hops) reached — could not route "${ctx.model}"`);
+          return;
+        }
+
+        const backup = pickFailoverModel(ctx.failoverConfig, ctx.model);
+        if (!backup) {
+          // No backup configured for this model — relay the error as-is.
+          if (ctx.statsCtx && ctx.statsCtx.stats) {
+            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
+          }
+          relayBuffered(ctx.res, status, headers, buffered);
+          return;
+        }
+
+        const backupRoute = pickRoute(backup, ctx.config.routes);
+        if (!backupRoute) {
+          if (ctx.statsCtx && ctx.statsCtx.stats) {
+            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+          }
+          sendError(ctx.res, 502, `failover backup model "${backup}" has no matching route`);
+          return;
+        }
+
+        // Record the original error on the primary model.
+        if (ctx.statsCtx && ctx.statsCtx.stats) {
+          ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
+        }
+
+        // Enter failover state — subsequent requests for this model pre-route to backup.
+        ctx.failoverState.set(ctx.model, { enteredAt: Date.now() });
+        ctx.log(`failover: ${ctx.model} -> ${backup} (status ${status}, retrying on backup, hop ${hop + 1})`);
+
+        // Rewrite only `model` in the body (the ONE scoped exception to passthrough)
+        // and reroute to the backup.
+        const failoverBody = rewriteModelInBody(ctx.body, backup);
+        const visionRoute = ctx.visionRoute; // preserve from outer ctx (may be null)
+        proxyToRoute(backupRoute, ctx.req, ctx.res, failoverBody, ctx.log, {
+          onResponse: makeResponseHandler({
+            ...ctx,
+            body: failoverBody,
+            model: backup,
+            providerId: providerIdFromUrl(backupRoute.base_url),
+            visionRoute,
+            isVisionTarget: backupRoute === visionRoute,
+            failoverHopCount: hop + 1,
+          }),
+          statsCtx: ctx.statsCtx,
+        });
+        return;
+      }
+
+      // 2. VISION CHECK: a specific "image not supported" 400 → reroute to the
+      //    forImages vision target (existing behaviour).
       if (isImageUnsupported400(status, buffered)) {
         if (ctx.isVisionTarget) {
           // Loop guard: the vision target itself can't take the image — clear error,
@@ -611,7 +747,16 @@ function makeResponseHandler(ctx) {
         sendError(ctx.res, 422, `model "${ctx.model}" cannot process images and no vision fallback is configured`);
         return;
       }
-      // An ambiguous 400 (a real bad request) — relay it as-is, never reroute.
+
+      // 3. Any other error — relay it verbatim (an ambiguous 400, a non-rate-limit
+      //    5xx, etc.). Never reroute.
+      // DIAGNOSTIC: log the error message so we can see what the backend returned
+      // (only when a failover candidate didn't match — helps tune the classifier).
+      try {
+        const diag = JSON.parse(buffered.toString("utf8"));
+        const diagMsg = (diag && diag.error && diag.error.message) || JSON.stringify(diag).slice(0, 200);
+        ctx.log(`error-relay: ${ctx.model} status=${status} msg="${diagMsg}"`);
+      } catch { /* never fail on diagnostics */ }
       if (ctx.statsCtx && ctx.statsCtx.stats) {
         ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
       }
@@ -620,11 +765,15 @@ function makeResponseHandler(ctx) {
   };
 }
 
-// Route one buffered request to its backend, with the reactive vision fallback.
+// Route one buffered request to its backend, with the reactive vision fallback
+// AND failover reroute.
 // `nonVisionCache` is a per-process Map(model → true) of models a backend has already
 // rejected for images — ephemeral state, never the payload.
+// `failoverState` is a per-process Map(model → { enteredAt }) of currently failed-over
+// models — when set, requests for that model pre-route to its backup.
+// `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
-function forward(config, req, res, body, log, nonVisionCache, statsCtx = null) {
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null) {
   const model = modelFromBody(body);
   const route = pickRoute(model, config.routes);
   if (!route) {
@@ -634,6 +783,47 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null) {
 
   const visionRoute = pickVisionRoute(config.routes);
   const providerId = providerIdFromUrl(route.base_url);
+
+  // Build the base ctx for makeResponseHandler — the shared context threaded
+  // through every hop (vision reroute AND failover reroute).
+  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx, config, failoverState, failoverConfig, failoverHopCount: 0 };
+
+  // 0. FAILOVER PRE-ROUTE: if this model is in the active failover state AND the
+  //    failover cooldown hasn't elapsed, skip the known-failing primary and go
+  //    straight to the backup. When the cooldown HAS elapsed, fall through and try
+  //    the primary — it's the natural recovery probe for routes the pinger can't
+  //    probe (e.g. passthrough with no backend key). If the primary works, the old
+  //    failoverState entry just sits stale (every subsequent request falls through
+  //    past the cooldown and tries the primary normally). If it fails again, the
+  //    reactive failover in makeResponseHandler re-enters the state with a fresh
+  //    timestamp.
+  if (failoverState && failoverState.has(model)) {
+    const foState = failoverState.get(model);
+    const cooldownMs = config.failoverRecoveryIntervalMs || 60000;
+    if (Date.now() - foState.enteredAt <= cooldownMs) {
+      const backup = pickFailoverModel(failoverConfig, model);
+      if (backup) {
+        const backupRoute = pickRoute(backup, config.routes);
+        if (backupRoute) {
+          const failoverBody = rewriteModelInBody(body, backup);
+          proxyToRoute(backupRoute, req, res, failoverBody, log, {
+            onResponse: makeResponseHandler({
+              ...baseCtx,
+              body: failoverBody,
+              model: backup,
+              providerId: providerIdFromUrl(backupRoute.base_url),
+              visionRoute,
+              isVisionTarget: backupRoute === visionRoute,
+            }),
+            statsCtx,
+          });
+          return;
+        }
+      }
+      // Backup model doesn't resolve — fall through, try the primary.
+    }
+    // Cooldown elapsed (or no backup found) — fall through, try the primary.
+  }
 
   // Pre-route an image-bearing request straight to the vision target, skipping the
   // non-vision backend call, when the matched route is known non-vision — EITHER:
@@ -654,18 +844,132 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null) {
   ) {
     const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
     proxyToRoute(visionRoute, req, res, visionBody, log, {
-      onResponse: makeResponseHandler({ res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: true, providerId: providerIdFromUrl(visionRoute.base_url), statsCtx }),
+      onResponse: makeResponseHandler({ ...baseCtx, body: visionBody, model: visionRoute.forImagesModel, visionRoute, nonVisionCache, isVisionTarget: true, providerId: providerIdFromUrl(visionRoute.base_url) }),
       statsCtx,
     });
     return;
   }
 
   proxyToRoute(route, req, res, body, log, {
-    onResponse: makeResponseHandler({
-      res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx,
-    }),
+    onResponse: makeResponseHandler(baseCtx),
     statsCtx,
   });
+}
+
+// ── FailoverPinger ──────────────────────────────────────────────────────────
+// Background timer that periodically probes failed-over primary models to check
+// whether they've recovered. When a probe succeeds (non-failover response), the
+// model is removed from failoverState and routing reverts to the primary.
+//
+// Probe: a minimal messages API call ({model, messages:[{role:"user",content:"."}],
+// max_tokens:1}) through the primary's backend route — a real API call, not just
+// a connectivity check, so it accurately reflects whether the backend accepts
+// messages for that model.
+//
+// Similar to QuotaPoller in stats.mjs: setInterval + unref, best-effort.
+
+class FailoverPinger {
+  #failoverState;  // shared Map<modelId, {enteredAt: number}>
+  #config;         // shared config object (for route resolution)
+  #log;            // opt-in stderr logger (same as the router's log)
+  #interval = null;
+  #cooldownMs;
+
+  constructor(failoverState, config, log, cooldownMs = 60000) {
+    this.#failoverState = failoverState;
+    this.#config = config;
+    this.#log = log || (() => {});
+    this.#cooldownMs = cooldownMs;
+  }
+
+  async poll() {
+    const now = Date.now();
+    const toProbe = [];
+    for (const [model, state] of this.#failoverState) {
+      // Respect cooldown — don't probe more often than configured.
+      if (now - state.enteredAt >= this.#cooldownMs) {
+        toProbe.push(model);
+      }
+    }
+    for (const model of toProbe) {
+      await this.#probeOne(model);
+    }
+  }
+
+  async #probeOne(model) {
+    const route = pickRoute(model, this.#config.routes);
+    if (!route) {
+      // Route no longer exists — clear the stale failover entry.
+      this.#failoverState.delete(model);
+      return;
+    }
+    if (isPassthrough(route)) {
+      // Can't probe a passthrough route (no backend key of our own).
+      // Keep the failover — it'll be cleared by a real client request.
+      return;
+    }
+    let auth;
+    try {
+      auth = resolveAuthHeader(route);
+    } catch {
+      // Key not set — can't probe. Keep failover state.
+      return;
+    }
+
+    const upstream = new URL(route.base_url);
+    const pingBody = JSON.stringify({ model, messages: [{ role: "user", content: "." }], max_tokens: 1 });
+    const headers = {
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(pingBody)),
+      host: upstream.host,
+    };
+    headers[auth.name] = auth.value;
+
+    await new Promise((resolve) => {
+      const client = upstream.protocol === "http:" ? http : https;
+      const req = client.request(
+        {
+          protocol: upstream.protocol,
+          hostname: upstream.hostname,
+          port: upstream.port || (upstream.protocol === "http:" ? 80 : 443),
+          path: joinPath(upstream.pathname, "/v1/messages"),
+          method: "POST",
+          headers,
+        },
+        (res) => {
+          // Read the (small) response to classify it.
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const status = res.statusCode || 502;
+            const body = Buffer.concat(chunks);
+            if (status < 400 || !isFailoverTrigger(status, body)) {
+              // Primary recovered or returned a non-failover error — clear failover.
+              this.#failoverState.delete(model);
+              this.#log(`failover-recovery: ${model} primary restored, failover cleared (probe status ${status})`);
+            }
+            // If still a failover-triggering error, keep state (don't touch).
+            resolve();
+          });
+          res.on("error", () => resolve()); // keep state
+          res.on("aborted", () => resolve());
+        },
+      );
+      req.on("error", () => resolve()); // network error — keep state
+      req.write(pingBody);
+      req.end();
+    });
+  }
+
+  start(intervalMs) {
+    this.poll();
+    this.#interval = setInterval(() => this.poll(), intervalMs);
+    this.#interval.unref(); // don't keep the process alive
+  }
+
+  stop() {
+    if (this.#interval) { clearInterval(this.#interval); this.#interval = null; }
+  }
 }
 
 // Build the router as an http.Server. `options.log` overrides the stderr logger
@@ -678,6 +982,15 @@ export function createRouter(config, options = {}) {
   // so a repeat image call pre-routes to the vision target without the failing first
   // hop. Ephemeral, holds only model ids — never any request payload.
   const nonVisionCache = new Map();
+
+  // Failover state + recovery pinger
+  const failoverConfig = config.failover || null;
+  const failoverState = new Map();
+  let failoverPinger = null;
+  if (failoverConfig && Object.keys(failoverConfig).length > 0) {
+    failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000);
+    failoverPinger.start(config.failoverRecoveryIntervalMs || 60000);
+  }
 
   // Dashboard stats + quota polling (enabled by config.dashboard)
   let stats = null;
@@ -773,6 +1086,62 @@ export function createRouter(config, options = {}) {
       }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
+    // GET /v1/failover — return current failover config + active state
+    if (dashboard && req.method === "GET" && req.url === "/v1/failover") {
+      const active = {};
+      for (const [model, state] of failoverState) active[model] = { enteredAt: state.enteredAt };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ config: config.failover || {}, active }));
+      return;
+    }
+    // POST /v1/failover — merge failover pairs in-memory (same pattern as POST /v1/plans)
+    if (dashboard && req.method === "POST" && req.url === "/v1/failover") {
+      readBody(req, 16384).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          if (typeof data !== "object") throw new Error("must be an object");
+          const { pairs, cooldownMs } = data;
+          if (pairs !== undefined) {
+            if (typeof pairs !== "object") throw new Error("pairs must be an object { modelGlob: backupModelId }");
+            config.failover = { ...(config.failover || {}), ...pairs };
+          }
+          if (cooldownMs !== undefined) {
+            if (typeof cooldownMs !== "number" || cooldownMs < 1000) throw new Error("cooldownMs must be a number >= 1000");
+            config.failoverRecoveryIntervalMs = cooldownMs;
+          }
+          // Clean stale failoverState entries whose patterns no longer exist.
+          for (const model of failoverState.keys()) {
+            if (!pickFailoverModel(config.failover, model)) failoverState.delete(model);
+          }
+          // Start the pinger if pairs now exist and it wasn't running
+          if (config.failover && Object.keys(config.failover).length > 0 && !failoverPinger) {
+            failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000);
+            failoverPinger.start(config.failoverRecoveryIntervalMs || 60000);
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, config: config.failover || {}, cooldownMs: config.failoverRecoveryIntervalMs }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
+      return;
+    }
+    // POST /v1/failover/reset — clear all (or one) active failover state
+    if (dashboard && req.method === "POST" && req.url === "/v1/failover/reset") {
+      let cleared = 0;
+      // Optional query param: /v1/failover/reset?model=claude-opus-4-8
+      const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+      const targetModel = url.searchParams.get("model");
+      if (targetModel) {
+        if (failoverState.delete(targetModel)) cleared = 1;
+      } else {
+        cleared = failoverState.size;
+        failoverState.clear();
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, cleared }));
+      return;
+    }
 
     // GET /v1/models (and the bare /models) returns the configured routes as a
     // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
@@ -787,18 +1156,19 @@ export function createRouter(config, options = {}) {
     readBody(req, maxBytes)
       .then((body) => {
         const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
-        forward(config, req, res, body, log, nonVisionCache, statsCtx);
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, failoverConfig);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });
 
   // Expose stats + quotaPoller for teardown in tests
-  server._modelpipe = { stats, quotaPoller };
+  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger };
 
   // Archive session on graceful shutdown
   server.on("close", () => {
     if (stats) stats.shutdown();
     if (quotaPoller) quotaPoller.stop();
+    if (failoverPinger) failoverPinger.stop();
   });
 
   return server;

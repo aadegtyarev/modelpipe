@@ -22,6 +22,13 @@
   "_anthropicPlan_doc": "OPTIONAL string pro|max|team. Only used when dashboard:true. Selects the Anthropic subscription tier for effective-cost display and plan-vs-API comparison in the provider card.",
   "plans": { "anthropic": 200, "glm": 64.80 },
   "_plans_doc": "OPTIONAL object. Per-provider monthly subscription price in USD. Overrides default prices for effective-cost calculation. Provider keys: anthropic, glm, deepseek, openrouter. Only used when dashboard:true.",
+  "failover": {
+    "claude-opus-*": "glm-5.1",
+    "glm-5.1": "deepseek-v4-pro"
+  },
+  "_failover_doc": "OPTIONAL object. Maps model globs to backup model ids. When a primary model returns a rate-limit (429), overloaded (529), or temporary-unavailable 5xx error, the router rewrites the body model and reroutes to the backup. Chain depth-guarded at 5 hops. A background pinger probes primaries and clears failover on recovery.",
+  "failoverRecoveryIntervalMs": 60000,
+  "_failoverRecoveryIntervalMs_doc": "OPTIONAL number, default 60000. Minimum ms between recovery pings to a failed-over primary. Must be >= 1000.",
   "routes": [
     {
       "match": "claude-*",

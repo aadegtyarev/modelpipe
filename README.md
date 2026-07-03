@@ -114,8 +114,10 @@ read once at launch. Edit the env, then quit and relaunch.
 
 modelpipe matches the **literal `body.model`** of each request against each route's
 `match` glob (only `*` is a wildcard), and forwards to the **first** route that matches.
-It does **not** alias or translate — it never rewrites `body.model` except on the one
-vision-reroute hop described below.
+It does **not** alias or translate — it rewrites `body.model` ONLY on two scoped
+reroute hops: the vision fallback (rewrites to `forImagesModel`), and the failover
+reroute (rewrites to a backup model id). Every other byte of the body passes through
+unchanged.
 
 The practical rule follows directly: a route's `match` must target the id that actually
 **arrives** — the id Claude Code resolved, not the alias you typed. For a Claude backend
@@ -160,8 +162,13 @@ config only names the env var, read at request time and never logged.
 | --- | --- | --- | --- |
 | `listen` | `{host, port}` | `127.0.0.1:8787` | Bind address and port. |
 | `maxBodyBytes` | number | `26214400` (25 MB) | Request body size cap; 413 if exceeded. |
-| `dashboard` | boolean | `false` | Enable the monitoring dashboard (see below). |
+| `dashboard` | boolean | `false` | Enable the monitoring dashboard, stats collection, and management endpoints. |
 | `glmPlan` | `"lite"` `"pro"` `"max"` | `"pro"` | GLM Coding Plan tier for quota bars. Only used when `dashboard: true`. |
+| `anthropicPlan` | `"pro"` `"max"` `"team"` | — | Anthropic subscription tier for plan-vs-API cost comparison. Only used when `dashboard: true`. |
+| `plans` | `{provider: price}` | — | Per-provider monthly subscription price (USD). E.g. `{"anthropic": 100, "glm": 64.80}`. Overrides default tier prices for effective-cost display. Only used when `dashboard: true`. |
+| `tokenPrices` | `{modelGlob: {input, output}}` | — | Per-model API token price overrides ($ per 1M tokens). Keys can use `*` globs. Falls back to built-in `PRICE_MAP` in `src/stats.mjs`. |
+| `failover` | `{modelGlob: backupModel}` | — | Model failover pairs. When a primary model's backend returns a retryable error (rate-limit, overloaded, account/org issues), modelpipe rewrites `body.model` to the backup id and reroutes. Supports chain failover (depth-guarded at 5 hops). |
+| `failoverRecoveryIntervalMs` | number | `60000` | Minimum ms between recovery probes to a failed-over primary. Background pinger probes primaries; also, after the cooldown elapses the next real request tries the primary. Must be >= 1000. |
 | `proxyUrl` | string | — | Public URL of this proxy, surfaced in `modelpipe --list` output. |
 | `routes[]` | array | required | Route entries (see below). |
 
@@ -175,11 +182,6 @@ config only names the env var, read at request time and never logged.
 | `vision` | boolean | `true` | `false` declares this backend has no vision. Image-bearing requests skip straight to the `forImages` target — needed when a backend doesn't 400 on images (soft-200 refusal, server-side image tool). Text-only calls route normally. |
 | `forImages` | boolean | — | Set `true` on **exactly one** route to mark it the vision fallback target. |
 | `forImagesModel` | string | **required** if `forImages` | The model id the vision backend expects. On reroute, `body.model` is rewritten to this (the only passthrough exception). |
-
-| Config field | Default | Meaning |
-| --- | --- | --- |
-| `dashboard` | `false` | Enable the usage dashboard (see below). |
-| `glmPlan` | `"pro"` | GLM Coding Plan tier: `"lite"`, `"pro"`, or `"max"`. Only used when `dashboard` is true — selects the budget for artificial 5-hour / weekly quota bars. |
 
 ### Vision routing
 
@@ -259,7 +261,8 @@ required — the page is embedded in the proxy process.
 **Pricing catalog.** Built-in prices for `claude-*`, `deepseek-*`, `glm-*`, and
 `google/gemini-*` models. Unknown models show `price —` in the card and $0.00 cost
 (they still count tokens and appear in the chart). The catalog lives in `src/stats.mjs`
-(`PRICE_MAP`) — add entries there for models not yet covered.
+(`PRICE_MAP`) — add entries there for models not yet covered. Override per-model prices
+at runtime via the Settings panel (⚙ → API token prices) or `config.tokenPrices`.
 
 **API endpoints** (only when `dashboard: true`):
 
@@ -268,10 +271,46 @@ required — the page is embedded in the proxy process.
 | `GET /v1/stats` | Per-model usage, session totals, timeline (last 200), GLM quota estimation. |
 | `GET /v1/quotas` | External quota snapshot: DeepSeek balance, OpenRouter credits, Anthropic rate limits. |
 | `GET /v1/sessions` | Archived session history (up to 20). |
+| `GET /v1/models` | Secret-free route listing: model globs, hosts, auth mode, vision flags. |
+| `GET /v1/failover` | Current failover config and active failover state. |
 | `POST /v1/sessions/reset` | Archives current session and starts a new one. |
+| `POST /v1/plans` | Updates subscription prices (`plans`) and API token prices (`tokenPrices`) in-memory. |
+| `POST /v1/failover` | Merges failover pairs and/or cooldown interval in-memory. |
+| `POST /v1/failover/reset` | Clears all (or one, via `?model=X`) active failover state. |
 
 All endpoints are JSON, secret-free (no keys, no env-var names, only aggregated counts),
 served only on localhost.
+
+## Model failover
+
+When `failover` is set in the config, modelpipe automatically switches to a backup model
+when a primary backend returns a retryable error:
+
+```json
+"failover": {
+  "claude-opus-*": "glm-5.1",
+  "glm-5.1": "deepseek-v4-pro"
+}
+```
+
+**How it works:**
+
+- **Reactive trigger.** When a backend returns an error that looks retryable — 429 (rate
+  limit), 529 (overloaded), or any 4xx/5xx whose body mentions rate-limit / quota /
+  capacity / credit / account / organisation keywords — modelpipe rewrites `body.model` to
+  the backup id and reroutes.
+- **Pre-route.** Once a model enters failover, subsequent requests within the cooldown
+  period skip the primary and go straight to the backup.
+- **Chain failover.** If the backup also fails and has its own failover pair, the router
+  follows the chain (depth-guarded at 5 hops).
+- **Recovery.** A background pinger periodically probes failed-over primaries. When a
+  primary responds normally, the failover is cleared and routing reverts. For passthrough
+  routes (no backend key), the cooldown-based retry on the next real request serves as
+  the recovery path.
+
+Pairs can be updated at runtime via the dashboard (⚙ → Failover) or the `POST /v1/failover`
+endpoint — no restart required. Active failover state is visible in the dashboard and can
+be manually reset.
 
 ## Security posture
 

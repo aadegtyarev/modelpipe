@@ -719,6 +719,19 @@ canvas{display:block;width:100%;height:200px}
   </div>
   <div id="tpriceRows"></div>
 </div>
+<div id="failoverPanel" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:13px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+    <span style="color:var(--muted)">Failover pairs (model glob → backup):</span>
+    <button onclick="saveFailover()" style="background:var(--blue);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Save</button>
+  </div>
+  <div id="failoverPairs"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+    <input id="foPattern" placeholder="model glob (e.g. claude-opus-*)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px;flex:1">
+    <input id="foBackup" placeholder="backup model (e.g. glm-5.1)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px;flex:1">
+    <button onclick="addFailoverPair()" style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Add</button>
+  </div>
+  <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
+</div>
 <div class="models" id="models"></div>
 <div class="models" id="models"></div>
 
@@ -779,10 +792,11 @@ async function saveTokenPrices(){
   load();
 }
 function toggleSettings(){
-  const s=$('settings'),tp=$('tokenPricesPanel');
+  const s=$('settings'),tp=$('tokenPricesPanel'),fp=$('failoverPanel');
   const show=s.style.display==='none';
   s.style.display=show?'flex':'none';
   tp.style.display=show?'block':'none';
+  fp.style.display=show?'block':'none';
   if(show){
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const pp=st.plans||{};
@@ -803,7 +817,69 @@ function toggleSettings(){
       if(!rows)rows='<span style="color:var(--muted)">no model traffic yet — prices shown from catalog</span>';
       $('tpriceRows').innerHTML=rows;
     });
+    // Load failover state
+    fetch("/v1/failover").then(r=>r.json()).then(fo=>renderFailover(fo));
   }
+}
+
+// ── Failover UI ──────────────────────────────────────────────────────────
+
+let failoverPairs={},failoverActive={};
+
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function escJs(s){return String(s).replace(/'/g,"\\'").replace(/\\/g,'\\\\')}
+
+function renderFailover(fo){
+  failoverPairs=fo.config||{};
+  failoverActive=fo.active||{};
+  // Pairs table
+  let phtml='';
+  for(const[pattern,backup]of Object.entries(failoverPairs)){
+    const pHtml=escHtml(pattern),bHtml=escHtml(backup),pJs=escJs(pattern);
+    phtml+='<div style="display:flex;align-items:center;gap:8px;margin:2px 0">'+
+      '<span style="min-width:140px;color:var(--blue)">'+pHtml+'</span>'+
+      '<span style="color:var(--muted)">→</span>'+
+      '<span style="min-width:140px;color:var(--green)">'+bHtml+'</span>'+
+      '<button onclick="removeFailoverPair(\\''+pJs+'\\')" style="background:var(--red);color:#fff;border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">×</button></div>';
+  }
+  if(!phtml)phtml='<span style="color:var(--muted)">no pairs configured</span>';
+  $('failoverPairs').innerHTML=phtml;
+  // Active state
+  const entries=Object.entries(failoverActive);
+  let ahtml='';
+  if(entries.length){
+    ahtml='<span style="color:var(--orange);font-weight:600">Active failovers:</span> ';
+    ahtml+=entries.map(([m,s])=>{
+      const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+      return '<span style="color:var(--orange)">'+escHtml(m)+' (since '+t+')</span>';
+    }).join(' · ');
+    ahtml+=' <button onclick="resetFailover()" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">Reset all</button>';
+  }
+  $('failoverActive').innerHTML=ahtml;
+}
+
+async function saveFailover(){
+  await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pairs:failoverPairs})});
+  load();
+}
+
+async function addFailoverPair(){
+  const pat=$('foPattern').value.trim(),bak=$('foBackup').value.trim();
+  if(!pat||!bak)return;
+  failoverPairs[pat]=bak;
+  await saveFailover();
+  $('foPattern').value='';$('foBackup').value='';
+}
+
+async function removeFailoverPair(pattern){
+  delete failoverPairs[pattern];
+  await saveFailover();
+}
+
+async function resetFailover(model){
+  const url=model?'/v1/failover/reset?model='+encodeURIComponent(model):'/v1/failover/reset';
+  await fetch(url,{method:"POST"});
+  load();
 }
 
 async function newSession(){
