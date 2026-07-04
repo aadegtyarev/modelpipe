@@ -105,7 +105,25 @@ function main() {
     }
   });
 
-  const shutdown = () => server.close(() => process.exit(0));
+  // Graceful shutdown that actually terminates. server.close() alone WAITS for every
+  // open connection to end first — and a client like Claude Code holds a keep-alive
+  // socket open indefinitely, so close() never fires its callback and the process hangs
+  // under `systemctl restart` (stuck "deactivating" until the stop timeout SIGKILLs it).
+  // So: stop accepting new connections, immediately free IDLE keep-alive sockets (lets
+  // close() complete once in-flight requests finish), and keep a short hard backstop that
+  // force-closes anything still lingering. (closeIdleConnections/closeAllConnections exist
+  // on Node >= 18.2; optional-chained so an older 18.x still exits cleanly via the timer.)
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close(() => process.exit(0));
+    server.closeIdleConnections?.();
+    setTimeout(() => {
+      server.closeAllConnections?.();
+      process.exit(0);
+    }, 3000).unref();
+  };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
