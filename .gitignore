@@ -4,6 +4,7 @@ npm-debug.log*
 .DS_Store
 .env
 .env.*
+!.env.example
 routes.json
 routes.local.json
 .playwright-mcp/

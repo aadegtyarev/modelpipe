@@ -11,13 +11,46 @@ and your `sonnet`/`opus`/`haiku` aliases land on whichever providers you choose.
 
 ## Quick start
 
+modelpipe is a single Node script with **zero dependencies** — nothing to build, nothing to
+`npm install`. You need **Node.js ≥ 18**.
+
+**1. Get it.**
+
 ```sh
-npx modelpipe routes.json            # run with no install
-# or: npm i -g modelpipe && modelpipe routes.json
+git clone https://github.com/aadegtyarev/modelpipe.git
+cd modelpipe
 ```
 
-Requires Node.js >= 18, no dependencies (Node built-ins only). It prints the listen
-URL to stderr and runs until killed (Ctrl-C). Then point your client at it:
+**2. Write your routes.** Copy the worked example and edit it — it maps model ids to
+backends. Keys are referenced by env-var **name** only, never pasted into the file.
+
+```sh
+cp routes.example.json routes.json
+$EDITOR routes.json        # see "Routes config" below
+```
+
+**3. Add your keys.** Copy the env template and fill in the keys your routes use.
+
+```sh
+cp .env.example .env
+$EDITOR .env
+```
+
+modelpipe **auto-loads `.env`** from your config's folder on start (or pass
+`--env-file <path>`). A shell `export` or a systemd `EnvironmentFile` still wins over it, and
+keys are only ever read at request time — never written to the config or logged.
+
+**4. Run it.**
+
+```sh
+node bin/modelpipe.mjs routes.json
+```
+
+It prints the listen URL to stderr and runs until you stop it (Ctrl-C). Want a `modelpipe`
+command on your PATH? `npm link` in the repo. Want it always-on? See
+[Run in the background](#run-in-the-background-systemd).
+
+**5. Point your client at it.**
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
@@ -26,10 +59,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 For Claude Code specifically — including the model-alias env recipe and the
 **restart caveat** — read the next section. For any other Anthropic-format client,
 setting `ANTHROPIC_BASE_URL` is usually all you need (see [Other clients](#other-clients)).
-
-Write your route table by copying [`routes.example.json`](routes.example.json) and
-filling in the env-var names it references; provider endpoints come from
-[`providers.json`](providers.json).
+Provider endpoints/auth to copy into routes come from [`providers.json`](providers.json).
 
 ## Claude Code setup
 
@@ -235,7 +265,7 @@ The injected header respects `scheme`, so a Bearer token works too:
 Discover what a config is wired for without starting the server:
 
 ```sh
-modelpipe routes.json --list
+node bin/modelpipe.mjs routes.json --list
 ```
 
 It prints a **safe JSON summary** of the route table to stdout and exits — no network,
@@ -255,12 +285,42 @@ localhost `--list`). Handy for a setup probe against a running router.
 ## Verifying routing — `MODEL_ROUTER_LOG`
 
 ```sh
-MODEL_ROUTER_LOG=1 modelpipe routes.json
+MODEL_ROUTER_LOG=1 node bin/modelpipe.mjs routes.json
 ```
 
 Prints one `model -> host` line per request to stderr (`[model-router] <model> -> <host>`)
 so you can confirm exactly which id arrived and where it routed — never a key, body, or
 header. Off by default.
+
+## Run in the background (systemd)
+
+To keep modelpipe always-on as a **user** service (no root), point it at your config and
+`.env` with absolute paths:
+
+```ini
+# ~/.config/systemd/user/modelpipe.service
+[Unit]
+Description=modelpipe — Anthropic-format model router
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node %h/modelpipe/bin/modelpipe.mjs %h/modelpipe/routes.json --env-file %h/modelpipe/.env
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now modelpipe
+systemctl --user status modelpipe          # check it's running
+journalctl --user -u modelpipe -f          # follow logs
+```
+
+Update after a `git pull` with `systemctl --user restart modelpipe` (graceful — it won't
+hang on open connections). `loginctl enable-linger $USER` keeps it running when you're
+logged out.
 
 ## Dashboard
 

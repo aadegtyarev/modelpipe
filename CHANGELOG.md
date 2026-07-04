@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`.env` auto-loading**: modelpipe now loads a `.env` from the config's folder on start
+  (or `--env-file <path>`), so a plain `node bin/modelpipe.mjs routes.json` "just works" with
+  keys — no shell export or systemd required. Never overrides vars already in the environment;
+  keys are still only read at request time and never logged. Added `.env.example`.
 - **Account pools** (`route.accounts` + `route.strategy`): multiple accounts/keys for the
   same model, rotating on a rate-limit. Each account has a `label` (its own dashboard card
   + per-label stats), its own `auth`, and an optional `base_url`; route-level `auth` becomes
