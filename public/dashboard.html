@@ -78,6 +78,11 @@ canvas{display:block;width:100%;height:200px}
 
 .refresh{color:var(--muted);font-size:13px;margin-top:14px;cursor:pointer}
 .refresh:hover{color:var(--text)}
+
+/* Routing / failover banner */
+.routing{background:var(--card-bg);border:1px solid var(--orange);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:14px}
+.routing .hdr{color:var(--orange);font-weight:600;margin-bottom:4px}
+.routing .line{padding:2px 0}
 </style>
 </head>
 <body>
@@ -86,6 +91,7 @@ canvas{display:block;width:100%;height:200px}
 <div class="error" id="e"></div>
 
 <div class="session" id="session"></div>
+<div id="routing"></div>
 <div class="sessctl" id="sessctl">
   <button class="b" id="btnReset" onclick="newSession()">New session</button>
   <span style="font-size:13px;color:var(--muted)">History:</span>
@@ -297,11 +303,12 @@ async function showHistory(){histMode=$("sessSelect").value||null;load();}
 // ── Load + render ─────────────────────────────────────────────────────────────
 async function load(){
   try{
-    const[stats,quotas,sessions,models]=await Promise.all([
+    const[stats,quotas,sessions,models,failover]=await Promise.all([
       fetch("/v1/stats").then(r=>r.json()),
       fetch("/v1/quotas").then(r=>r.json()),
       fetch("/v1/sessions").then(r=>r.json()),
       fetch("/v1/models").then(r=>r.json()).catch(()=>({data:[]})),
+      fetch("/v1/failover").then(r=>r.json()).catch(()=>({config:{},active:{},groups:[]})),
     ]);
     // Build providerId -> billing map from the route table, using the SERVER-computed
     // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
@@ -333,10 +340,35 @@ async function load(){
       if(arch){stats.session=arch.session;stats.models=arch.models;stats.timeline=[];}
     }
     render(stats,quotas,cfg);
+    renderRouting(failover);
     $("e").style.display="none";
   }catch(err){$("e").style.display="block";$("e").textContent="fetch error: "+err.message}
   $("r").textContent="Updated: "+new Date().toLocaleTimeString()+"  —  auto-refresh "+(auto?"ON":"OFF");
   if(auto)setTimeout(load,2000);
+}
+
+// Top-level routing banner: shows — without opening Settings — when traffic is being
+// redirected (a reactive failover pair is active, or a failover group is shifted off its
+// head tier). Silent when routing is normal (the model cards already show where traffic
+// goes). Hidden while viewing an archived session (failover state is live, not historical).
+function renderRouting(fo){
+  if(!fo||histMode){$("routing").innerHTML="";return;}
+  const active=Object.entries(fo.active||{});
+  const groups=(fo.groups||[]).filter(g=>g.offset>0);
+  if(!active.length&&!groups.length){$("routing").innerHTML="";return;}
+  let h='<div class="routing"><div class="hdr">⚠ Routing redirected — failover active</div>';
+  for(const g of groups){
+    h+='<div class="line">'+g.ladder.map((t,p)=>{
+      const eff=g.effective[p],act=eff!==t;
+      return '<span style="color:'+(act?'var(--orange)':'var(--muted)')+'">'+escHtml(t)+(act?' → '+escHtml(eff):'')+'</span>';
+    }).join(' <span style="color:var(--border)">|</span> ')+' <span class="tag sub">['+escHtml(g.mode)+'] shifted +'+g.offset+'</span></div>';
+  }
+  for(const[m,s]of active){
+    const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+    h+='<div class="line"><span style="color:var(--orange)">'+escHtml(m)+'</span> → rerouted to backup (since '+t+')</div>';
+  }
+  h+='</div>';
+  $("routing").innerHTML=h;
 }
 
 function render(stats,quotas,cfg){
@@ -365,8 +397,11 @@ function render(stats,quotas,cfg){
     const online=m.lastRequestAt>Date.now()-300000;
     const metered=isMetered(m.providerId);
     const tot=(m.inputTokens+m.outputTokens)||1;
+    // Red dot ONLY when the model is fully failing — traffic sent, zero successful responses.
+    const allFail=m.requests>0&&(m.requests-(m.errors||0))===0;
+    const dotColor=allFail?'var(--red)':(online?'var(--green)':'var(--muted)');
     mhtml+='<div class="card">'+
-      '<div class="head"><span class="name" style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'● ':'○ ')+escHtml(mid)+'</span>'+
+      '<div class="head"><span class="name" style="color:'+dotColor+'" title="'+(allFail?'all requests failing':(online?'active':'idle'))+'">'+(online||allFail?'● ':'○ ')+escHtml(mid)+'</span>'+
         '<span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span></div>'+
       '<div class="provider">'+escHtml(m.providerId)+'</div>'+
       '<div class="price">'+(metered?pricestr(m.priceInput,m.priceOutput):'subscription — cost not metered')+'</div>'+
@@ -394,13 +429,17 @@ function render(stats,quotas,cfg){
     const metered=isMetered(c.pid);
     const cost=sm.reduce((a,m)=>a+(m.cost||0),0);
     const treq=sm.reduce((a,m)=>a+(m.requests||0),0);
+    const terr=sm.reduce((a,m)=>a+(m.errors||0),0);
     const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.outputTokens||0),0);
     const online=sm.some(m=>m.lastRequestAt>Date.now()-300000);
+    // Red dot ONLY when this provider is fully failing — traffic sent, zero successful responses.
+    const allFail=treq>0&&(treq-terr)===0;
+    const dotColor=allFail?'var(--red)':(online?'var(--green)':'var(--muted)');
     const canon=c.canon||c.pid; // for a pooled account, the underlying provider (glm/anthropic/…)
     const labelled=canon!==c.pid; // this card IS an individual account label
     const consoleUrl=CONSOLE[canon];
     qhtml+='<div class="qcard"><div class="qhead">'+
-      '<span style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'●':'○')+'</span> '+escHtml(c.pid)+
+      '<span style="color:'+dotColor+'" title="'+(allFail?'all requests failing':(online?'active':'idle'))+'">'+(online||allFail?'●':'○')+'</span> '+escHtml(c.pid)+
       (labelled?' <span class="tag" style="color:var(--blue);border-color:var(--blue)">'+escHtml(canon)+'</span>':'')+
       ' <span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span>'+
       (consoleUrl?' <a href="'+consoleUrl+'" target="_blank" rel="noopener" title="open provider console" style="margin-left:auto;font-size:12px">console ↗</a>':'')+
