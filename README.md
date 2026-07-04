@@ -9,6 +9,27 @@ It is **Claude-Code-first and standalone**: it needs no protocol, no wrapper, an
 account beyond the backend keys you already have. Start it, point Claude Code at it,
 and your `sonnet`/`opus`/`haiku` aliases land on whichever providers you choose.
 
+## Install
+
+Fastest — a guided setup that asks a few questions and writes your `routes.json` + `.env`
+(needs **Node.js ≥ 18**; no `npm install`, zero dependencies):
+
+```sh
+# run the config wizard straight from GitHub (nothing installed globally)
+npx github:aadegtyarev/modelpipe init
+
+# …then run the proxy against the config it wrote:
+npx github:aadegtyarev/modelpipe routes.json
+```
+
+Or install it persistently (clone into `~/modelpipe` + run the wizard):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/aadegtyarev/modelpipe/main/install.sh | bash
+```
+
+Prefer to do it by hand? See [Quick start](#quick-start) just below.
+
 ## Quick start
 
 modelpipe is a single Node script with **zero dependencies** — nothing to build, nothing to
@@ -20,6 +41,9 @@ modelpipe is a single Node script with **zero dependencies** — nothing to buil
 git clone https://github.com/aadegtyarev/modelpipe.git
 cd modelpipe
 ```
+
+Or let the wizard write your config for you: `node bin/modelpipe.mjs init` (asks which
+backends to route, which keys, port, dashboard — then writes `routes.json` + `.env`).
 
 **2. Write your routes.** Copy the worked example and edit it — it maps model ids to
 backends. Keys are referenced by env-var **name** only, never pasted into the file.
