@@ -135,9 +135,8 @@ array. Each route has a `match` glob over the model id, a backend `base_url`, an
 {
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": true,
-  "glmPlan": "pro",
   "routes": [
-    { "match": "claude-*", "base_url": "https://api.anthropic.com", "auth": "passthrough" },
+    { "match": "claude-*", "base_url": "https://api.anthropic.com", "auth": "passthrough", "billing": "subscription" },
     { "match": "deepseek-*", "base_url": "https://api.deepseek.com/anthropic",
       "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" } },
     { "match": "vision-*", "base_url": "https://openrouter.ai/api", "forImages": true,
@@ -162,13 +161,11 @@ config only names the env var, read at request time and never logged.
 | --- | --- | --- | --- |
 | `listen` | `{host, port}` | `127.0.0.1:8787` | Bind address and port. |
 | `maxBodyBytes` | number | `26214400` (25 MB) | Request body size cap; 413 if exceeded. |
-| `dashboard` | boolean | `false` | Enable the monitoring dashboard, stats collection, and management endpoints. |
-| `glmPlan` | `"lite"` `"pro"` `"max"` | `"pro"` | GLM Coding Plan tier for quota bars. Only used when `dashboard: true`. |
-| `anthropicPlan` | `"pro"` `"max"` `"team"` | — | Anthropic subscription tier for plan-vs-API cost comparison. Only used when `dashboard: true`. |
-| `plans` | `{provider: price}` | — | Per-provider monthly subscription price (USD). E.g. `{"anthropic": 100, "glm": 64.80}`. Overrides default tier prices for effective-cost display. Only used when `dashboard: true`. |
-| `tokenPrices` | `{modelGlob: {input, output}}` | — | Per-model API token price overrides ($ per 1M tokens). Keys can use `*` globs. Falls back to built-in `PRICE_MAP` in `src/stats.mjs`. |
+| `dashboard` | boolean | `false` | Enable the monitoring dashboard, stats collection, and management endpoints. The live session and dashboard-set overrides persist under `~/.modelpipe/` across restarts. |
+| `tokenPrices` | `{modelGlob: {input, output}}` | — | Per-model **metered** API token price overrides ($ per 1M tokens). Keys can use `*` globs. Falls back to built-in `PRICE_MAP` in `src/stats.mjs`. Editable at runtime (⚙) and persisted. |
 | `failover` | `{modelGlob: backupModel}` | — | Model failover pairs. When a primary model's backend returns a retryable error (rate-limit, overloaded, account/org issues), modelpipe rewrites `body.model` to the backup id and reroutes. Supports chain failover (depth-guarded at 5 hops). |
-| `failoverRecoveryIntervalMs` | number | `60000` | Minimum ms between recovery probes to a failed-over primary. Background pinger probes primaries; also, after the cooldown elapses the next real request tries the primary. Must be >= 1000. |
+| `failoverGroups` | `[{ladder, mode?}]` | — | Coordinated group failover. `mode: "shift"` (default) moves the whole ladder down one when its head tier fails; `mode: "cascade"` walks per-request. See [Model failover](#model-failover). |
+| `failoverRecoveryIntervalMs` | number | `60000` | Minimum ms between recovery probes to a failed-over primary (and group wind-back re-probes). After the cooldown elapses the next real request also tries the primary. Must be >= 1000. |
 | `proxyUrl` | string | — | Public URL of this proxy, surfaced in `modelpipe --list` output. |
 | `routes[]` | array | required | Route entries (see below). |
 
@@ -179,6 +176,7 @@ config only names the env var, read at request time and never logged.
 | `match` | string | **required** | Glob pattern over the model id (`*` is the only wildcard). First match wins — order specific before broad. |
 | `base_url` | string (URL) | **required** | Backend origin. The client's `/v1/messages` path is appended. |
 | `auth` | string or object | **required** | `"passthrough"` forwards the client's auth header unchanged. Object `{header, keyEnv, scheme?}` swaps in a backend key: `header` is the header name (e.g. `x-api-key`), `keyEnv` is the **name** of the env var holding the key (never the key value), `scheme` is an optional prefix (e.g. `"Bearer"` → `Authorization: Bearer <key>`). |
+| `billing` | `"metered"` `"subscription"` | derived | How the dashboard reports money. `metered` = pay-as-you-go (real per-token $). `subscription` = flat plan (tokens + "flat plan" label, no fabricated $). Default: passthrough ⇒ subscription, key-swap ⇒ metered. |
 | `vision` | boolean | `true` | `false` declares this backend has no vision. Image-bearing requests skip straight to the `forImages` target — needed when a backend doesn't 400 on images (soft-200 refusal, server-side image tool). Text-only calls route normally. |
 | `forImages` | boolean | — | Set `true` on **exactly one** route to mark it the vision fallback target. |
 | `forImagesModel` | string | **required** if `forImages` | The model id the vision backend expects. On reroute, `body.model` is rewritten to this (the only passthrough exception). |
@@ -240,43 +238,55 @@ When `"dashboard": true` is set in the config, modelpipe collects per-request us
 and serves a live monitoring page at `http://127.0.0.1:8787/dashboard`. No installation
 required — the page is embedded in the proxy process.
 
+**Honesty rule.** The dashboard shows only measured data. Money appears **only where it is
+real**: per-token cost for `metered` (pay-as-you-go) providers and real provider balances.
+For `subscription` (flat-plan) providers — a GLM Coding Plan, an Anthropic subscription —
+per-token dollars are meaningless, so the dashboard shows **tokens + a "flat plan" label**,
+never a fabricated cost. There are no invented quota bars, no subscription-cost proration,
+and no "plan vs API saves $X" verdicts.
+
 **What it shows:**
 
-- **Session bar** — total cost, requests, tokens, start time.
-- **Model cards** — each model with its provider, API pricing ($X/$Y per 1M in/out),
-  tokens consumed, and dollar cost. Models sorted by spend.
+- **Session bar** — metered API cost (subscription providers contribute nothing), requests,
+  tokens, start time.
+- **Model cards** — each model with its provider, a `metered`/`flat plan` tag, tokens, and
+  requests. Dollar cost is shown only for metered models; flat-plan models show `—`.
 - **Token chart** — cumulative tokens per model over time (last 200 requests).
-- **Quotas** — DeepSeek balance, OpenRouter daily credits, Anthropic RPM/TPM rate limits
-  (captured from response headers; for the Rate Limits API, set `ANTHROPIC_API_KEY` in
-  `.env` even if the traffic route stays passthrough).
-- **GLM Coding Plan** — artificial 5-hour and weekly quota bars estimated from token
-  counts × API pricing. The plan–vs–raw-API comparison shows whether the subscription
-  pays off. Displays the current peak/off-peak multiplier in local time.
-- **Request log** — last 50 requests with timestamp, model, tokens in/out, cost,
-  duration (ms).
-- **Session management** — "New Session" button resets counters and archives the current
-  session; history dropdown selects any of the last 20 sessions. Sessions persist to
-  `~/.modelpipe/sessions.json` across proxy restarts.
+- **Provider cards** — real data only: DeepSeek balance, OpenRouter credits, Anthropic
+  RPM/ITPM/OTPM (from live response headers), and per-provider session tokens/requests. GLM
+  links to the z.ai console for its real Coding-Plan quota.
+- **Request log** — last 50 requests with timestamp, model, tokens in/out, cost (metered
+  only), duration (ms).
+- **Session management** — "New session" archives the current session and starts fresh;
+  history dropdown selects any of the last 20 sessions.
+- **Settings (⚙)** — edit metered token prices and failover pairs at runtime; view failover
+  groups and active shift state.
 
-**Pricing catalog.** Built-in prices for `claude-*`, `deepseek-*`, `glm-*`, and
-`google/gemini-*` models. Unknown models show `price —` in the card and $0.00 cost
-(they still count tokens and appear in the chart). The catalog lives in `src/stats.mjs`
-(`PRICE_MAP`) — add entries there for models not yet covered. Override per-model prices
-at runtime via the Settings panel (⚙ → API token prices) or `config.tokenPrices`.
+**Persistence.** The live session (per-model/provider totals + timeline) is flushed to
+`~/.modelpipe/state.json` every 10 s and on shutdown, and **resumed on startup** — a crash
+loses at most a few seconds. Archived sessions live in `~/.modelpipe/sessions.json`, and
+dashboard-set token prices / failover pairs in `~/.modelpipe/overrides.json`. The config
+file stays the immutable source of truth; overrides are merged on top. (Override the base
+dir with `MODELPIPE_DIR`.)
+
+**Pricing catalog.** Built-in metered prices for `claude-*`, `deepseek-*`, `glm-*`, and
+`google/gemini-*` models in `src/stats.mjs` (`PRICE_MAP`). Unknown models show `price —` and
+$0 cost (they still count tokens and chart). Override per-model prices at runtime via
+Settings (⚙) or `config.tokenPrices`.
 
 **API endpoints** (only when `dashboard: true`):
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /v1/stats` | Per-model usage, session totals, timeline (last 200), GLM quota estimation. |
-| `GET /v1/quotas` | External quota snapshot: DeepSeek balance, OpenRouter credits, Anthropic rate limits. |
+| `GET /v1/stats` | Per-model usage, session totals, timeline (last 200). |
+| `GET /v1/quotas` | Real provider balances: DeepSeek balance, OpenRouter credits. |
 | `GET /v1/sessions` | Archived session history (up to 20). |
-| `GET /v1/models` | Secret-free route listing: model globs, hosts, auth mode, vision flags. |
-| `GET /v1/failover` | Current failover config and active failover state. |
+| `GET /v1/models` | Secret-free route listing: model globs, hosts, auth mode, vision + billing flags. |
+| `GET /v1/failover` | Failover pairs, active reactive state, and group ladders/offsets/effective tiers. |
 | `POST /v1/sessions/reset` | Archives current session and starts a new one. |
-| `POST /v1/plans` | Updates subscription prices (`plans`) and API token prices (`tokenPrices`) in-memory. |
-| `POST /v1/failover` | Merges failover pairs and/or cooldown interval in-memory. |
-| `POST /v1/failover/reset` | Clears all (or one, via `?model=X`) active failover state. |
+| `POST /v1/token-prices` | Updates metered API token prices in-memory + persists them. |
+| `POST /v1/failover` | Sets failover pairs (authoritative) and/or cooldown; persists them. |
+| `POST /v1/failover/reset` | Clears all (or one, via `?model=X`) active failover state and group shifts. |
 
 All endpoints are JSON, secret-free (no keys, no env-var names, only aggregated counts),
 served only on localhost.
@@ -309,8 +319,44 @@ when a primary backend returns a retryable error:
   the recovery path.
 
 Pairs can be updated at runtime via the dashboard (⚙ → Failover) or the `POST /v1/failover`
-endpoint — no restart required. Active failover state is visible in the dashboard and can
-be manually reset.
+endpoint — no restart required, and edits persist. Active failover state is visible in the
+dashboard and can be manually reset.
+
+### Group failover — shift the whole ladder at once
+
+A plain `failover` pair reroutes only the **one** model that erred. Sometimes you want a
+**coordinated shift**: when a provider goes down, move a whole tier ladder down together so
+the next tier isn't doubly loaded. That's `failoverGroups`:
+
+```json
+"failoverGroups": [
+  { "ladder": ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], "mode": "shift" }
+]
+```
+
+- **`mode: "shift"` (default)** — the ladder rides a shared offset. When the **head** tier
+  fails (e.g. Anthropic is down), the offset moves the whole ladder down one: `opus → glm`
+  **and glm's own traffic → deepseek at the same time**. A background probe of the tier you
+  shifted past winds the offset back up when it recovers.
+- **`mode: "cascade"`** — no coordinated shift; each request just walks the ladder on error
+  (the same shape as a `failover` chain, expressed as one ordered list).
+- The **head** (index 0) may be a glob; every lower tier is a rewrite target and **must be a
+  concrete model id**. Each tier needs a matching route. Groups take precedence over
+  `failover` pairs for any model on a ladder.
+
+**Routing to other providers.** A backup (pair value or ladder tier) can target any provider
+— including OpenRouter — as long as a route matches its id. To fail opus over to Claude via
+OpenRouter, add a route and reference the id:
+
+```json
+"routes": [
+  { "match": "anthropic/*", "base_url": "https://openrouter.ai/api",
+    "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" } }
+],
+"failover": { "claude-opus-*": "anthropic/claude-sonnet-4.6" }
+```
+
+(Order the OpenRouter `*/*`-style route **last** — first match wins.)
 
 ## Security posture
 

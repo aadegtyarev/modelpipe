@@ -5,6 +5,59 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-04
+
+### Added
+- **Failover groups** (`failoverGroups`): an ordered ladder multiple models ride together.
+  In `mode: "shift"` (default), a failing HEAD tier shifts the WHOLE ladder down one — e.g.
+  ladder `["claude-opus-*", "glm-5.1", "deepseek-v4-pro"]`: when Anthropic errors, `opus→glm`
+  AND glm's own traffic `→deepseek` at the same time, winding back when the head recovers.
+  `mode: "cascade"` walks the ladder per-request without the coordinated shift. Groups take
+  precedence over `failover` pairs. New pure exports `ladderPosition`, `effectiveLadderModel`,
+  `resolveGroup`; `GET /v1/failover` now reports group ladders, offsets, and effective tiers.
+- **Live-session persistence**: the current session (per-model/provider totals, timeline) is
+  flushed to `~/.modelpipe/state.json` every 10 s and on shutdown, and resumed on startup — a
+  crash now loses at most a few seconds instead of the whole session.
+- **Persisted dashboard overrides**: token prices and failover pairs set in the dashboard are
+  saved to `~/.modelpipe/overrides.json` and re-applied on restart (the config file stays the
+  immutable source of truth). Failover edits are authoritative, so removing a pair in the UI
+  sticks. `POST /v1/failover` now validates globs the same way startup does.
+- **Per-route `billing` flag** (`"metered"` | `"subscription"`, default derived from auth):
+  drives honest cost reporting in the dashboard and is surfaced in `GET /v1/models`.
+- `POST /v1/token-prices` (supersedes the old `POST /v1/plans`, which stays as an alias) for
+  updating metered API prices at runtime.
+- `test/stats.test.mjs` — the previously-untested `stats.mjs` now has a suite (pricing, SSE
+  token parsing, live-session persistence, provider identification).
+
+### Changed
+- **Honest dashboard**: removed all fabricated indicators — the subscription "effective cost"
+  proration, the "plan vs API saves $X/mo" verdict, and the artificial GLM 5-hour/weekly quota
+  bars + peak multiplier. Money is now shown only where it is real: per-token cost for metered
+  providers (DeepSeek, OpenRouter) and real provider balances/limits; subscription/flat-plan
+  providers show tokens + a "flat plan" label (GLM links to the z.ai console for the real quota,
+  Anthropic shows its live rate-limit headers). Removed the `plans`, `glmPlan`, and
+  `anthropicPlan` config fields and `computeGlmQuota`/`glmMultiplier` code.
+- Dashboard HTML moved out of `src/stats.mjs` into an editable `public/dashboard.html`
+  (read at startup); fixed a duplicate `<div id="models">`.
+
+### Fixed
+- SSE usage tracker no longer accumulates the full response in memory for its fallback path
+  (capped at 256 KB) — restoring the module's zero-buffer promise for large streams.
+- Removed a dead poll of a non-existent Anthropic `GET /v1/rate_limits` endpoint (its limits
+  come from live response headers, which were already captured).
+
+## [0.6.0] - 2026-07-01
+
+### Added
+- **Dashboard** (`dashboard: true`): a live monitoring page at `/dashboard` plus `/v1/stats`,
+  `/v1/quotas`, `/v1/sessions` — per-model tokens/requests/cost, a token chart, a request log,
+  session history (persisted to `~/.modelpipe/sessions.json`), and real provider balances
+  (DeepSeek, OpenRouter). Usage is parsed from the SSE stream with zero buffering.
+- **Model failover** (`failover`): per-model backup on a retryable upstream error (429/529 or a
+  rate-limit/quota/capacity/credit/account-keyword body), with pre-route while failed over,
+  chain failover (depth-guarded at 5 hops), and a background recovery pinger.
+- `tokenPrices` config + runtime override for per-model API prices.
+
 ## [0.5.0] - 2026-07-01
 
 ### Added
