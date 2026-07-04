@@ -37,6 +37,8 @@ import {
   resolveGroup,
   isFallbackAuth,
   clientHasAuth,
+  pickAccountIndex,
+  accountEligible,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -473,6 +475,34 @@ async function main() {
   let fbBadThrew = false;
   try { validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: "yes" } }] }); } catch { fbBadThrew = true; }
   check("validateConfig rejects non-boolean fallback", fbBadThrew, true);
+
+  // ── account pools (pure) ────────────────────────────────────────────────────
+  const mkPool = (strategy, exhausted = []) => ({ strategy, rr: -1, accounts: [0, 1, 2].map((i) => ({ label: "a" + i, exhaustedUntil: exhausted[i] || 0 })) });
+  check("pickAccountIndex failover: lowest eligible", pickAccountIndex(mkPool("failover"), 1000), 0);
+  check("pickAccountIndex failover: skips exhausted #0", pickAccountIndex(mkPool("failover", [9999]), 1000), 1);
+  check("pickAccountIndex failover: exclude just-failed", pickAccountIndex(mkPool("failover"), 1000, 0), 1);
+  check("pickAccountIndex all exhausted → least-recently (smallest until)", pickAccountIndex(mkPool("failover", [5000, 3000, 8000]), 1000), 1);
+  const rr = mkPool("round-robin");
+  const r1 = pickAccountIndex(rr, 1000), r2 = pickAccountIndex(rr, 1000), r3 = pickAccountIndex(rr, 1000), r4 = pickAccountIndex(rr, 1000);
+  check("round-robin cycles 0,1,2,0", [r1, r2, r3, r4].join(","), "0,1,2,0");
+  const rrEx = mkPool("round-robin", [0, 9999, 0]); // #1 exhausted
+  check("round-robin skips exhausted", [pickAccountIndex(rrEx, 1000), pickAccountIndex(rrEx, 1000)].join(","), "0,2");
+  check("accountEligible true when cooldown elapsed", accountEligible(mkPool("failover"), 0, 1000), true);
+  check("accountEligible false when in cooldown", accountEligible(mkPool("failover", [9999]), 0, 1000), false);
+
+  // ── validateConfig: accounts + strategy ─────────────────────────────────────
+  const acctOK = { routes: [{ match: "g-*", base_url: "https://g.example", accounts: [
+    { label: "m", auth: { header: "x-api-key", keyEnv: "K1" } },
+    { label: "b", auth: { header: "x-api-key", keyEnv: "K2" } },
+  ], strategy: "round-robin" }] };
+  check("validateConfig accepts accounts pool (auth optional on route)", validateConfig(acctOK).routes[0].accounts.length, 2);
+  const acctThrow = (cfg) => { try { validateConfig(cfg); return false; } catch { return true; } };
+  check("rejects empty accounts", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [] }] }), true);
+  check("rejects duplicate label", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x", auth: { header: "h", keyEnv: "K" } }, { label: "x", auth: { header: "h", keyEnv: "K2" } }] }] }), true);
+  check("rejects account missing auth", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x" }] }] }), true);
+  check("rejects strategy without accounts", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", auth: { header: "h", keyEnv: "K" }, strategy: "failover" }] }), true);
+  check("rejects bad strategy", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x", auth: { header: "h", keyEnv: "K" } }, { label: "y", auth: { header: "h", keyEnv: "K2" } }], strategy: "spread" }] }), true);
+  check("rejects bad account base_url", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x", base_url: "not a url", auth: { header: "h", keyEnv: "K" } }, { label: "y", auth: { header: "h", keyEnv: "K2" } }] }] }), true);
 
   // ── validateConfig: failoverGroups ─────────────────────────────────────────
   const baseRoute = { routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }] };
@@ -1192,6 +1222,91 @@ async function main() {
       delete process.env.GR_KEY;
       await close(grRouter);
       await close(grStub.server);
+    }
+  }
+
+  // ── account pool e2e (rotate on limit, cooldown recovery, round-robin, endpoints) ──
+  {
+    process.env.AP_K1 = "KEY-ACCT-1"; process.env.AP_K2 = "KEY-ACCT-2";
+    const apA = makeFlexStub(200); // account "a1" backend
+    const apB = makeFlexStub(200); // account "a2" backend
+    const apAPort = await listen(apA.server);
+    const apBPort = await listen(apB.server);
+    const apRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      dashboard: true,
+      failoverRecoveryIntervalMs: 30000,
+      routes: [{
+        match: "glm-*", base_url: `http://127.0.0.1:${apAPort}`, billing: "subscription",
+        accounts: [
+          { label: "a1", base_url: `http://127.0.0.1:${apAPort}`, auth: { header: "x-api-key", keyEnv: "AP_K1" } },
+          { label: "a2", base_url: `http://127.0.0.1:${apBPort}`, auth: { header: "x-api-key", keyEnv: "AP_K2" } },
+        ],
+      }],
+    });
+    const apPort = await listen(apRouter);
+    const pool = [...apRouter._modelpipe.accountPools.values()][0];
+    try {
+      // AP1. a1 hits a rate-limit → rotate to a2; each account uses its OWN key.
+      apA.setStatus(429); apA.setBody('{"error":{"message":"rate limit exceeded"}}'); apB.setStatus(200);
+      const ap1 = await request(apPort, { model: "glm-5.1", messages: [{ role: "user", content: "AP1" }] });
+      check("AP1: a1 backend hit", apA.received.length, 1);
+      check("AP1: a1 got its own key", apA.received[0].headers["x-api-key"], "KEY-ACCT-1");
+      check("AP1: rotated to a2 backend", apB.received.length, 1);
+      check("AP1: a2 got its own key", apB.received[0].headers["x-api-key"], "KEY-ACCT-2");
+      check("AP1: client gets 200", ap1.status, 200);
+      check("AP1: a1 parked in cooldown", pool.accounts[0].exhaustedUntil > Date.now(), true);
+
+      // AP2. Next request pre-routes straight to a2 (a1 still in cooldown) — a1 not retried.
+      const aBefore = apA.received.length;
+      const ap2 = await request(apPort, { model: "glm-5.1", messages: [{ role: "user", content: "AP2" }] });
+      check("AP2: a1 NOT retried during cooldown", apA.received.length, aBefore);
+      check("AP2: a2 served it", apB.received[apB.received.length - 1].headers["x-api-key"], "KEY-ACCT-2");
+      check("AP2: client gets 200", ap2.status, 200);
+
+      // AP3. Recover a1 (clear cooldown) + a1 healthy → failover prefers a1 again.
+      pool.accounts[0].exhaustedUntil = 0; apA.setStatus(200);
+      const aBefore3 = apA.received.length;
+      const ap3 = await request(apPort, { model: "glm-5.1", messages: [{ role: "user", content: "AP3" }] });
+      check("AP3: a1 preferred again after recovery", apA.received.length, aBefore3 + 1);
+      check("AP3: a1 used its key", apA.received[apA.received.length - 1].headers["x-api-key"], "KEY-ACCT-1");
+      check("AP3: client gets 200", ap3.status, 200);
+
+      // AP4. /v1/accounts reports pool state; reset endpoint clears cooldowns.
+      pool.accounts[1].exhaustedUntil = Date.now() + 99999;
+      const accView = JSON.parse((await get(apPort, "/v1/accounts")).body);
+      check("AP4: /v1/accounts lists the pool", accView.pools[0].accounts.length, 2);
+      check("AP4: a2 shown exhausted", accView.pools[0].accounts[1].exhausted, true);
+      const rst = await postPath(apPort, "/v1/accounts/reset");
+      check("AP4: reset cleared a cooldown", JSON.parse(rst.body).cleared >= 1, true);
+      check("AP4: a2 cooldown cleared", pool.accounts[1].exhaustedUntil, 0);
+    } finally {
+      delete process.env.AP_K1; delete process.env.AP_K2;
+      await close(apRouter); await close(apA.server); await close(apB.server);
+    }
+
+    // AP5. round-robin spreads across accounts.
+    process.env.AP_K1 = "K1"; process.env.AP_K2 = "K2";
+    const rrA = makeFlexStub(200), rrB = makeFlexStub(200);
+    const rrAPort = await listen(rrA.server), rrBPort = await listen(rrB.server);
+    const rrRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      routes: [{
+        match: "glm-*", base_url: `http://127.0.0.1:${rrAPort}`, strategy: "round-robin",
+        accounts: [
+          { label: "a1", base_url: `http://127.0.0.1:${rrAPort}`, auth: { header: "x-api-key", keyEnv: "AP_K1" } },
+          { label: "a2", base_url: `http://127.0.0.1:${rrBPort}`, auth: { header: "x-api-key", keyEnv: "AP_K2" } },
+        ],
+      }],
+    });
+    const rrPort = await listen(rrRouter);
+    try {
+      for (let i = 0; i < 4; i++) await request(rrPort, { model: "glm-5.1", messages: [] });
+      check("AP5 round-robin: a1 got 2 of 4", rrA.received.length, 2);
+      check("AP5 round-robin: a2 got 2 of 4", rrB.received.length, 2);
+    } finally {
+      delete process.env.AP_K1; delete process.env.AP_K2;
+      await close(rrRouter); await close(rrA.server); await close(rrB.server);
     }
   }
 

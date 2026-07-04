@@ -113,6 +113,7 @@ canvas{display:block;width:100%;height:200px}
     <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addFailoverPair()">Add</button>
   </div>
   <div id="failoverGroups" style="margin-top:10px"></div>
+  <div id="accountPools" style="margin-top:10px"></div>
   <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
 </div>
 
@@ -171,8 +172,23 @@ function toggleSettings(){
       $('tpriceRows').innerHTML=rows;
     });
     fetch("/v1/failover").then(r=>r.json()).then(renderFailover);
+    fetch("/v1/accounts").then(r=>r.json()).then(renderAccounts).catch(()=>{});
   }
 }
+
+// ── Account pools view (config-file; shows live cooldown state) ─────────────────
+function renderAccounts(data){
+  const pools=(data&&data.pools)||[];
+  if(!pools.length){$('accountPools').innerHTML='';return;}
+  let h='<h3>Account pools</h3>';
+  for(const p of pools){
+    h+='<div style="margin:3px 0"><span style="color:var(--muted)">'+escHtml(p.match)+' ['+escHtml(p.strategy)+']</span> '+
+      p.accounts.map(a=>'<span style="color:'+(a.exhausted?'var(--orange)':'var(--green)')+'">'+escHtml(a.label)+(a.exhausted?' (cooldown)':'')+'</span>').join(' · ')+'</div>';
+  }
+  h+='<button onclick="resetAccounts()" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer;margin-top:4px">Reset cooldowns</button>';
+  $('accountPools').innerHTML=h;
+}
+async function resetAccounts(){await fetch("/v1/accounts/reset",{method:"POST"});fetch("/v1/accounts").then(r=>r.json()).then(renderAccounts).catch(()=>{});}
 
 async function saveTokenPrices(){
   const tp={};
@@ -251,12 +267,21 @@ async function load(){
     ]);
     // Build providerId -> billing map from the route table, using the SERVER-computed
     // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
+    // An account pool expands into one pseudo-provider per LABEL (that's what stats key on).
     billingByProvider={};
-    const cfg=(models.data||[]).map(m=>{
-      const pid=m.provider||m.host||'';
-      if(m.billing)billingByProvider[pid]=m.billing;
-      return{...m,pid};
-    });
+    const cfg=[];
+    for(const m of (models.data||[])){
+      if(Array.isArray(m.accounts)&&m.accounts.length){
+        for(const a of m.accounts){
+          billingByProvider[a.label]=a.billing;
+          cfg.push({id:m.id,host:a.host,billing:a.billing,pid:a.label,canon:m.provider});
+        }
+      }else{
+        const pid=m.provider||m.host||'';
+        if(m.billing)billingByProvider[pid]=m.billing;
+        cfg.push({...m,pid,canon:m.provider});
+      }
+    }
 
     let sel='<option value="">live</option>';
     for(const s of (sessions||[])){
@@ -333,19 +358,22 @@ function render(stats,quotas,cfg){
     const treq=sm.reduce((a,m)=>a+(m.requests||0),0);
     const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.outputTokens||0),0);
     const online=sm.some(m=>m.lastRequestAt>Date.now()-300000);
+    const canon=c.canon||c.pid; // for a pooled account, the underlying provider (glm/anthropic/…)
+    const labelled=canon!==c.pid; // this card IS an individual account label
     qhtml+='<div class="qcard"><div class="qhead">'+
       '<span style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'●':'○')+'</span> '+escHtml(c.pid)+
+      (labelled?' <span class="tag" style="color:var(--blue);border-color:var(--blue)">'+escHtml(canon)+'</span>':'')+
       ' <span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span></div>';
     const rows=[];
     rows.push('<span class="l">session</span> <span>'+(metered?usd(cost)+' · ':'')+fmt(treq)+' req · '+fmt(ttok)+' tok</span>');
-    if(c.pid==='anthropic'){
+    if(canon==='anthropic'){
       const pr=(a,b)=>{const rem=Number(rl["anthropic-ratelimit-"+a+"-remaining"]||0),lim=Number(rl["anthropic-ratelimit-"+a+"-limit"]||0);if(lim)rows.push('<span class="l">'+b+'</span> <span>'+fmt(rem)+' / '+fmt(lim)+'</span>');};
       pr('requests','RPM');pr('input-tokens','ITPM');pr('output-tokens','OTPM');
       if(!rl["anthropic-ratelimit-requests-limit"])rows.push('<span class="l">limits</span> <span style="color:var(--muted)">— (seen from response headers once traffic flows)</span>');
     }
-    if(c.pid==='deepseek'&&qs.deepseek&&qs.deepseek.total_balance!=null)rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
-    if(c.pid==='openrouter'&&qs.openrouter&&qs.openrouter.limit_remaining!=null){const o=qs.openrouter;rows.push('<span class="l">credits</span> <span>'+Number(o.limit_remaining).toFixed(4)+(o.limit!=null?' / '+o.limit:'')+'</span>');}
-    if(c.pid==='glm')rows.push('<span class="l">quota</span> <span style="color:var(--muted)">flat plan — see <a href="https://z.ai/manage-apikey/subscription" target="_blank" rel="noopener">z.ai console</a></span>');
+    if(canon==='deepseek'&&qs.deepseek&&qs.deepseek.total_balance!=null)rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
+    if(canon==='openrouter'&&qs.openrouter&&qs.openrouter.limit_remaining!=null){const o=qs.openrouter;rows.push('<span class="l">credits</span> <span>'+Number(o.limit_remaining).toFixed(4)+(o.limit!=null?' / '+o.limit:'')+'</span>');}
+    if(canon==='glm')rows.push('<span class="l">quota</span> <span style="color:var(--muted)">flat plan — see <a href="https://z.ai/manage-apikey/subscription" target="_blank" rel="noopener">z.ai console</a></span>');
     qhtml+=rows.map(r=>'<div class="qrow">'+r+'</div>').join('')+'</div>';
   }
   $("quotas").innerHTML=qhtml||'<span style="color:var(--muted)">no configured providers</span>';

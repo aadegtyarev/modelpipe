@@ -283,6 +283,56 @@ export function clientHasAuth(headers) {
   return false;
 }
 
+// ── Account pools (multiple accounts per route, rotate on limit) ───────────────
+// A route may carry an `accounts` pool — several backends for the SAME model, each with
+// its own key (and optionally its own base_url), identified by a `label`. When the active
+// account hits a rate-limit / quota error, the router rotates to the next eligible account
+// (same model, no body rewrite) and parks the exhausted one for a cooldown; it becomes
+// eligible again once the cooldown elapses. `strategy` picks the order:
+//   • "failover" (default) — always prefer the lowest-index eligible account (drain #1,
+//     move to #2 on limit, snap back to #1 when it recovers).
+//   • "round-robin" — spread requests across eligible accounts (stretch total quota).
+// This is backend/key-level rotation, distinct from failover pairs/groups (model-id level).
+
+// Pure: choose an account index from a pool given the current time. `excludeIdx` skips the
+// just-failed account during a rotation. Returns the chosen index, or -1 only when the
+// pool has no account other than the excluded one. When at least one account is eligible
+// (cooldown elapsed) it returns an ELIGIBLE one; when none are eligible it returns the
+// least-recently-exhausted non-excluded account (a best-effort last try). For round-robin
+// it advances `pool.rr` to the returned index.
+export function pickAccountIndex(pool, now, excludeIdx = -1) {
+  const accts = pool.accounts;
+  const n = accts.length;
+  const eligible = [];
+  for (let i = 0; i < n; i++) {
+    if (i === excludeIdx) continue;
+    if ((accts[i].exhaustedUntil || 0) <= now) eligible.push(i);
+  }
+  if (eligible.length === 0) {
+    // No eligible account — return the least-recently-exhausted non-excluded one, or -1.
+    let best = -1, bestUntil = Infinity;
+    for (let i = 0; i < n; i++) {
+      if (i === excludeIdx) continue;
+      const u = accts[i].exhaustedUntil || 0;
+      if (u < bestUntil) { bestUntil = u; best = i; }
+    }
+    return best;
+  }
+  if (pool.strategy === "round-robin") {
+    for (let step = 1; step <= n; step++) {
+      const cand = (pool.rr + step) % n;
+      if (eligible.includes(cand)) { pool.rr = cand; return cand; }
+    }
+  }
+  return eligible[0]; // failover: lowest-index eligible (prefers primary order)
+}
+
+// True when the given account index is genuinely eligible right now (cooldown elapsed) —
+// used to decide whether a rotation has a live account to move to, vs the pool being spent.
+export function accountEligible(pool, idx, now) {
+  return idx >= 0 && (pool.accounts[idx].exhaustedUntil || 0) <= now;
+}
+
 // Resolve a route's backend auth header from the environment. Returns
 // { name, value }; throws a 500 RouterError when the named env var is unset/empty
 // — fail-closed: the router never forwards a request without the backend's own key.
@@ -301,6 +351,16 @@ export function resolveAuthHeader(route, env = process.env) {
 // Validate the config SHAPE at load/start time (fail-closed before serving). Does
 // not touch env — keys are read per-request so the process can be started before
 // the keys are exported.
+// Validate one auth spec (a route's or an account's): "passthrough" OR a key-swap object
+// { header, keyEnv, scheme?, fallback? }. Throws on any problem. `at` prefixes the message.
+function validateAuth(auth, at) {
+  if (auth === "passthrough") return;
+  if (!auth || typeof auth !== "object") throw new Error(`${at}.auth: missing (object or "passthrough")`);
+  if (typeof auth.header !== "string" || auth.header.length === 0) throw new Error(`${at}.auth.header: missing`);
+  if (typeof auth.keyEnv !== "string" || auth.keyEnv.length === 0) throw new Error(`${at}.auth.keyEnv: missing`);
+  if (auth.fallback !== undefined && typeof auth.fallback !== "boolean") throw new Error(`${at}.auth.fallback: must be a boolean when present`);
+}
+
 export function validateConfig(config) {
   if (!config || typeof config !== "object") throw new Error("config: not an object");
   if (!Array.isArray(config.routes) || config.routes.length === 0) {
@@ -349,17 +409,37 @@ export function validateConfig(config) {
     if (route.billing !== undefined && route.billing !== "metered" && route.billing !== "subscription") {
       throw new Error(`${at}.billing: must be "metered" or "subscription" when present`);
     }
-    // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
-    // OR a key-swap object { header, keyEnv, scheme?, fallback? }.
-    if (route.auth === "passthrough") continue;
-    if (!route.auth || typeof route.auth !== "object") throw new Error(`${at}.auth: missing (object or "passthrough")`);
-    if (typeof route.auth.header !== "string" || route.auth.header.length === 0) throw new Error(`${at}.auth.header: missing`);
-    if (typeof route.auth.keyEnv !== "string" || route.auth.keyEnv.length === 0) throw new Error(`${at}.auth.keyEnv: missing`);
-    // fallback: OPTIONAL boolean. true ⇒ forward the client's OWN auth header when it sent
-    // one, and inject keyEnv only when it didn't ("the token that flies wins, else the
-    // proxy's"). Default false = always swap in keyEnv.
-    if (route.auth.fallback !== undefined && typeof route.auth.fallback !== "boolean") {
-      throw new Error(`${at}.auth.fallback: must be a boolean when present`);
+    // accounts: OPTIONAL pool of backends for the SAME model, each { label, auth, base_url? }.
+    // Rotates on a rate-limit; see the account-pool helpers above. When present, the route's
+    // top-level `auth` is OPTIONAL (each account carries its own).
+    if (route.accounts !== undefined) {
+      if (!Array.isArray(route.accounts) || route.accounts.length === 0) {
+        throw new Error(`${at}.accounts: must be a non-empty array of { label, auth, base_url? }`);
+      }
+      const labels = new Set();
+      for (const [j, acc] of route.accounts.entries()) {
+        const aat = `${at}.accounts[${j}]`;
+        if (!acc || typeof acc !== "object") throw new Error(`${aat}: must be an object { label, auth, base_url? }`);
+        if (typeof acc.label !== "string" || acc.label.length === 0) throw new Error(`${aat}.label: missing`);
+        if (labels.has(acc.label)) throw new Error(`${aat}.label: duplicate label "${acc.label}" in the pool`);
+        labels.add(acc.label);
+        if (acc.base_url !== undefined) {
+          try { new URL(acc.base_url); } catch { throw new Error(`${aat}.base_url: not a valid URL`); }
+        }
+        validateAuth(acc.auth, aat);
+      }
+    }
+    // strategy: OPTIONAL "failover" (default) | "round-robin"; only meaningful with a pool.
+    if (route.strategy !== undefined) {
+      if (route.accounts === undefined) throw new Error(`${at}.strategy: only valid together with an accounts pool`);
+      if (route.strategy !== "failover" && route.strategy !== "round-robin") {
+        throw new Error(`${at}.strategy: must be "failover" or "round-robin" (default "failover")`);
+      }
+    }
+    // auth: REQUIRED unless an accounts pool supplies per-account auth. When present it is
+    // "passthrough" OR a key-swap object { header, keyEnv, scheme?, fallback? }.
+    if (route.accounts === undefined || route.auth !== undefined) {
+      validateAuth(route.auth, at);
     }
   }
   if (visionCount > 1) throw new Error("config.routes: at most one route may set forImages: true (the vision fallback target)");
@@ -481,6 +561,25 @@ export function listConfig(config) {
     if (route.forImagesModel !== undefined) out.forImagesModel = route.forImagesModel;
     if (route.vision !== undefined) out.vision = route.vision;
     if (route.billing !== undefined) out.billing = route.billing;
+    // Account pool (safe view): label + optional base_url + the auth VIEW (env-var NAME
+    // only, never a key value) — same whitelist as the route auth above.
+    if (Array.isArray(route.accounts)) {
+      if (route.strategy !== undefined) out.strategy = route.strategy;
+      out.accounts = route.accounts.map((acc) => {
+        const av = { label: acc.label };
+        if (acc.base_url !== undefined) av.base_url = acc.base_url;
+        if (acc.auth === "passthrough") {
+          av.auth = "passthrough";
+        } else if (acc.auth && typeof acc.auth === "object") {
+          const aa = { header: acc.auth.header };
+          if (acc.auth.scheme !== undefined) aa.scheme = acc.auth.scheme;
+          aa.keyEnv = acc.auth.keyEnv; // NAME only
+          if (acc.auth.fallback === true) aa.fallback = true;
+          av.auth = aa;
+        }
+        return av;
+      });
+    }
     return out;
   });
   if (config && Array.isArray(config.failoverGroups)) safe.failoverGroups = config.failoverGroups;
@@ -508,7 +607,7 @@ export function listModels(config) {
   return listConfig(config).routes.map((r) => {
     let host = null;
     try { host = new URL(r.base_url).host; } catch { /* bad base_url → leave null */ }
-    return {
+    const entry = {
       id: r.match,                                       // the match glob, e.g. "deepseek-*"
       object: "model",
       host,                                              // backend host — no path, no key
@@ -518,6 +617,19 @@ export function listModels(config) {
       for_images: r.forImages === true,                  // the forImages vision-fallback flag
       billing: routeBilling(r),                          // "metered" | "subscription" — how the dashboard reports $
     };
+    // Account pool: expose each account's LABEL (the stats provider id), its host, and its
+    // billing — so the dashboard maps $ per account without re-deriving anything.
+    if (Array.isArray(r.accounts)) {
+      entry.strategy = r.strategy || "failover";
+      entry.accounts = r.accounts.map((acc) => {
+        let ahost = host;
+        try { if (acc.base_url) ahost = new URL(acc.base_url).host; } catch { /* keep route host */ }
+        // Per-account billing: explicit route billing wins, else derive from the account auth.
+        const billing = r.billing || (acc.auth === "passthrough" ? "subscription" : "metered");
+        return { label: acc.label, host: ahost, billing };
+      });
+    }
+    return entry;
   });
 }
 
@@ -784,18 +896,12 @@ function handleGroupFailover(ctx, status, buffered, headers, hop) {
   recordStat(ctx, status); // record the original error on the tier that failed
   ctx.log(`failover-group[${g}]: ${ctx.model} -> ${nextModel} (status ${status}, retrying, hop ${hop + 1})`);
   const nextBody = rewriteModelInBody(ctx.body, nextModel);
-  proxyToRoute(nextRoute, ctx.req, ctx.res, nextBody, ctx.log, {
-    onResponse: makeResponseHandler({
-      ...ctx,
-      body: nextBody,
-      model: nextModel,
-      providerId: providerIdFromUrl(nextRoute.base_url),
-      isVisionTarget: nextRoute === ctx.visionRoute,
-      failoverHopCount: hop + 1,
-      groupEffIndex: nextIdx,
-      groupProbe: null, // a reroute is no longer the head-recovery probe — don't wind back on its success
-    }),
-    statsCtx: ctx.statsCtx,
+  dispatch(nextRoute, nextBody, ctx, {
+    model: nextModel,
+    isVisionTarget: nextRoute === ctx.visionRoute,
+    failoverHopCount: hop + 1,
+    groupEffIndex: nextIdx,
+    groupProbe: null, // a reroute is no longer the head-recovery probe — don't wind back on its success
   });
 }
 
@@ -831,7 +937,7 @@ function makeResponseHandler(ctx) {
     // Other 4xx (401, 403, 404, etc.) stream straight back — they're client errors
     // that failover can't fix, so buffering them is wasted work + changes delivery
     // semantics for oversized error bodies.
-    const isFailoverCandidate = (ctx.failoverConfig || ctx.group)
+    const isFailoverCandidate = (ctx.failoverConfig || ctx.group || (ctx.account && ctx.route))
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
     if (status !== 400 && !isFailoverCandidate) {
       windBackProbe(); // a non-candidate response to a recovery probe = head is back
@@ -860,6 +966,37 @@ function makeResponseHandler(ctx) {
           }
           sendError(ctx.res, 502, `failover chain limit (${MAX_FAILOVER_HOPS} hops) reached — could not route "${ctx.model}"`);
           return;
+        }
+
+        // ACCOUNT ROTATION (innermost): the current route has an account pool → park the
+        // failed account for a cooldown and retry the SAME request (same model, no body
+        // rewrite) on the next eligible account. Only when the pool has no live account left
+        // do we fall through to model-level failover (group/pairs).
+        if (ctx.account && ctx.route && ctx.accountPools) {
+          const pool = ctx.accountPools.get(ctx.route);
+          if (pool) {
+            const now = Date.now();
+            pool.accounts[ctx.account.idx].exhaustedUntil = now + (ctx.config.failoverRecoveryIntervalMs || 60000);
+            const nextIdx = pickAccountIndex(pool, now, ctx.account.idx);
+            if (accountEligible(pool, nextIdx, now)) {
+              recordStat(ctx, status); // record the error on the exhausted account label
+              const acct = pool.accounts[nextIdx];
+              ctx.log(`account: ${ctx.model} ${ctx.account.label} -> ${acct.label} (status ${status}, hop ${hop + 1})`);
+              const effRoute = { ...ctx.route, auth: acct.auth, base_url: acct.base_url || ctx.route.base_url };
+              proxyToRoute(effRoute, ctx.req, ctx.res, ctx.body, ctx.log, {
+                onResponse: makeResponseHandler({
+                  ...ctx,
+                  providerId: acct.label,
+                  account: { idx: nextIdx, label: acct.label },
+                  failoverHopCount: hop + 1,
+                  groupProbe: null,
+                }),
+                statsCtx: ctx.statsCtx,
+              });
+              return;
+            }
+            // Pool exhausted — fall through to model-level failover.
+          }
         }
 
         // GROUP failover takes precedence for a model riding a ladder.
@@ -897,20 +1034,12 @@ function makeResponseHandler(ctx) {
         ctx.log(`failover: ${ctx.model} -> ${backup} (status ${status}, retrying on backup, hop ${hop + 1})`);
 
         // Rewrite only `model` in the body (the ONE scoped exception to passthrough)
-        // and reroute to the backup.
+        // and reroute to the backup (dispatch applies the backup route's own account pool).
         const failoverBody = rewriteModelInBody(ctx.body, backup);
-        const visionRoute = ctx.visionRoute; // preserve from outer ctx (may be null)
-        proxyToRoute(backupRoute, ctx.req, ctx.res, failoverBody, ctx.log, {
-          onResponse: makeResponseHandler({
-            ...ctx,
-            body: failoverBody,
-            model: backup,
-            providerId: providerIdFromUrl(backupRoute.base_url),
-            visionRoute,
-            isVisionTarget: backupRoute === visionRoute,
-            failoverHopCount: hop + 1,
-          }),
-          statsCtx: ctx.statsCtx,
+        dispatch(backupRoute, failoverBody, ctx, {
+          model: backup,
+          isVisionTarget: backupRoute === ctx.visionRoute,
+          failoverHopCount: hop + 1,
         });
         return;
       }
@@ -935,10 +1064,12 @@ function makeResponseHandler(ctx) {
           const visionBody = rewriteModelInBody(ctx.body, ctx.visionRoute.forImagesModel);
           // Drop group context: the vision target's model is not on the ladder, so a later
           // failover-trigger from it must fall to plain pair logic, not walk the ladder off
-          // a stale groupEffIndex.
-          proxyToRoute(ctx.visionRoute, ctx.req, ctx.res, visionBody, ctx.log, {
-            onResponse: makeResponseHandler({ ...ctx, isVisionTarget: true, group: null, groupProbe: null }),
-            statsCtx: ctx.statsCtx,
+          // a stale groupEffIndex. dispatch applies the vision route's own account pool.
+          dispatch(ctx.visionRoute, visionBody, ctx, {
+            model: ctx.visionRoute.forImagesModel,
+            isVisionTarget: true,
+            group: null,
+            groupProbe: null,
           });
           return;
         }
@@ -969,6 +1100,44 @@ function makeResponseHandler(ctx) {
   };
 }
 
+// Resolve a target route to an effective backend, applying its account pool if it has one.
+// Returns { effRoute, providerId, account } — for a pooled route the effRoute carries the
+// selected account's auth/base_url, providerId is the account LABEL (so stats are per
+// account), and account = { idx, label }; for a plain route it's the route itself and the
+// host-derived providerId with account = null.
+function accountSetup(route, accountPools) {
+  const pool = accountPools && accountPools.get(route);
+  if (!pool) return { effRoute: route, providerId: providerIdFromUrl(route.base_url), account: null };
+  const idx = pickAccountIndex(pool, Date.now(), -1);
+  const acct = pool.accounts[idx];
+  return {
+    effRoute: { ...route, auth: acct.auth, base_url: acct.base_url || route.base_url },
+    providerId: acct.label,
+    account: { idx, label: acct.label },
+  };
+}
+
+// The single proxy choke-point: pick this route's account (if pooled), build the ctx from
+// a carry ctx (baseCtx for a first hop, the current ctx for a reroute) plus per-hop
+// overrides, and forward. Every routing path (primary, vision, failover pair/group) goes
+// through here so account selection + per-label stats are uniform. Account ROTATION (same
+// route, next account) is handled inline in makeResponseHandler, not here.
+function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
+  const setup = accountSetup(targetRoute, carryCtx.accountPools);
+  const ctx = {
+    ...carryCtx,
+    ...overrides,
+    route: targetRoute,
+    body: sendBody,
+    providerId: setup.providerId,
+    account: setup.account,
+  };
+  proxyToRoute(setup.effRoute, carryCtx.req, carryCtx.res, sendBody, carryCtx.log, {
+    onResponse: makeResponseHandler(ctx),
+    statsCtx: carryCtx.statsCtx,
+  });
+}
+
 // Route one buffered request to its backend, with the reactive vision fallback
 // AND failover reroute.
 // `nonVisionCache` is a per-process Map(model → true) of models a backend has already
@@ -977,7 +1146,7 @@ function makeResponseHandler(ctx) {
 // models — when set, requests for that model pre-route to its backup.
 // `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
-function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null) {
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null) {
   const model = modelFromBody(body);
   const route = pickRoute(model, config.routes);
   if (!route) {
@@ -986,11 +1155,11 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
   }
 
   const visionRoute = pickVisionRoute(config.routes);
-  const providerId = providerIdFromUrl(route.base_url);
 
-  // Build the base ctx for makeResponseHandler — the shared context threaded
-  // through every hop (vision reroute AND failover reroute).
-  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx, config, failoverState, failoverConfig, groupState, failoverHopCount: 0 };
+  // Build the base ctx for makeResponseHandler — the shared context threaded through every
+  // hop (vision reroute, failover reroute, account rotation). providerId/account/route are
+  // set per hop by dispatch().
+  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, failoverState, failoverConfig, groupState, accountPools, failoverHopCount: 0 };
 
   // 0a. FAILOVER GROUP PRE-ROUTE: a model riding a ladder is served by its group's
   //     effective tier (position + current shift offset). Takes precedence over plain
@@ -1025,18 +1194,12 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
       const effRoute = pickRoute(targetModel, config.routes);
       if (effRoute) {
         const gBody = shifted ? rewriteModelInBody(body, targetModel) : body;
-        proxyToRoute(effRoute, req, res, gBody, log, {
-          onResponse: makeResponseHandler({
-            ...baseCtx,
-            body: gBody,
-            model: targetModel,
-            providerId: providerIdFromUrl(effRoute.base_url),
-            isVisionTarget: effRoute === visionRoute,
-            group: { groupIndex: gres.groupIndex, position: gres.position, mode: gres.mode },
-            groupEffIndex: effIndex,
-            groupProbe,
-          }),
-          statsCtx,
+        dispatch(effRoute, gBody, baseCtx, {
+          model: targetModel,
+          isVisionTarget: effRoute === visionRoute,
+          group: { groupIndex: gres.groupIndex, position: gres.position, mode: gres.mode },
+          groupEffIndex: effIndex,
+          groupProbe,
         });
         return;
       }
@@ -1062,16 +1225,9 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
         const backupRoute = pickRoute(backup, config.routes);
         if (backupRoute) {
           const failoverBody = rewriteModelInBody(body, backup);
-          proxyToRoute(backupRoute, req, res, failoverBody, log, {
-            onResponse: makeResponseHandler({
-              ...baseCtx,
-              body: failoverBody,
-              model: backup,
-              providerId: providerIdFromUrl(backupRoute.base_url),
-              visionRoute,
-              isVisionTarget: backupRoute === visionRoute,
-            }),
-            statsCtx,
+          dispatch(backupRoute, failoverBody, baseCtx, {
+            model: backup,
+            isVisionTarget: backupRoute === visionRoute,
           });
           return;
         }
@@ -1099,17 +1255,11 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
     (route.vision === false || (model && nonVisionCache.has(model)))
   ) {
     const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
-    proxyToRoute(visionRoute, req, res, visionBody, log, {
-      onResponse: makeResponseHandler({ ...baseCtx, body: visionBody, model: visionRoute.forImagesModel, visionRoute, nonVisionCache, isVisionTarget: true, providerId: providerIdFromUrl(visionRoute.base_url) }),
-      statsCtx,
-    });
+    dispatch(visionRoute, visionBody, baseCtx, { model: visionRoute.forImagesModel, isVisionTarget: true });
     return;
   }
 
-  proxyToRoute(route, req, res, body, log, {
-    onResponse: makeResponseHandler(baseCtx),
-    statsCtx,
-  });
+  dispatch(route, body, baseCtx, {});
 }
 
 // ── FailoverPinger ──────────────────────────────────────────────────────────
@@ -1286,6 +1436,20 @@ export function createRouter(config, options = {}) {
   const failoverState = new Map();
   // Per-group shift state (offset winds down/up as the head tier fails/recovers).
   const groupState = (config.failoverGroups || []).map(() => ({ offset: 0, shiftedAt: 0 }));
+
+  // Account pools: per-route rotation state, keyed by the route object. Each account tracks
+  // exhaustedUntil (cooldown after a rate-limit); rr is the round-robin cursor (-1 so the
+  // first round-robin pick lands on index 0).
+  const accountPools = new Map();
+  for (const route of config.routes) {
+    if (Array.isArray(route.accounts) && route.accounts.length > 0) {
+      accountPools.set(route, {
+        strategy: route.strategy || "failover",
+        rr: -1,
+        accounts: route.accounts.map((a) => ({ label: a.label, auth: a.auth, base_url: a.base_url || null, exhaustedUntil: 0 })),
+      });
+    }
+  }
   let failoverPinger = null;
   const hasPairs = failoverConfig && Object.keys(failoverConfig).length > 0;
   const hasGroups = groupState.length > 0;
@@ -1472,6 +1636,46 @@ export function createRouter(config, options = {}) {
       return;
     }
 
+    // GET /v1/accounts — per-route account-pool state (labels, strategy, cooldowns).
+    if (dashboard && req.method === "GET" && req.url === "/v1/accounts") {
+      const now = Date.now();
+      const pools = [];
+      for (const route of config.routes) {
+        const pool = accountPools.get(route);
+        if (!pool) continue;
+        pools.push({
+          match: route.match,
+          strategy: pool.strategy,
+          accounts: pool.accounts.map((a) => ({
+            label: a.label,
+            exhausted: (a.exhaustedUntil || 0) > now,
+            cooldownUntil: a.exhaustedUntil || 0,
+          })),
+        });
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ pools }));
+      return;
+    }
+    // POST /v1/accounts/reset — clear account cooldowns without a restart.
+    //   (no param)   → clear every account's cooldown in every pool
+    //   ?label=<l>   → clear one account's cooldown by label
+    if (dashboard && req.method === "POST" &&
+        (req.url === "/v1/accounts/reset" || req.url.startsWith("/v1/accounts/reset?"))) {
+      const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+      const label = url.searchParams.get("label");
+      let cleared = 0;
+      for (const pool of accountPools.values()) {
+        for (const a of pool.accounts) {
+          if (label && a.label !== label) continue;
+          if ((a.exhaustedUntil || 0) > 0) { a.exhaustedUntil = 0; cleared++; }
+        }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, cleared }));
+      return;
+    }
+
     // GET /v1/models (and the bare /models) returns the configured routes as a
     // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
     // it needs no request body and never reaches a backend — everything else (POST
@@ -1488,13 +1692,13 @@ export function createRouter(config, options = {}) {
         // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take
         // effect; an empty map counts as "no pairs" (don't buffer every error needlessly).
         const liveFailover = config.failover && Object.keys(config.failover).length ? config.failover : null;
-        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState);
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState, accountPools);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });
 
   // Expose stats + quotaPoller for teardown in tests
-  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger, groupState };
+  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger, groupState, accountPools };
 
   // Archive session on graceful shutdown
   server.on("close", () => {
