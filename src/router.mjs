@@ -586,11 +586,17 @@ export function listConfig(config) {
   return safe;
 }
 
-// The effective billing mode for a route: explicit `billing`, else derived —
-// passthrough rides the client's own plan (subscription), a key-swap route is metered.
+// The effective billing mode for a route: explicit `billing` wins, else derived.
+// - passthrough rides the client's own plan/OAuth → subscription.
+// - the z.ai GLM Anthropic endpoint is the Coding Plan (a flat subscription, NOT pay-as-
+//   you-go — that's z.ai's separate OpenAI-format API), so default it to subscription;
+//   otherwise a Coding-Plan user would see a fabricated per-token $ (the fantik we removed).
+// - every other key-swap route is metered (pay-as-you-go).
 export function routeBilling(route) {
   if (route && (route.billing === "metered" || route.billing === "subscription")) return route.billing;
-  return isPassthrough(route) ? "subscription" : "metered";
+  if (isPassthrough(route)) return "subscription";
+  if (route && providerIdFromUrl(route.base_url) === "glm") return "subscription";
+  return "metered";
 }
 
 // The NETWORK-FACING view of the route table for GET /v1/models — a STRICTER projection
@@ -1409,6 +1415,9 @@ export function createRouter(config, options = {}) {
   const dashOverrides = {
     tokenPrices: (stored && typeof stored.tokenPrices === "object") ? stored.tokenPrices : {},
     failover: (stored && typeof stored.failover === "object") ? stored.failover : {},
+    // billing: { <providerId|accountLabel>: "metered" | "subscription" } — dashboard-only
+    // display override when the derived default guesses wrong (e.g. a metered z.ai key).
+    billing: (stored && typeof stored.billing === "object") ? stored.billing : {},
   };
   {
     const beforeTP = config.tokenPrices;
@@ -1657,6 +1666,28 @@ export function createRouter(config, options = {}) {
       res.end(JSON.stringify({ pools }));
       return;
     }
+    // POST /v1/billing — override a provider's/account's billing mode for the dashboard.
+    // Body: { provider: "<id or label>", mode: "metered" | "subscription" | "auto" }.
+    // "auto" clears the override (back to the derived default). Persisted.
+    if (dashboard && req.method === "POST" && req.url === "/v1/billing") {
+      readBody(req, 2048).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          const prov = data && data.provider;
+          const mode = data && data.mode;
+          if (typeof prov !== "string" || prov.length === 0) throw new Error("provider (id/label) required");
+          if (mode === "auto" || mode == null) delete dashOverrides.billing[prov];
+          else if (mode === "metered" || mode === "subscription") dashOverrides.billing[prov] = mode;
+          else throw new Error('mode must be "metered", "subscription", or "auto"');
+          saveOverrides();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, billing: dashOverrides.billing }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
+      return;
+    }
     // POST /v1/accounts/reset — clear account cooldowns without a restart.
     //   (no param)   → clear every account's cooldown in every pool
     //   ?label=<l>   → clear one account's cooldown by label
@@ -1681,9 +1712,18 @@ export function createRouter(config, options = {}) {
     // it needs no request body and never reaches a backend — everything else (POST
     // messages, passthrough, the vision reroute) flows through readBody → forward unchanged.
     if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
-      const payload = JSON.stringify({ object: "list", data: listModels(config) });
+      const models = listModels(config);
+      // Apply dashboard billing overrides (by provider id, or by account label for pools).
+      if (dashboard) {
+        for (const m of models) {
+          if (dashOverrides.billing[m.provider]) m.billing = dashOverrides.billing[m.provider];
+          if (Array.isArray(m.accounts)) {
+            for (const a of m.accounts) if (dashOverrides.billing[a.label]) a.billing = dashOverrides.billing[a.label];
+          }
+        }
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(payload);
+      res.end(JSON.stringify({ object: "list", data: models }));
       return;
     }
     readBody(req, maxBytes)

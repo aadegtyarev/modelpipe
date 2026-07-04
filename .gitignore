@@ -9,3 +9,4 @@ routes.json
 routes.local.json
 .playwright-mcp/
 *.png
+!docs/dashboard.png

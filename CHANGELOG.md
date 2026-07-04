@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **GLM billing honesty**: the z.ai GLM Anthropic endpoint is the Coding Plan (a flat
+  subscription), but a key-swap route defaulted to `metered` — so GLM usage showed a
+  fabricated per-token $. `routeBilling` now defaults z.ai/GLM to `subscription`.
+
 ### Added
+- **Per-provider console links** in the dashboard (Anthropic / z.ai / DeepSeek / OpenRouter),
+  not just z.ai.
+- **Billing override in Settings** (`POST /v1/billing`, persisted): flip any provider between
+  metered / flat plan / auto when the derived default guesses wrong.
+- **Wizard: custom providers** — `modelpipe init` now has an "add a custom provider" loop
+  (label, model glob, base_url, auth header/scheme/keyEnv/key, billing) for any
+  Anthropic-format API beyond the built-in presets.
+- Dashboard screenshot in the README (`docs/dashboard.png`).
 - **`modelpipe init` setup wizard** (`src/setup.mjs`): a guided, zero-dep prompt that asks
   which backends to route, which keys, port, and dashboard, then writes a validated
   `routes.json` + `.env`. Runnable straight from GitHub — `npx github:aadegtyarev/modelpipe init`

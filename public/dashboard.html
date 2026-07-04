@@ -117,6 +117,12 @@ canvas{display:block;width:100%;height:200px}
   <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
 </div>
 
+<div class="panel" id="billingPanel">
+  <h3>Billing (how the dashboard reports $ per provider)</h3>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:6px">metered = show real per-token cost · flat plan = subscription (tokens only, no $) · auto = derive from the route</div>
+  <div id="billingRows"></div>
+</div>
+
 <div class="models" id="models"></div>
 
 <div class="chart-wrap">
@@ -147,15 +153,24 @@ function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function escJs(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
 
 const COLORS=['#58a6ff','#3fb950','#d2991d','#f85149','#bc8cff','#79c0ff','#f0883e','#56d364'];
+// Console/usage pages per provider — a quick jump to check the real quota/balance/billing.
+const CONSOLE={
+  anthropic:"https://console.anthropic.com/settings/usage",
+  glm:"https://z.ai/manage-apikey/subscription",
+  deepseek:"https://platform.deepseek.com/usage",
+  openrouter:"https://openrouter.ai/settings/credits",
+};
 const colors={};
 
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
+  bp.style.display=show?'block':'none';
   if(show){
+    fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const models=st.models||{},tpOver=st.tokenPrices||{};
       let rows='';
@@ -174,6 +189,29 @@ function toggleSettings(){
     fetch("/v1/failover").then(r=>r.json()).then(renderFailover);
     fetch("/v1/accounts").then(r=>r.json()).then(renderAccounts).catch(()=>{});
   }
+}
+
+// ── Billing override (metered / flat plan / auto) per provider ──────────────────
+function renderBilling(models){
+  // One row per provider id (or per account label for pools) with its current mode.
+  const seen=new Map();
+  for(const m of (models.data||[])){
+    if(Array.isArray(m.accounts)&&m.accounts.length){ for(const a of m.accounts) if(!seen.has(a.label)) seen.set(a.label,a.billing); }
+    else if(m.provider&&!seen.has(m.provider)) seen.set(m.provider,m.billing);
+  }
+  let h='';
+  for(const[pid,mode]of seen){
+    const btn=(m,label)=>'<button onclick="setBilling(\''+escJs(pid)+'\',\''+m+'\')" style="background:'+(mode===m?'var(--blue)':'var(--card-bg)')+';color:'+(mode===m?'#fff':'var(--text)')+';border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;margin-left:4px">'+label+'</button>';
+    h+='<div style="display:flex;align-items:center;gap:6px;margin:3px 0"><span style="min-width:150px">'+escHtml(pid)+'</span>'+
+      btn('metered','metered')+btn('subscription','flat plan')+
+      '<button onclick="setBilling(\''+escJs(pid)+'\',\'auto\')" style="background:var(--card-bg);color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;margin-left:8px">auto</button></div>';
+  }
+  $('billingRows').innerHTML=h||'<span style="color:var(--muted)">no providers configured</span>';
+}
+async function setBilling(provider,mode){
+  await fetch("/v1/billing",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider,mode})});
+  fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
+  load();
 }
 
 // ── Account pools view (config-file; shows live cooldown state) ─────────────────
@@ -360,10 +398,13 @@ function render(stats,quotas,cfg){
     const online=sm.some(m=>m.lastRequestAt>Date.now()-300000);
     const canon=c.canon||c.pid; // for a pooled account, the underlying provider (glm/anthropic/…)
     const labelled=canon!==c.pid; // this card IS an individual account label
+    const consoleUrl=CONSOLE[canon];
     qhtml+='<div class="qcard"><div class="qhead">'+
       '<span style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'●':'○')+'</span> '+escHtml(c.pid)+
       (labelled?' <span class="tag" style="color:var(--blue);border-color:var(--blue)">'+escHtml(canon)+'</span>':'')+
-      ' <span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span></div>';
+      ' <span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span>'+
+      (consoleUrl?' <a href="'+consoleUrl+'" target="_blank" rel="noopener" title="open provider console" style="margin-left:auto;font-size:12px">console ↗</a>':'')+
+      '</div>';
     const rows=[];
     rows.push('<span class="l">session</span> <span>'+(metered?usd(cost)+' · ':'')+fmt(treq)+' req · '+fmt(ttok)+' tok</span>');
     if(canon==='anthropic'){
@@ -373,7 +414,7 @@ function render(stats,quotas,cfg){
     }
     if(canon==='deepseek'&&qs.deepseek&&qs.deepseek.total_balance!=null)rows.push('<span class="l">balance</span> <span>$'+qs.deepseek.total_balance+'</span>');
     if(canon==='openrouter'&&qs.openrouter&&qs.openrouter.limit_remaining!=null){const o=qs.openrouter;rows.push('<span class="l">credits</span> <span>'+Number(o.limit_remaining).toFixed(4)+(o.limit!=null?' / '+o.limit:'')+'</span>');}
-    if(canon==='glm')rows.push('<span class="l">quota</span> <span style="color:var(--muted)">flat plan — see <a href="https://z.ai/manage-apikey/subscription" target="_blank" rel="noopener">z.ai console</a></span>');
+    if(canon==='glm')rows.push('<span class="l">quota</span> <span style="color:var(--muted)">flat plan — see console ↗</span>');
     qhtml+=rows.map(r=>'<div class="qrow">'+r+'</div>').join('')+'</div>';
   }
   $("quotas").innerHTML=qhtml||'<span style="color:var(--muted)">no configured providers</span>';

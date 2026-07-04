@@ -101,6 +101,32 @@ export async function runSetup(argv = []) {
       process.stdout.write("\n");
     }
 
+    // Custom providers — any other Anthropic-format API (base_url + auth + model glob).
+    while (await yesno("Add a custom provider (any other Anthropic-format API)?", false)) {
+      const label = await ask("  provider id/label", "custom");
+      const match = await ask("  model glob (e.g. my-*)", "");
+      if (!match) { process.stdout.write("  (skipped — a model glob is required)\n\n"); continue; }
+      const base_url = await ask("  base_url (e.g. https://api.example.com/anthropic)", "");
+      if (!base_url) { process.stdout.write("  (skipped — a base_url is required)\n\n"); continue; }
+      let auth;
+      const am = await ask("  auth: (1) passthrough  (2) API key", "2");
+      if (am.trim() === "1") {
+        auth = "passthrough";
+      } else {
+        const header = await ask("  auth header name", "x-api-key");
+        const scheme = await ask("  scheme prefix (blank, or e.g. Bearer)", "");
+        const keyEnv = await ask("  env-var NAME for the key", label.toUpperCase().replace(/[^A-Z0-9]+/g, "_") + "_API_KEY");
+        auth = { header, keyEnv };
+        if (scheme) auth.scheme = scheme;
+        const key = await ask(`  paste ${keyEnv} (or leave blank to fill in .env later)`, "");
+        envKeys.set(keyEnv, key);
+      }
+      const bill = await ask("  billing: (1) metered  (2) flat plan / subscription", "1");
+      const route = { match, base_url, auth, billing: bill.trim() === "2" ? "subscription" : "metered" };
+      chosen.push({ p: { id: label, defaultModel: match }, route });
+      process.stdout.write("\n");
+    }
+
     if (chosen.length === 0) {
       process.stdout.write("No backends selected — nothing to write.\n");
       return 1;

@@ -39,6 +39,7 @@ import {
   clientHasAuth,
   pickAccountIndex,
   accountEligible,
+  routeBilling,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -198,6 +199,18 @@ function postPath(port, urlPath) {
       (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8") })); },
     );
     req.on("error", reject); req.end();
+  });
+}
+
+// A bare POST with a JSON body to an arbitrary path (management endpoints).
+function postJson(port, urlPath, obj) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(obj));
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: urlPath, method: "POST", headers: { "content-type": "application/json", "content-length": data.length } },
+      (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8") })); },
+    );
+    req.on("error", reject); req.write(data); req.end();
   });
 }
 
@@ -475,6 +488,12 @@ async function main() {
   let fbBadThrew = false;
   try { validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: "yes" } }] }); } catch { fbBadThrew = true; }
   check("validateConfig rejects non-boolean fallback", fbBadThrew, true);
+
+  // ── routeBilling (honest defaults) ──────────────────────────────────────────
+  check("routeBilling: explicit wins", routeBilling({ base_url: "https://api.deepseek.com", billing: "subscription", auth: { header: "x", keyEnv: "K" } }), "subscription");
+  check("routeBilling: passthrough → subscription", routeBilling({ base_url: "https://api.anthropic.com", auth: "passthrough" }), "subscription");
+  check("routeBilling: z.ai/GLM key-swap → subscription (Coding Plan)", routeBilling({ base_url: "https://api.z.ai/api/anthropic", auth: { header: "Authorization", keyEnv: "ZAI_API_KEY" } }), "subscription");
+  check("routeBilling: deepseek key-swap → metered", routeBilling({ base_url: "https://api.deepseek.com/anthropic", auth: { header: "x-api-key", keyEnv: "K" } }), "metered");
 
   // ── account pools (pure) ────────────────────────────────────────────────────
   const mkPool = (strategy, exhausted = []) => ({ strategy, rr: -1, accounts: [0, 1, 2].map((i) => ({ label: "a" + i, exhaustedUntil: exhausted[i] || 0 })) });
@@ -1307,6 +1326,33 @@ async function main() {
     } finally {
       delete process.env.AP_K1; delete process.env.AP_K2;
       await close(rrRouter); await close(rrA.server); await close(rrB.server);
+    }
+  }
+
+  // ── billing override endpoint (dashboard settings) ─────────────────────────
+  {
+    process.env.BILL_K = "x";
+    const bStub = makeFlexStub(200);
+    const bPort = await listen(bStub.server);
+    const bRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 }, dashboard: true,
+      routes: [{ match: "deepseek-*", base_url: `http://127.0.0.1:${bPort}`, auth: { header: "x-api-key", keyEnv: "BILL_K" } }],
+    });
+    const brPort = await listen(bRouter);
+    try {
+      const before = JSON.parse((await get(brPort, "/v1/models")).body).data[0];
+      check("billing: deepseek stub defaults metered", before.billing, "metered");
+      // Provider id for a localhost stub host is host:port; override by that id.
+      const pid = before.provider;
+      await postJson(brPort, "/v1/billing", { provider: pid, mode: "subscription" });
+      const after = JSON.parse((await get(brPort, "/v1/models")).body).data[0];
+      check("billing override → subscription reflected in /v1/models", after.billing, "subscription");
+      await postJson(brPort, "/v1/billing", { provider: pid, mode: "auto" });
+      const reset = JSON.parse((await get(brPort, "/v1/models")).body).data[0];
+      check("billing override auto → back to derived (metered)", reset.billing, "metered");
+    } finally {
+      delete process.env.BILL_K;
+      await close(bRouter); await close(bStub.server);
     }
   }
 
