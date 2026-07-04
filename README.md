@@ -350,7 +350,13 @@ logged out.
 
 When `"dashboard": true` is set in the config, modelpipe collects per-request usage data
 and serves a live monitoring page at `http://127.0.0.1:8787/dashboard`. No installation
-required — the page is embedded in the proxy process.
+required — the page is served from the proxy process.
+
+![modelpipe dashboard](docs/dashboard.png)
+
+Note the honesty in the shot above: DeepSeek (pay-as-you-go) shows a real per-token **$**,
+while GLM and Claude (flat-plan) show tokens with a **flat plan** tag and `—` for cost. Each
+provider card links to its **console**.
 
 **Honesty rule.** The dashboard shows only measured data. Money appears **only where it is
 real**: per-token cost for `metered` (pay-as-you-go) providers and real provider balances.
