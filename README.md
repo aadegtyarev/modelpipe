@@ -177,6 +177,8 @@ config only names the env var, read at request time and never logged.
 | `base_url` | string (URL) | **required** | Backend origin. The client's `/v1/messages` path is appended. |
 | `auth` | string or object | **required** | `"passthrough"` forwards the client's auth header unchanged. Object `{header, keyEnv, scheme?, fallback?}` swaps in a backend key: `header` is the header name (e.g. `x-api-key`), `keyEnv` is the **name** of the env var holding the key (never the key value), `scheme` is an optional prefix (e.g. `"Bearer"` → `Authorization: Bearer <key>`). `fallback: true` = **use the client's own token if it flew, else inject `keyEnv`** (see [Fallback auth](#fallback-auth-use-the-clients-token-else-the-proxys)). |
 | `billing` | `"metered"` `"subscription"` | derived | How the dashboard reports money. `metered` = pay-as-you-go (real per-token $). `subscription` = flat plan (tokens + "flat plan" label, no fabricated $). Default: passthrough ⇒ subscription, key-swap ⇒ metered. |
+| `accounts` | `[{label, auth, base_url?}]` | — | Multiple accounts (keys) for the **same** model — the router rotates to the next when one hits its limit. Each has a `label` (shown per-account in the dashboard), its own `auth`, and an optional `base_url`. When present, route-level `auth` is optional. See [Account pools](#account-pools-multiple-keys-per-model). |
+| `strategy` | `"failover"` `"round-robin"` | `"failover"` | Only with `accounts`. `failover` drains account #1, moves to #2 on a limit, snaps back when #1 recovers. `round-robin` spreads requests across accounts. |
 | `vision` | boolean | `true` | `false` declares this backend has no vision. Image-bearing requests skip straight to the `forImages` target — needed when a backend doesn't 400 on images (soft-200 refusal, server-side image tool). Text-only calls route normally. |
 | `forImages` | boolean | — | Set `true` on **exactly one** route to mark it the vision fallback target. |
 | `forImagesModel` | string | **required** if `forImages` | The model id the vision backend expects. On reroute, `body.model` is rewritten to this (the only passthrough exception). |
@@ -311,6 +313,8 @@ Settings (⚙) or `config.tokenPrices`.
 | `GET /v1/sessions` | Archived session history (up to 20). |
 | `GET /v1/models` | Secret-free route listing: model globs, hosts, auth mode, vision + billing flags. |
 | `GET /v1/failover` | Failover pairs, active reactive state, and group ladders/offsets/effective tiers. |
+| `GET /v1/accounts` | Per-route account-pool state: labels, strategy, and per-account cooldown. |
+| `POST /v1/accounts/reset` | Clears account cooldowns (all, or one via `?label=X`) — no restart. |
 | `POST /v1/sessions/reset` | Archives current session and starts a new one. |
 | `POST /v1/token-prices` | Updates metered API token prices in-memory + persists them. |
 | `POST /v1/failover` | Sets failover pairs (authoritative) and/or cooldown; persists them. |
@@ -393,6 +397,49 @@ OpenRouter, add a route and reference the id:
 ```
 
 (Order the OpenRouter `*/*`-style route **last** — first match wins.)
+
+## Account pools: multiple keys per model
+
+Sometimes you have **several accounts on the same provider** — e.g. two GLM Coding Plan
+subscriptions, or a few Anthropic API keys — and want to roll onto the next when one runs
+out of quota. That's an `accounts` pool on a route:
+
+```json
+{
+  "match": "glm-*",
+  "base_url": "https://api.z.ai/api/anthropic",
+  "billing": "subscription",
+  "strategy": "failover",
+  "accounts": [
+    { "label": "glm-main",   "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_KEY_1" } },
+    { "label": "glm-backup", "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_KEY_2" } }
+  ]
+}
+```
+
+- Each account has a **`label`** (shown as its own card in the dashboard), its own **`auth`**
+  (key), and an optional **`base_url`** (a different host/org). When `accounts` is set, the
+  route-level `auth` is optional.
+- This is **key/backend-level** rotation — the model id is **not** rewritten (unlike failover
+  pairs/groups). The same `glm-5.1` request just goes out under a different key.
+- **On a limit** (429/529/quota/credit/org error) the active account is parked for the
+  `failoverRecoveryIntervalMs` cooldown and the request retries on the next eligible account.
+  When the cooldown elapses the account is tried again automatically (`failover` snaps back to
+  the primary; `round-robin` folds it back into rotation).
+- **`strategy`**: `"failover"` (default) drains the primary and only moves down on a limit;
+  `"round-robin"` spreads requests to stretch total quota across accounts.
+- **Works for any provider** — GLM, Anthropic (several API keys), DeepSeek, OpenRouter.
+- **Not everywhere** — a route without `accounts` behaves exactly as before. Pools are opt-in.
+- **Dashboard/state:** `GET /v1/accounts` shows each pool's labels + cooldown state;
+  `POST /v1/accounts/reset` (optionally `?label=X`) clears cooldowns without a restart.
+
+Account rotation is the innermost layer: it happens **within** a route first; only when a
+pool has no live account left does model-level `failover`/`failoverGroups` kick in.
+
+> **Note on GLM/Anthropic subscription tokens:** a Coding-Plan token or an Anthropic OAuth
+> token is short-lived (see [Fallback auth](#fallback-auth-use-the-clients-token-else-the-proxys)).
+> Account pools are most robust with **long-lived API keys**. For OAuth subscriptions the token
+> in the env will expire and need refreshing.
 
 ## Security posture
 

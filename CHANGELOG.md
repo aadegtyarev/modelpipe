@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Account pools** (`route.accounts` + `route.strategy`): multiple accounts/keys for the
+  same model, rotating on a rate-limit. Each account has a `label` (its own dashboard card
+  + per-label stats), its own `auth`, and an optional `base_url`; route-level `auth` becomes
+  optional. `strategy: "failover"` (default) drains the primary and moves down on a limit,
+  snapping back on recovery; `"round-robin"` spreads requests across accounts. Backend/key-
+  level rotation (no model-id rewrite), innermost to failover pairs/groups; cooldown-based
+  auto-recovery. New endpoints `GET /v1/accounts` and `POST /v1/accounts/reset` (`?label=`).
+  `GET /v1/models` exposes per-account labels/hosts/billing. New pure exports
+  `pickAccountIndex`, `accountEligible`.
+
+### Fixed
+- Graceful shutdown no longer hangs on keep-alive connections (`systemctl restart` was
+  getting stuck "deactivating"): shutdown now frees idle sockets immediately and hard-closes
+  anything lingering after 3s.
+
 ## [0.7.0] - 2026-07-04
 
 ### Added
