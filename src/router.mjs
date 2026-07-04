@@ -45,9 +45,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   StatsCollector, QuotaPoller, DASHBOARD_HTML,
-  createUsageTracker, providerIdFromUrl, computeGlmQuota,
+  createUsageTracker, providerIdFromUrl,
   decompressIfNeeded,
 } from "./stats.mjs";
+import { readJson, writeJson, OVERRIDES_FILE } from "./store.mjs";
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
 const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per request
@@ -201,6 +202,62 @@ export function pickFailoverModel(failoverConfig, model) {
   return null;
 }
 
+// ── Failover groups (coordinated "shift the whole ladder") ────────────────────
+// A failover GROUP is an ordered ladder of model ids — a shared priority chain that
+// multiple models ride together. Unlike a plain `failover` pair (which reroutes only
+// the ONE model that erred), a group in `mode: "shift"` moves the ENTIRE ladder down
+// by one when its HEAD tier fails: e.g. ladder ["claude-opus-*","glm-5.1","deepseek-v4-pro"]
+// with the head on Anthropic — when Anthropic errors, opus→glm AND glm's own traffic
+// →deepseek at the same time (a group `offset` of 1 applied to every position). When the
+// head recovers, the offset winds back. `mode: "cascade"` skips the global shift and just
+// walks the ladder per-request on error (the same shape as a plain `failover` chain, but
+// expressed as one ordered list). Groups take precedence over `failover` pairs for any
+// model whose id lands on a ladder.
+
+// Pure: the index of the first ladder entry that matches `model` — an exact id match, or
+// a glob match when the entry carries a `*` (only the head is allowed to be a glob; see
+// validateConfig). -1 when no entry matches or inputs are malformed.
+export function ladderPosition(ladder, model) {
+  if (!Array.isArray(ladder) || typeof model !== "string" || model.length === 0) return -1;
+  for (let i = 0; i < ladder.length; i++) {
+    const entry = ladder[i];
+    if (typeof entry !== "string") continue;
+    if (entry === model) return i;
+    if (entry.includes("*") && globToRegExp(entry).test(model)) return i;
+  }
+  return -1;
+}
+
+// Pure: the effective tier id a request at ladder position `p` resolves to given the
+// group's current `offset`, clamped to the last tier (never runs off the end).
+export function effectiveLadderModel(ladder, offset, p) {
+  const last = ladder.length - 1;
+  return ladder[Math.min(p + (offset || 0), last)];
+}
+
+// Pure: resolve which group (if any) a model rides, its position on that ladder, the
+// group's current offset, and the effective tier to route to. `groupState` is a parallel
+// array of { offset } (per group). null when no ladder matches.
+export function resolveGroup(groups, groupState, model) {
+  if (!Array.isArray(groups)) return null;
+  for (let g = 0; g < groups.length; g++) {
+    const grp = groups[g];
+    const p = ladderPosition(grp && grp.ladder, model);
+    if (p >= 0) {
+      const offset = (groupState && groupState[g] && groupState[g].offset) || 0;
+      return {
+        groupIndex: g,
+        position: p,
+        offset,
+        effIndex: Math.min(p + offset, grp.ladder.length - 1),
+        effectiveModel: effectiveLadderModel(grp.ladder, offset, p),
+        mode: grp.mode || "shift",
+      };
+    }
+  }
+  return null;
+}
+
 // True when a route forwards the client's incoming auth header unchanged instead of
 // swapping in a backend key (auth: "passthrough"). Lets a subscription/OAuth Claude
 // Code session use the Anthropic/default route with NO backend API key.
@@ -265,6 +322,15 @@ export function validateConfig(config) {
     if (route.vision !== undefined && typeof route.vision !== "boolean") {
       throw new Error(`${at}.vision: must be a boolean (default true) when present`);
     }
+    // billing: OPTIONAL "metered" | "subscription". Governs how the dashboard reports
+    // money for this backend. "metered" = pay-as-you-go (real per-token $ shown, e.g.
+    // DeepSeek/OpenRouter). "subscription" = a flat plan (GLM Coding Plan, an Anthropic
+    // subscription) where per-token $ is meaningless — the dashboard shows tokens + a
+    // "flat plan" label, never a fabricated cost. Default: a passthrough route is
+    // "subscription" (it rides the client's own plan/OAuth), a key-swap route is "metered".
+    if (route.billing !== undefined && route.billing !== "metered" && route.billing !== "subscription") {
+      throw new Error(`${at}.billing: must be "metered" or "subscription" when present`);
+    }
     // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
     // OR a key-swap object { header, keyEnv, scheme? }.
     if (route.auth === "passthrough") continue;
@@ -275,34 +341,10 @@ export function validateConfig(config) {
   if (visionCount > 1) throw new Error("config.routes: at most one route may set forImages: true (the vision fallback target)");
 
   // dashboard: optional boolean (default false). When true, modelpipe collects
-  // per-provider usage stats (tokens, requests, RPS), polls external quota APIs,
+  // per-provider usage stats (tokens, requests, RPS), polls real provider billing APIs,
   // and serves /v1/stats, /v1/quotas, and /dashboard endpoints.
   if (config.dashboard !== undefined && config.dashboard !== true && config.dashboard !== false) {
     throw new Error("config.dashboard: must be a boolean (default false) when present");
-  }
-  // glmPlan: optional string, "lite" | "pro" | "max" (default "pro"). Only used
-  // when dashboard is true. Selects the GLM Coding Plan tier for artificial quota
-  // estimation.
-  if (config.glmPlan !== undefined) {
-    const allowed = ["lite", "pro", "max"];
-    if (!allowed.includes(config.glmPlan)) {
-      throw new Error(`config.glmPlan: must be one of ${allowed.join(", ")}`);
-    }
-  }
-  if (config.anthropicPlan !== undefined) {
-    const allowed = ["pro", "max", "team"];
-    if (!allowed.includes(config.anthropicPlan)) {
-      throw new Error(`config.anthropicPlan: must be one of ${allowed.join(", ")}`);
-    }
-  }
-  // plans: optional object with per-provider monthly subscription price overrides.
-  // E.g. { anthropic: 200, glm: 64.80 }. Used by dashboard effective-cost display.
-  // If not set, default prices are used (anthropic pro=20 max=200 team=25, glm lite=18 pro=64.80 max=180).
-  if (config.plans !== undefined) {
-    if (typeof config.plans !== "object") throw new Error("config.plans: must be an object { provider: price }");
-    for (const [pid, price] of Object.entries(config.plans)) {
-      if (typeof price !== "number" || price < 0) throw new Error(`config.plans.${pid}: must be a non-negative number (monthly USD)`);
-    }
   }
   // tokenPrices: optional per-model API price overrides ($ per 1M tokens).
   // E.g. { "claude-opus-*": { input: 15, output: 75 }, "glm-5.2": { input: 1.2, output: 4.0 } }.
@@ -328,6 +370,35 @@ export function validateConfig(config) {
         globToRegExp(pattern);
       } catch (e) {
         throw new Error(`config.failover: key "${pattern}" is not a valid glob: ${e.message}`);
+      }
+    }
+  }
+  // failoverGroups: optional array of ordered ladders. Each group is
+  // { ladder: [modelId, ...], mode?: "shift" | "cascade" }. In "shift" mode a head-tier
+  // failure shifts the whole ladder down one (opus→glm AND glm→deepseek together);
+  // "cascade" just walks the ladder per-request on error. The head (index 0) may be a
+  // glob; every lower tier is a rewrite target and MUST be a concrete model id.
+  if (config.failoverGroups !== undefined) {
+    if (!Array.isArray(config.failoverGroups)) {
+      throw new Error("config.failoverGroups: must be an array of { ladder, mode? }");
+    }
+    for (const [i, grp] of config.failoverGroups.entries()) {
+      const at = `config.failoverGroups[${i}]`;
+      if (!grp || typeof grp !== "object") throw new Error(`${at}: must be an object { ladder, mode? }`);
+      if (!Array.isArray(grp.ladder) || grp.ladder.length < 2) {
+        throw new Error(`${at}.ladder: must be an array of at least 2 model ids`);
+      }
+      for (const [j, entry] of grp.ladder.entries()) {
+        if (typeof entry !== "string" || entry.length === 0) {
+          throw new Error(`${at}.ladder[${j}]: must be a non-empty model id`);
+        }
+        // Lower tiers are rewrite targets — a glob there would forward `*` to a backend.
+        if (j >= 1 && entry.includes("*")) {
+          throw new Error(`${at}.ladder[${j}] "${entry}": only the head (index 0) may be a glob; lower tiers are rewrite targets and must be concrete model ids`);
+        }
+      }
+      if (grp.mode !== undefined && grp.mode !== "shift" && grp.mode !== "cascade") {
+        throw new Error(`${at}.mode: must be "shift" or "cascade" (default "shift")`);
       }
     }
   }
@@ -384,9 +455,18 @@ export function listConfig(config) {
     if (route.forImages !== undefined) out.forImages = route.forImages;
     if (route.forImagesModel !== undefined) out.forImagesModel = route.forImagesModel;
     if (route.vision !== undefined) out.vision = route.vision;
+    if (route.billing !== undefined) out.billing = route.billing;
     return out;
   });
+  if (config && Array.isArray(config.failoverGroups)) safe.failoverGroups = config.failoverGroups;
   return safe;
+}
+
+// The effective billing mode for a route: explicit `billing`, else derived —
+// passthrough rides the client's own plan (subscription), a key-swap route is metered.
+export function routeBilling(route) {
+  if (route && (route.billing === "metered" || route.billing === "subscription")) return route.billing;
+  return isPassthrough(route) ? "subscription" : "metered";
 }
 
 // The NETWORK-FACING view of the route table for GET /v1/models — a STRICTER projection
@@ -410,6 +490,7 @@ export function listModels(config) {
       auth: r.auth === "passthrough" ? "passthrough" : "key",  // mode only, never the env name
       vision: r.vision !== false,                        // vision-capable unless explicitly opted out
       for_images: r.forImages === true,                  // the forImages vision-fallback flag
+      billing: routeBilling(r),                          // "metered" | "subscription" — how the dashboard reports $
     };
   });
 }
@@ -621,6 +702,70 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {})
   upstreamReq.end();
 }
 
+// Record a zero-token error/relay stat for the tier a ctx is currently on. No-op when
+// the dashboard is off.
+function recordStat(ctx, status) {
+  if (ctx.statsCtx && ctx.statsCtx.stats) {
+    ctx.statsCtx.stats.record({
+      providerId: ctx.providerId, model: ctx.model,
+      durationMs: Date.now() - ctx.statsCtx.startTime,
+      inputTokens: 0, outputTokens: 0, status,
+    });
+  }
+}
+
+// Handle a failover-triggering error for a request riding a failover GROUP ladder.
+// In "shift" mode, a failing HEAD tier bumps the group's shared offset so the whole
+// ladder moves down one for future traffic; in either mode THIS request advances to the
+// next tier down (depth-guarded by the caller's hop check).
+function handleGroupFailover(ctx, status, buffered, headers, hop) {
+  const g = ctx.group.groupIndex;
+  const grp = ctx.config.failoverGroups[g];
+  const gs = ctx.groupState[g];
+  const ladder = grp.ladder;
+  const last = ladder.length - 1;
+  const currentEff = ctx.groupEffIndex != null ? ctx.groupEffIndex : Math.min(ctx.group.position + gs.offset, last);
+
+  // SHIFT: the tier serving ladder position 0 (index === offset) is the head. When it
+  // fails, shift the whole ladder down one — every rider moves together next time.
+  if (ctx.group.mode === "shift" && currentEff === gs.offset && gs.offset < last) {
+    gs.offset++;
+    gs.shiftedAt = Date.now();
+    ctx.log(`failover-group[${g}]: head tier "${ladder[currentEff]}" failing (status ${status}) — shift offset -> ${gs.offset} (whole ladder moves down one)`);
+  }
+
+  // Advance THIS request to the next tier down.
+  const nextIdx = Math.min(currentEff + 1, last);
+  if (nextIdx === currentEff) {
+    // Already at the last tier — nothing lower to try. Relay the error verbatim.
+    recordStat(ctx, status);
+    relayBuffered(ctx.res, status, headers, buffered);
+    return;
+  }
+  const nextModel = ladder[nextIdx];
+  const nextRoute = pickRoute(nextModel, ctx.config.routes);
+  if (!nextRoute) {
+    recordStat(ctx, 502);
+    sendError(ctx.res, 502, `failover group tier "${nextModel}" has no matching route`);
+    return;
+  }
+  recordStat(ctx, status); // record the original error on the tier that failed
+  ctx.log(`failover-group[${g}]: ${ctx.model} -> ${nextModel} (status ${status}, retrying, hop ${hop + 1})`);
+  const nextBody = rewriteModelInBody(ctx.body, nextModel);
+  proxyToRoute(nextRoute, ctx.req, ctx.res, nextBody, ctx.log, {
+    onResponse: makeResponseHandler({
+      ...ctx,
+      body: nextBody,
+      model: nextModel,
+      providerId: providerIdFromUrl(nextRoute.base_url),
+      isVisionTarget: nextRoute === ctx.visionRoute,
+      failoverHopCount: hop + 1,
+      groupEffIndex: nextIdx,
+    }),
+    statsCtx: ctx.statsCtx,
+  });
+}
+
 // Build the response handler that realises the reactive vision fallback AND failover
 // reroute. `ctx` carries the in-flight request; `isVisionTarget` is true when the route
 // being answered IS the `forImages` route (so a 400-image from it is the loop-guard case,
@@ -638,7 +783,7 @@ function makeResponseHandler(ctx) {
     // Other 4xx (401, 403, 404, etc.) stream straight back — they're client errors
     // that failover can't fix, so buffering them is wasted work + changes delivery
     // semantics for oversized error bodies.
-    const isFailoverCandidate = ctx.failoverConfig
+    const isFailoverCandidate = (ctx.failoverConfig || ctx.group)
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
     if (status !== 400 && !isFailoverCandidate) {
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
@@ -665,6 +810,12 @@ function makeResponseHandler(ctx) {
             ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
           }
           sendError(ctx.res, 502, `failover chain limit (${MAX_FAILOVER_HOPS} hops) reached — could not route "${ctx.model}"`);
+          return;
+        }
+
+        // GROUP failover takes precedence for a model riding a ladder.
+        if (ctx.group) {
+          handleGroupFailover(ctx, status, buffered, headers, hop);
           return;
         }
 
@@ -773,7 +924,7 @@ function makeResponseHandler(ctx) {
 // models — when set, requests for that model pre-route to its backup.
 // `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
-function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null) {
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null) {
   const model = modelFromBody(body);
   const route = pickRoute(model, config.routes);
   if (!route) {
@@ -786,7 +937,35 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
 
   // Build the base ctx for makeResponseHandler — the shared context threaded
   // through every hop (vision reroute AND failover reroute).
-  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx, config, failoverState, failoverConfig, failoverHopCount: 0 };
+  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, providerId, statsCtx, config, failoverState, failoverConfig, groupState, failoverHopCount: 0 };
+
+  // 0a. FAILOVER GROUP PRE-ROUTE: a model riding a ladder is served by its group's
+  //     effective tier (position + current shift offset). Takes precedence over plain
+  //     failover pairs. When offset is 0 this routes to the model itself; when the head
+  //     tier has shifted, the whole ladder rides down together.
+  if (groupState && Array.isArray(config.failoverGroups) && config.failoverGroups.length > 0) {
+    const gres = resolveGroup(config.failoverGroups, groupState, model);
+    if (gres) {
+      const effRoute = pickRoute(gres.effectiveModel, config.routes);
+      if (effRoute) {
+        const gBody = gres.effectiveModel === model ? body : rewriteModelInBody(body, gres.effectiveModel);
+        proxyToRoute(effRoute, req, res, gBody, log, {
+          onResponse: makeResponseHandler({
+            ...baseCtx,
+            body: gBody,
+            model: gres.effectiveModel,
+            providerId: providerIdFromUrl(effRoute.base_url),
+            isVisionTarget: effRoute === visionRoute,
+            group: { groupIndex: gres.groupIndex, position: gres.position, mode: gres.mode },
+            groupEffIndex: gres.effIndex,
+          }),
+          statsCtx,
+        });
+        return;
+      }
+      // Effective tier has no matching route — fall through to normal routing.
+    }
+  }
 
   // 0. FAILOVER PRE-ROUTE: if this model is in the active failover state AND the
   //    failover cooldown hasn't elapsed, skip the known-failing primary and go
@@ -870,13 +1049,15 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
 
 class FailoverPinger {
   #failoverState;  // shared Map<modelId, {enteredAt: number}>
+  #groupState;     // shared Array<{offset, shiftedAt}> parallel to config.failoverGroups
   #config;         // shared config object (for route resolution)
   #log;            // opt-in stderr logger (same as the router's log)
   #interval = null;
   #cooldownMs;
 
-  constructor(failoverState, config, log, cooldownMs = 60000) {
+  constructor(failoverState, config, log, cooldownMs = 60000, groupState = null) {
     this.#failoverState = failoverState;
+    this.#groupState = groupState;
     this.#config = config;
     this.#log = log || (() => {});
     this.#cooldownMs = cooldownMs;
@@ -884,36 +1065,52 @@ class FailoverPinger {
 
   async poll() {
     const now = Date.now();
+    // Plain failover pairs.
     const toProbe = [];
     for (const [model, state] of this.#failoverState) {
-      // Respect cooldown — don't probe more often than configured.
-      if (now - state.enteredAt >= this.#cooldownMs) {
-        toProbe.push(model);
-      }
+      if (now - state.enteredAt >= this.#cooldownMs) toProbe.push(model);
     }
     for (const model of toProbe) {
-      await this.#probeOne(model);
+      const r = await this.#probeRecovery(model);
+      if (r === "recovered" || r === "no-route") {
+        this.#failoverState.delete(model);
+        if (r === "recovered") this.#log(`failover-recovery: ${model} primary restored, failover cleared`);
+      }
+    }
+    // Failover groups in "shift" mode: probe the tier we shifted PAST (ladder[offset-1]);
+    // when it recovers, wind the whole ladder back up one step.
+    await this.#pollGroups(now);
+  }
+
+  async #pollGroups(now) {
+    const groups = this.#config.failoverGroups;
+    if (!this.#groupState || !Array.isArray(groups)) return;
+    for (let g = 0; g < groups.length; g++) {
+      const gs = this.#groupState[g];
+      if (!gs || gs.offset <= 0) continue;
+      if (now - (gs.shiftedAt || 0) < this.#cooldownMs) continue;
+      const probeModel = groups[g].ladder[gs.offset - 1];
+      const r = await this.#probeRecovery(probeModel);
+      if (r === "recovered" || r === "no-route") {
+        gs.offset--;
+        gs.shiftedAt = Date.now();
+        this.#log(`failover-group[${g}]: tier "${probeModel}" restored — shift offset -> ${gs.offset} (ladder winds back up one)`);
+      }
     }
   }
 
-  async #probeOne(model) {
+  // Probe one model's backend with a minimal real messages call. Returns
+  // "recovered" (backend accepts messages again), "down" (still a failover error),
+  // "unprobeable" (passthrough or no key — can't probe), or "no-route".
+  async #probeRecovery(model) {
     const route = pickRoute(model, this.#config.routes);
-    if (!route) {
-      // Route no longer exists — clear the stale failover entry.
-      this.#failoverState.delete(model);
-      return;
-    }
-    if (isPassthrough(route)) {
-      // Can't probe a passthrough route (no backend key of our own).
-      // Keep the failover — it'll be cleared by a real client request.
-      return;
-    }
+    if (!route) return "no-route";
+    if (isPassthrough(route)) return "unprobeable"; // no backend key of our own to probe with
     let auth;
     try {
       auth = resolveAuthHeader(route);
     } catch {
-      // Key not set — can't probe. Keep failover state.
-      return;
+      return "unprobeable"; // key not set
     }
 
     const upstream = new URL(route.base_url);
@@ -925,7 +1122,7 @@ class FailoverPinger {
     };
     headers[auth.name] = auth.value;
 
-    await new Promise((resolve) => {
+    return await new Promise((resolve) => {
       const client = upstream.protocol === "http:" ? http : https;
       const req = client.request(
         {
@@ -937,25 +1134,18 @@ class FailoverPinger {
           headers,
         },
         (res) => {
-          // Read the (small) response to classify it.
           const chunks = [];
           res.on("data", (c) => chunks.push(c));
           res.on("end", () => {
             const status = res.statusCode || 502;
             const body = Buffer.concat(chunks);
-            if (status < 400 || !isFailoverTrigger(status, body)) {
-              // Primary recovered or returned a non-failover error — clear failover.
-              this.#failoverState.delete(model);
-              this.#log(`failover-recovery: ${model} primary restored, failover cleared (probe status ${status})`);
-            }
-            // If still a failover-triggering error, keep state (don't touch).
-            resolve();
+            resolve((status < 400 || !isFailoverTrigger(status, body)) ? "recovered" : "down");
           });
-          res.on("error", () => resolve()); // keep state
-          res.on("aborted", () => resolve());
+          res.on("error", () => resolve("down"));
+          res.on("aborted", () => resolve("down"));
         },
       );
-      req.on("error", () => resolve()); // network error — keep state
+      req.on("error", () => resolve("down")); // network error — keep state
       req.write(pingBody);
       req.end();
     });
@@ -978,6 +1168,33 @@ export function createRouter(config, options = {}) {
   validateConfig(config);
   const maxBytes = config.maxBodyBytes || DEFAULT_MAX_BODY_BYTES;
   const log = options.log || defaultLogger();
+
+  // Dashboard-set overrides (tokenPrices, failover pairs) from a previous run. The config
+  // FILE stays the immutable source of truth; only what the DASHBOARD sets is accumulated
+  // in `dashOverrides` and persisted to ~/.modelpipe/overrides.json — so a file removal is
+  // never shadowed by a stale override. The overrides are merged on top of the file config
+  // for runtime use. A corrupt/invalid overrides file is ignored rather than bricking start.
+  const stored = readJson(OVERRIDES_FILE, {});
+  const dashOverrides = {
+    tokenPrices: (stored && typeof stored.tokenPrices === "object") ? stored.tokenPrices : {},
+    failover: (stored && typeof stored.failover === "object") ? stored.failover : {},
+  };
+  {
+    const beforeTP = config.tokenPrices;
+    const beforeFO = config.failover;
+    try {
+      if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
+      // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
+      // replace, not a merge) — so a pair removed in the UI stays removed across restart.
+      if (Object.keys(dashOverrides.failover).length) config.failover = { ...dashOverrides.failover };
+      validateConfig(config);
+    } catch {
+      config.tokenPrices = beforeTP;
+      config.failover = beforeFO;
+    }
+  }
+  // Persist ONLY the dashboard-set overrides (best-effort).
+  const saveOverrides = () => writeJson(OVERRIDES_FILE, dashOverrides);
   // Per-process (per-router-instance) cache of models a backend rejected for images,
   // so a repeat image call pre-routes to the vision target without the failing first
   // hop. Ephemeral, holds only model ids — never any request payload.
@@ -986,10 +1203,15 @@ export function createRouter(config, options = {}) {
   // Failover state + recovery pinger
   const failoverConfig = config.failover || null;
   const failoverState = new Map();
+  // Per-group shift state (offset winds down/up as the head tier fails/recovers).
+  const groupState = (config.failoverGroups || []).map(() => ({ offset: 0, shiftedAt: 0 }));
   let failoverPinger = null;
-  if (failoverConfig && Object.keys(failoverConfig).length > 0) {
-    failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000);
-    failoverPinger.start(config.failoverRecoveryIntervalMs || 60000);
+  const hasPairs = failoverConfig && Object.keys(failoverConfig).length > 0;
+  const hasGroups = groupState.length > 0;
+  if (hasPairs || hasGroups) {
+    const cooldown = config.failoverRecoveryIntervalMs || 60000;
+    failoverPinger = new FailoverPinger(failoverState, config, log, cooldown, groupState);
+    failoverPinger.start(cooldown);
   }
 
   // Dashboard stats + quota polling (enabled by config.dashboard)
@@ -998,7 +1220,10 @@ export function createRouter(config, options = {}) {
   const dashboard = config.dashboard === true;
   if (dashboard) {
     stats = new StatsCollector();
-    // Collect keyEnv names from the routes config
+    stats.startAutosave(10000); // flush the live session every 10s so a crash loses little
+    // Wire billing-API pollers only for providers that actually expose one (DeepSeek
+    // balance, OpenRouter credits). Anthropic's limits come from live response headers,
+    // not a poll — so it is deliberately absent here.
     const keyEnvs = {};
     for (const route of config.routes) {
       if (route.auth && typeof route.auth === "object" && route.auth.keyEnv) {
@@ -1007,11 +1232,6 @@ export function createRouter(config, options = {}) {
           keyEnvs[pid] = route.auth.keyEnv;
         }
       }
-    }
-    // Anthropic uses a separate env var for Rate Limits API polling (optional —
-    // the traffic route can stay passthrough while a separate key polls limits).
-    if (process.env.ANTHROPIC_API_KEY) {
-      keyEnvs.anthropic = "ANTHROPIC_API_KEY";
     }
     if (Object.keys(keyEnvs).length > 0) {
       quotaPoller = new QuotaPoller(keyEnvs);
@@ -1029,18 +1249,7 @@ export function createRouter(config, options = {}) {
       }
       if (req.url === "/v1/stats") {
         const snap = stats.snapshot(config.tokenPrices || null);
-        if (config.glmPlan) {
-          snap.glmQuota = computeGlmQuota(snap.timeline, config.glmPlan);
-        }
-        if (config.anthropicPlan) {
-          snap.anthropicPlan = config.anthropicPlan;
-        }
-        if (config.plans) {
-          snap.plans = config.plans;
-        }
-        if (config.tokenPrices) {
-          snap.tokenPrices = config.tokenPrices;
-        }
+        if (config.tokenPrices) snap.tokenPrices = config.tokenPrices;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(snap));
         return;
@@ -1065,33 +1274,46 @@ export function createRouter(config, options = {}) {
       res.end(JSON.stringify({ ok: true, startedAt: stats.snapshot().session.startedAt }));
       return;
     }
-    // POST /v1/plans — update subscription prices and/or token prices in-memory
-    if (dashboard && req.method === "POST" && req.url === "/v1/plans") {
-      readBody(req, 4096).then((body) => {
+    // POST /v1/token-prices — update per-model metered API prices in-memory + persist.
+    // Body: { "glm-5.2": { input, output }, ... } (or { tokenPrices: {...} }). These are
+    // REAL pay-as-you-go prices used for honest per-response cost on metered providers —
+    // there are no more "subscription plan price" fantik fields.
+    if (dashboard && req.method === "POST" && (req.url === "/v1/token-prices" || req.url === "/v1/plans")) {
+      readBody(req, 8192).then((body) => {
         try {
           const data = JSON.parse(body.toString("utf8"));
-          if (typeof data !== "object") throw new Error("must be an object");
-          const { _tokenPrices, ...plans } = data;
-          if (Object.keys(plans).length > 0) {
-            config.plans = { ...(config.plans || {}), ...plans };
+          if (!data || typeof data !== "object") throw new Error("must be an object { model: { input, output } }");
+          // Accept either a bare price map or { tokenPrices } / legacy { _tokenPrices }.
+          const prices = data.tokenPrices || data._tokenPrices || data;
+          for (const [k, p] of Object.entries(prices)) {
+            if (!p || typeof p.input !== "number" || typeof p.output !== "number" || p.input < 0 || p.output < 0) {
+              throw new Error(`price for "${k}" must be { input: number>=0, output: number>=0 }`);
+            }
           }
-          if (_tokenPrices) {
-            config.tokenPrices = { ...(config.tokenPrices || {}), ..._tokenPrices };
-          }
+          config.tokenPrices = { ...(config.tokenPrices || {}), ...prices };
+          dashOverrides.tokenPrices = { ...dashOverrides.tokenPrices, ...prices };
+          saveOverrides();
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: true, plans: config.plans, tokenPrices: config.tokenPrices }));
+          res.end(JSON.stringify({ ok: true, tokenPrices: config.tokenPrices }));
         } catch (e) {
           sendError(res, 400, `invalid: ${e.message}`);
         }
       }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
-    // GET /v1/failover — return current failover config + active state
+    // GET /v1/failover — return current failover config + active state (pairs + groups)
     if (dashboard && req.method === "GET" && req.url === "/v1/failover") {
       const active = {};
       for (const [model, state] of failoverState) active[model] = { enteredAt: state.enteredAt };
+      const groups = (config.failoverGroups || []).map((grp, g) => ({
+        ladder: grp.ladder,
+        mode: grp.mode || "shift",
+        offset: (groupState[g] && groupState[g].offset) || 0,
+        // The tier each ladder position is CURRENTLY served by, given the shift offset.
+        effective: grp.ladder.map((_, p) => effectiveLadderModel(grp.ladder, (groupState[g] && groupState[g].offset) || 0, p)),
+      }));
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ config: config.failover || {}, active }));
+      res.end(JSON.stringify({ config: config.failover || {}, active, groups }));
       return;
     }
     // POST /v1/failover — merge failover pairs in-memory (same pattern as POST /v1/plans)
@@ -1102,8 +1324,18 @@ export function createRouter(config, options = {}) {
           if (typeof data !== "object") throw new Error("must be an object");
           const { pairs, cooldownMs } = data;
           if (pairs !== undefined) {
-            if (typeof pairs !== "object") throw new Error("pairs must be an object { modelGlob: backupModelId }");
-            config.failover = { ...(config.failover || {}), ...pairs };
+            if (!pairs || typeof pairs !== "object") throw new Error("pairs must be an object { modelGlob: backupModelId }");
+            // Validate each pair the SAME way startup does (R5): non-empty string glob →
+            // non-empty string backup, glob must compile. No weaker path than the file.
+            for (const [pattern, backup] of Object.entries(pairs)) {
+              if (typeof pattern !== "string" || pattern.length === 0) throw new Error(`pair key "${pattern}" must be a non-empty model glob`);
+              if (typeof backup !== "string" || backup.length === 0) throw new Error(`pair value for "${pattern}" must be a non-empty backup model id`);
+              try { globToRegExp(pattern); } catch (ge) { throw new Error(`pair key "${pattern}" is not a valid glob: ${ge.message}`); }
+            }
+            // The posted set is the authoritative dashboard failover config (replace),
+            // so removing a pair in the UI and re-posting actually deletes it.
+            config.failover = { ...pairs };
+            dashOverrides.failover = { ...pairs };
           }
           if (cooldownMs !== undefined) {
             if (typeof cooldownMs !== "number" || cooldownMs < 1000) throw new Error("cooldownMs must be a number >= 1000");
@@ -1115,9 +1347,10 @@ export function createRouter(config, options = {}) {
           }
           // Start the pinger if pairs now exist and it wasn't running
           if (config.failover && Object.keys(config.failover).length > 0 && !failoverPinger) {
-            failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000);
+            failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000, groupState);
             failoverPinger.start(config.failoverRecoveryIntervalMs || 60000);
           }
+          saveOverrides();
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ok: true, config: config.failover || {}, cooldownMs: config.failoverRecoveryIntervalMs }));
         } catch (e) {
@@ -1137,6 +1370,8 @@ export function createRouter(config, options = {}) {
       } else {
         cleared = failoverState.size;
         failoverState.clear();
+        // Also wind every group offset back to 0 (revert all shifts).
+        for (const gs of groupState) { if (gs.offset > 0) { gs.offset = 0; gs.shiftedAt = 0; cleared++; } }
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, cleared }));
@@ -1156,13 +1391,14 @@ export function createRouter(config, options = {}) {
     readBody(req, maxBytes)
       .then((body) => {
         const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
-        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, failoverConfig);
+        // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take effect.
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, config.failover || null, groupState);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });
 
   // Expose stats + quotaPoller for teardown in tests
-  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger };
+  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger, groupState };
 
   // Archive session on graceful shutdown
   server.on("close", () => {
