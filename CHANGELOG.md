@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`modelpipe init` setup wizard** (`src/setup.mjs`): a guided, zero-dep prompt that asks
+  which backends to route, which keys, port, and dashboard, then writes a validated
+  `routes.json` + `.env`. Runnable straight from GitHub — `npx github:aadegtyarev/modelpipe init`
+  — with no global install. Guards an existing `routes.json` (asks before overwrite) and only
+  appends missing keys to an existing `.env` (never clobbers secrets).
+- **`install.sh`** one-liner (`curl … | bash`) that clones into `~/modelpipe` and runs the
+  wizard (reads the terminal via `/dev/tty` so it works under `curl | bash`).
+
 ## [0.8.0] - 2026-07-04
 
 ### Added
