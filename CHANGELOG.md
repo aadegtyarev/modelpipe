@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-04
 
 ### Added
 - **Fallback auth** (`auth.fallback: true` on a key-swap route): forward the client's own
@@ -15,10 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /v1/failover/reset?group=N` winds a single group's shift offset back without a
   restart (unsticks a rare double-shift). Also fixed the reset endpoint to match its path
   when a query string is present (`?model=`/`?group=` previously fell through and 404'd).
-
-## [0.7.0] - 2026-07-04
-
-### Added
 - **Failover groups** (`failoverGroups`): an ordered ladder multiple models ride together.
   In `mode: "shift"` (default), a failing HEAD tier shifts the WHOLE ladder down one — e.g.
   ladder `["claude-opus-*", "glm-5.1", "deepseek-v4-pro"]`: when Anthropic errors, `opus→glm`
