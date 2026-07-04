@@ -43,7 +43,7 @@ function loadEnvFile(filePath) {
   return set;
 }
 
-const USAGE = "usage: modelpipe <config.json> [--port N] [--env-file <path>] | modelpipe <config.json> --list";
+const USAGE = "usage: modelpipe <config.json> [--port N] [--env-file <path>] | modelpipe <config.json> --list | modelpipe init [--dir <path>]";
 
 function fail(message) {
   process.stderr.write(`modelpipe: ${message}\n${USAGE}\n`);
@@ -96,6 +96,16 @@ function resolvePort(rawPort, config) {
 }
 
 function main() {
+  // `modelpipe init` / `setup` — interactive config wizard (no config file needed).
+  const sub = process.argv[2];
+  if (sub === "init" || sub === "setup") {
+    import("../src/setup.mjs")
+      .then((m) => m.runSetup(process.argv.slice(3)))
+      .then((code) => process.exit(code || 0))
+      .catch((err) => fail(`setup failed: ${err.message}`));
+    return;
+  }
+
   const { configPath, port: rawPort, list, envFile } = parseArgs(process.argv.slice(2));
   if (!configPath) fail("a routes config file is required");
 
