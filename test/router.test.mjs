@@ -32,6 +32,9 @@ import {
   pickVisionRoute,
   validateConfig,
   listConfig,
+  ladderPosition,
+  effectiveLadderModel,
+  resolveGroup,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -408,6 +411,44 @@ async function main() {
   check("pickFailoverModel empty string model ⇒ null", pickFailoverModel({ "a-*": "b" }, ""), null);
   check("pickFailoverModel exact match", pickFailoverModel({ "glm-5.1": "deepseek-v4-pro" }, "glm-5.1"), "deepseek-v4-pro");
   check("pickFailoverModel first match wins", pickFailoverModel({ "claude-*": "glm-5.1", "claude-opus-*": "deepseek" }, "claude-opus-4-8"), "glm-5.1");
+
+  // ── failover GROUPS: pure helpers ──────────────────────────────────────────
+  const LADDER = ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"];
+  check("ladderPosition head glob matches", ladderPosition(LADDER, "claude-opus-4-8"), 0);
+  check("ladderPosition concrete tier matches", ladderPosition(LADDER, "glm-5.1"), 1);
+  check("ladderPosition last tier matches", ladderPosition(LADDER, "deepseek-v4-pro"), 2);
+  check("ladderPosition no match ⇒ -1", ladderPosition(LADDER, "gpt-x"), -1);
+  check("ladderPosition empty model ⇒ -1", ladderPosition(LADDER, ""), -1);
+  check("effectiveLadderModel offset 0 = self", effectiveLadderModel(LADDER, 0, 0), "claude-opus-*");
+  check("effectiveLadderModel offset 1 shifts head→glm", effectiveLadderModel(LADDER, 1, 0), "glm-5.1");
+  check("effectiveLadderModel offset 1 shifts glm→deepseek", effectiveLadderModel(LADDER, 1, 1), "deepseek-v4-pro");
+  check("effectiveLadderModel clamps at last tier", effectiveLadderModel(LADDER, 5, 2), "deepseek-v4-pro");
+  const groups = [{ ladder: LADDER, mode: "shift" }];
+  const gs0 = [{ offset: 0 }];
+  const gs1 = [{ offset: 1 }];
+  check("resolveGroup offset 0: opus serves itself", resolveGroup(groups, gs0, "claude-opus-4-8").effectiveModel, "claude-opus-*");
+  check("resolveGroup offset 1: opus → glm", resolveGroup(groups, gs1, "claude-opus-4-8").effectiveModel, "glm-5.1");
+  check("resolveGroup offset 1: glm → deepseek (whole ladder shifts)", resolveGroup(groups, gs1, "glm-5.1").effectiveModel, "deepseek-v4-pro");
+  check("resolveGroup returns position", resolveGroup(groups, gs0, "glm-5.1").position, 1);
+  check("resolveGroup no ladder match ⇒ null", resolveGroup(groups, gs0, "gpt-x"), null);
+  check("resolveGroup no groups ⇒ null", resolveGroup(undefined, gs0, "glm-5.1"), null);
+
+  // ── validateConfig: failoverGroups ─────────────────────────────────────────
+  const baseRoute = { routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }] };
+  check("validateConfig accepts valid failoverGroups",
+    validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1", "c-1"], mode: "shift" }] }).failoverGroups[0].mode, "shift");
+  let grpNotArrThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: {} }); } catch { grpNotArrThrew = true; }
+  check("validateConfig rejects non-array failoverGroups", grpNotArrThrew, true);
+  let grpShortThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*"] }] }); } catch { grpShortThrew = true; }
+  check("validateConfig rejects ladder < 2 tiers", grpShortThrew, true);
+  let grpGlobTargetThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-*"] }] }); } catch { grpGlobTargetThrew = true; }
+  check("validateConfig rejects glob in a lower (target) tier", grpGlobTargetThrew, true);
+  let grpBadModeThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1"], mode: "wat" }] }); } catch { grpBadModeThrew = true; }
+  check("validateConfig rejects bad group mode", grpBadModeThrew, true);
 
   // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
   const listSample = {
@@ -941,6 +982,78 @@ async function main() {
     await close(foA.server);
     await close(foB.server);
     await close(foC.server);
+  }
+
+  // ── failover GROUP shift e2e (the whole ladder moves down together) ────────
+  {
+    process.env.TEST_GRP_KEY = "GRP-SECRET";
+    const grpA = makeFlexStub(200); // claude-* backend (head)
+    const grpB = makeFlexStub(200); // glm-5.1 backend
+    const grpC = makeFlexStub(200); // deepseek backend
+    const grpAPort = await listen(grpA.server);
+    const grpBPort = await listen(grpB.server);
+    const grpCPort = await listen(grpC.server);
+    const grpConfig = {
+      listen: { host: "127.0.0.1", port: 0 },
+      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
+      failoverRecoveryIntervalMs: 1000,
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${grpAPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+        { match: "glm-5.1", base_url: `http://127.0.0.1:${grpBPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${grpCPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+      ],
+    };
+    const grpRouter = createRouter(grpConfig);
+    const grpPort = await listen(grpRouter);
+    try {
+      // G1. Head (opus) 429 → reactive shift to glm; offset becomes 1.
+      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
+      grpB.setStatus(200);
+      const g1 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G1" }] });
+      check("G1 group: head A hit", grpA.received.length, 1);
+      check("G1 group: glm B served the reroute", grpB.received.length, 1);
+      check("G1 group: client gets 200", g1.status, 200);
+      check("G1 group: B got rewritten model", JSON.parse(grpB.received[0].body).model, "glm-5.1");
+      check("G1 group: offset shifted to 1", grpRouter._modelpipe.groupState[0].offset, 1);
+
+      // G2. THE KEY FEATURE: glm's OWN traffic now pre-routes to deepseek (whole ladder
+      //     shifted), even though glm itself never failed.
+      const cBefore = grpC.received.length;
+      const bBefore = grpB.received.length;
+      grpC.setStatus(200);
+      const g2 = await request(grpPort, { model: "glm-5.1", messages: [{ role: "user", content: "G2" }] });
+      check("G2 group: glm traffic shifted to deepseek", grpC.received.length, cBefore + 1);
+      check("G2 group: glm backend B NOT hit for glm traffic", grpB.received.length, bBefore);
+      check("G2 group: deepseek got rewritten model", JSON.parse(grpC.received[grpC.received.length - 1].body).model, "deepseek-v4-pro");
+      check("G2 group: client gets 200", g2.status, 200);
+
+      // G3. opus pre-routes to glm during shift (head A skipped).
+      const aBefore3 = grpA.received.length;
+      const bBefore3 = grpB.received.length;
+      const g3 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G3" }] });
+      check("G3 group: head A skipped (pre-route)", grpA.received.length, aBefore3);
+      check("G3 group: glm B served opus", grpB.received.length, bBefore3 + 1);
+      check("G3 group: client gets 200", g3.status, 200);
+
+      // G4. Recovery: head healthy + cooldown elapsed → pinger winds offset back to 0.
+      grpA.setStatus(200);
+      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // ancient → cooldown elapsed
+      const pinger = grpRouter._modelpipe.failoverPinger;
+      await pinger.poll();
+      check("G4 group recovery: offset wound back to 0", grpRouter._modelpipe.groupState[0].offset, 0);
+
+      // G5. After recovery, opus serves itself again.
+      const aBefore5 = grpA.received.length;
+      const g5 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G5" }] });
+      check("G5 group: head A serves itself after recovery", grpA.received.length, aBefore5 + 1);
+      check("G5 group: client gets 200", g5.status, 200);
+    } finally {
+      delete process.env.TEST_GRP_KEY;
+      await close(grpRouter);
+      await close(grpA.server);
+      await close(grpB.server);
+      await close(grpC.server);
+    }
   }
 
   if (fails.length) {
