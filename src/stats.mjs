@@ -308,24 +308,33 @@ export function decompressIfNeeded(upstreamRes) {
   return { stream: upstreamRes, headers: upstreamRes.headers, decompressed: false };
 }
 
-// Cap the fallback buffer so a large streamed response can't be held in full in memory.
-// The primary path extracts tokens incrementally (see `buffer` below); `totalBuffer` is
-// only a last resort for a small non-streaming JSON reply, so a modest cap is plenty and
-// preserves the module's zero-buffer promise for real streams.
-const FALLBACK_BUFFER_CAP = 256 * 1024;
+// An SSE stream has its tokens extracted incrementally (from `buffer`), so we never hold
+// it in full — that is the module's zero-buffer promise. Only a NON-streaming JSON reply
+// needs the whole body (its usage is one top-level object the flush fallback parses), so
+// `totalBuffer` accumulates ONLY for that case, bounded so a pathological body can't OOM.
+const JSON_FALLBACK_CAP = 10 * 1024 * 1024;
 
 export function createUsageTracker(stats, { providerId, model, startTime }) {
   let buffer = "";
   let inputTokens = 0;
   let outputTokens = 0;
   let totalBuffer = "";
+  let started = false;
+  let looksJson = false;
 
   return new Transform({
     transform(chunk, _encoding, callback) {
       this.push(chunk);
       const text = chunk.toString("utf8");
       buffer += text;
-      if (totalBuffer.length < FALLBACK_BUFFER_CAP) totalBuffer += text;
+      // Decide streaming-vs-JSON from the first non-empty chunk: an SSE stream starts with
+      // `event:`/`data:`, a non-streaming reply with `{`. Accumulate the full body only for
+      // the JSON case (needed by the flush fallback); an SSE stream never grows totalBuffer.
+      if (!started && text.trim().length > 0) {
+        started = true;
+        looksJson = text.replace(/^﻿/, "").trimStart().startsWith("{");
+      }
+      if (looksJson && totalBuffer.length < JSON_FALLBACK_CAP) totalBuffer += text;
       // Split on double-newline (handles \n\n and \r\n\r\n)
       const parts = buffer.split(/\r?\n\r?\n/);
       buffer = parts.pop() || "";

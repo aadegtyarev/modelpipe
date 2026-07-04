@@ -87,6 +87,17 @@ async function run() {
   check("JSON fallback extracts input_tokens", rec2[0].inputTokens, 7);
   check("JSON fallback extracts output_tokens", rec2[0].outputTokens, 9);
 
+  // ── LARGE non-streaming JSON still records tokens (regression guard for the buffer cap) ─
+  const rec3 = [];
+  const tr3 = createUsageTracker({ record: (e) => rec3.push(e) }, { providerId: "deepseek", model: "deepseek-chat", startTime: Date.now() });
+  const drained3 = drain(tr3);
+  const bigText = "x".repeat(400 * 1024); // ~400 KB — over the old 256 KB cap
+  tr3.write('{"content":[{"type":"text","text":"' + bigText + '"}],');
+  tr3.end('"usage":{"input_tokens":11,"output_tokens":22}}');
+  await drained3;
+  check("large JSON body still records input_tokens", rec3[0].inputTokens, 11);
+  check("large JSON body still records output_tokens", rec3[0].outputTokens, 22);
+
   // ── decompressIfNeeded ──────────────────────────────────────────────────────────
   const plain = decompressIfNeeded({ headers: { "content-type": "text/event-stream" } });
   check("decompress: uncompressed passes through", plain.decompressed, false);

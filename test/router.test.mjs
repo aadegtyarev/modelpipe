@@ -1006,11 +1006,21 @@ async function main() {
     const grpRouter = createRouter(grpConfig);
     const grpPort = await listen(grpRouter);
     try {
+      // G0. Healthy head at offset 0 must forward the ORIGINAL concrete model id, NOT the
+      //     ladder's glob head ("claude-opus-*"). Guards the glob-head rewrite bug.
+      grpA.setStatus(200);
+      const g0 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G0" }] });
+      check("G0 group: healthy head serves itself", g0.status, 200);
+      check("G0 group: forwards the REAL model id (not the glob)", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
+      check("G0 group: offset still 0", grpRouter._modelpipe.groupState[0].offset, 0);
+      grpA.received.length = 0;
+
       // G1. Head (opus) 429 → reactive shift to glm; offset becomes 1.
       grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
       grpB.setStatus(200);
       const g1 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G1" }] });
       check("G1 group: head A hit", grpA.received.length, 1);
+      check("G1 group: head A got the real model id (not glob)", JSON.parse(grpA.received[0].body).model, "claude-opus-4-8");
       check("G1 group: glm B served the reroute", grpB.received.length, 1);
       check("G1 group: client gets 200", g1.status, 200);
       check("G1 group: B got rewritten model", JSON.parse(grpB.received[0].body).model, "glm-5.1");
@@ -1035,12 +1045,29 @@ async function main() {
       check("G3 group: glm B served opus", grpB.received.length, bBefore3 + 1);
       check("G3 group: client gets 200", g3.status, 200);
 
-      // G4. Recovery: head healthy + cooldown elapsed → pinger winds offset back to 0.
+      // G4. The synthetic pinger must NOT probe a GLOB head (ladder[offset-1]="claude-opus-*"):
+      //     a glob has no concrete id to ping with, so the pinger skips it and offset stays.
+      //     (Recovery for a glob/passthrough head is the live-request path in G4b.)
       grpA.setStatus(200);
       grpRouter._modelpipe.groupState[0].shiftedAt = 1; // ancient → cooldown elapsed
       const pinger = grpRouter._modelpipe.failoverPinger;
       await pinger.poll();
-      check("G4 group recovery: offset wound back to 0", grpRouter._modelpipe.groupState[0].offset, 0);
+      check("G4 group: pinger does NOT wind back a glob head (offset stays 1)", grpRouter._modelpipe.groupState[0].offset, 1);
+
+      // G4b. LIVE-REQUEST recovery (the passthrough/glob-head path the pinger can't probe):
+      //      force a shift, then a head request after cooldown probes the real head and
+      //      winds back on success — no synthetic ping involved.
+      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
+      await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-shift" }] });
+      check("G4b: shifted to offset 1", grpRouter._modelpipe.groupState[0].offset, 1);
+      grpA.setStatus(200); // head recovered
+      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // cooldown elapsed
+      const aBefore4b = grpA.received.length;
+      const g4b = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-probe" }] });
+      check("G4b: live head probe hit the real head A", grpA.received.length, aBefore4b + 1);
+      check("G4b: probe forwarded the real model id", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
+      check("G4b: client got 200", g4b.status, 200);
+      check("G4b: offset wound back to 0 by the live request", grpRouter._modelpipe.groupState[0].offset, 0);
 
       // G5. After recovery, opus serves itself again.
       const aBefore5 = grpA.received.length;

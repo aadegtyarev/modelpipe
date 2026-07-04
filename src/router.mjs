@@ -488,6 +488,7 @@ export function listModels(config) {
       object: "model",
       host,                                              // backend host — no path, no key
       auth: r.auth === "passthrough" ? "passthrough" : "key",  // mode only, never the env name
+      provider: providerIdFromUrl(r.base_url),           // server-computed id — one source of truth with stats
       vision: r.vision !== false,                        // vision-capable unless explicitly opted out
       for_images: r.forImages === true,                  // the forImages vision-fallback flag
       billing: routeBilling(r),                          // "metered" | "subscription" — how the dashboard reports $
@@ -761,6 +762,7 @@ function handleGroupFailover(ctx, status, buffered, headers, hop) {
       isVisionTarget: nextRoute === ctx.visionRoute,
       failoverHopCount: hop + 1,
       groupEffIndex: nextIdx,
+      groupProbe: null, // a reroute is no longer the head-recovery probe — don't wind back on its success
     }),
     statsCtx: ctx.statsCtx,
   });
@@ -775,6 +777,21 @@ function makeResponseHandler(ctx) {
   return (upstreamRes) => {
     const status = upstreamRes.statusCode || 502;
 
+    // A group recovery PROBE (a head-position request the pre-route sent one tier up during
+    // cooldown) that comes back WITHOUT a failover-triggering error means the head has
+    // recovered → wind the whole ladder back up one. Called on the success/relay paths, not
+    // when the probe itself triggers failover (then the offset stays and it re-serves lower).
+    const windBackProbe = () => {
+      const p = ctx.groupProbe;
+      if (!p || !ctx.groupState) return;
+      const gs = ctx.groupState[p.groupIndex];
+      if (gs && gs.offset === p.fromOffset) {
+        gs.offset = p.windTo;
+        gs.shiftedAt = Date.now();
+        ctx.log(`failover-group[${p.groupIndex}]: head recovered on a live request — shift offset -> ${gs.offset}`);
+      }
+    };
+
     // Fast path — success / SSE (2xx) and every other non-error that is neither a
     // 400 (vision classifier) nor a failover-candidate status. These are NEVER
     // buffered, so streaming stays intact.
@@ -786,6 +803,7 @@ function makeResponseHandler(ctx) {
     const isFailoverCandidate = (ctx.failoverConfig || ctx.group)
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
     if (status !== 400 && !isFailoverCandidate) {
+      windBackProbe(); // a non-candidate response to a recovery probe = head is back
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
         ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
         : null);
@@ -884,8 +902,11 @@ function makeResponseHandler(ctx) {
           // model so the next image call pre-routes (per-process cache, never the payload).
           if (ctx.model) ctx.nonVisionCache.set(ctx.model, true);
           const visionBody = rewriteModelInBody(ctx.body, ctx.visionRoute.forImagesModel);
+          // Drop group context: the vision target's model is not on the ladder, so a later
+          // failover-trigger from it must fall to plain pair logic, not walk the ladder off
+          // a stale groupEffIndex.
           proxyToRoute(ctx.visionRoute, ctx.req, ctx.res, visionBody, ctx.log, {
-            onResponse: makeResponseHandler({ ...ctx, isVisionTarget: true }),
+            onResponse: makeResponseHandler({ ...ctx, isVisionTarget: true, group: null, groupProbe: null }),
             statsCtx: ctx.statsCtx,
           });
           return;
@@ -908,6 +929,7 @@ function makeResponseHandler(ctx) {
         const diagMsg = (diag && diag.error && diag.error.message) || JSON.stringify(diag).slice(0, 200);
         ctx.log(`error-relay: ${ctx.model} status=${status} msg="${diagMsg}"`);
       } catch { /* never fail on diagnostics */ }
+      windBackProbe(); // a non-retryable response to a recovery probe = head is back
       if (ctx.statsCtx && ctx.statsCtx.stats) {
         ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
       }
@@ -946,18 +968,42 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
   if (groupState && Array.isArray(config.failoverGroups) && config.failoverGroups.length > 0) {
     const gres = resolveGroup(config.failoverGroups, groupState, model);
     if (gres) {
-      const effRoute = pickRoute(gres.effectiveModel, config.routes);
+      const gs = groupState[gres.groupIndex];
+      const ladderArr = config.failoverGroups[gres.groupIndex].ladder;
+      let effIndex = gres.effIndex;
+      let groupProbe = null;
+      // RECOVERY via a live request (works for passthrough / glob heads the synthetic
+      // pinger cannot probe): once the cooldown has elapsed since the last shift, a
+      // HEAD-position request tries one tier UP with the real request + real model id.
+      // If it comes back healthy, makeResponseHandler winds the whole ladder back one;
+      // if it fails, the reactive path re-serves it on the shifted tier (offset unchanged).
+      // Only head traffic can probe this way — a lower tier's request can't test the head's
+      // model. This is the group analogue of the plain-pairs cooldown fall-through below.
+      if (gres.position === 0 && gs.offset > 0 &&
+          Date.now() - (gs.shiftedAt || 0) >= (config.failoverRecoveryIntervalMs || 60000)) {
+        effIndex = gs.offset - 1;
+        gs.shiftedAt = Date.now(); // hold off another probe for a full cooldown
+        groupProbe = { groupIndex: gres.groupIndex, fromOffset: gs.offset, windTo: gs.offset - 1 };
+      }
+      // Served by its OWN tier (effIndex === position) → pass the original body unchanged.
+      // Only a genuine DOWNWARD shift rewrites, and only to a lower tier — which
+      // validateConfig guarantees is a concrete id, never a glob. (So we must NOT compare
+      // against the ladder entry: a glob HEAD serving its own traffic keeps the real id.)
+      const shifted = effIndex > gres.position;
+      const targetModel = shifted ? ladderArr[effIndex] : model;
+      const effRoute = pickRoute(targetModel, config.routes);
       if (effRoute) {
-        const gBody = gres.effectiveModel === model ? body : rewriteModelInBody(body, gres.effectiveModel);
+        const gBody = shifted ? rewriteModelInBody(body, targetModel) : body;
         proxyToRoute(effRoute, req, res, gBody, log, {
           onResponse: makeResponseHandler({
             ...baseCtx,
             body: gBody,
-            model: gres.effectiveModel,
+            model: targetModel,
             providerId: providerIdFromUrl(effRoute.base_url),
             isVisionTarget: effRoute === visionRoute,
             group: { groupIndex: gres.groupIndex, position: gres.position, mode: gres.mode },
-            groupEffIndex: gres.effIndex,
+            groupEffIndex: effIndex,
+            groupProbe,
           }),
           statsCtx,
         });
@@ -1090,6 +1136,10 @@ class FailoverPinger {
       if (!gs || gs.offset <= 0) continue;
       if (now - (gs.shiftedAt || 0) < this.#cooldownMs) continue;
       const probeModel = groups[g].ladder[gs.offset - 1];
+      // A glob tier (only the head may be one) has no concrete id to synthesize a probe
+      // with — sending the glob string would be a bogus model id. Leave it to the live
+      // head-request cooldown fall-through in forward() to recover.
+      if (probeModel.includes("*")) continue;
       const r = await this.#probeRecovery(probeModel);
       if (r === "recovered" || r === "no-route") {
         gs.offset--;
@@ -1169,11 +1219,11 @@ export function createRouter(config, options = {}) {
   const maxBytes = config.maxBodyBytes || DEFAULT_MAX_BODY_BYTES;
   const log = options.log || defaultLogger();
 
-  // Dashboard-set overrides (tokenPrices, failover pairs) from a previous run. The config
-  // FILE stays the immutable source of truth; only what the DASHBOARD sets is accumulated
-  // in `dashOverrides` and persisted to ~/.modelpipe/overrides.json — so a file removal is
-  // never shadowed by a stale override. The overrides are merged on top of the file config
-  // for runtime use. A corrupt/invalid overrides file is ignored rather than bricking start.
+  // Dashboard-set overrides from a previous run, persisted to ~/.modelpipe/overrides.json.
+  // tokenPrices MERGE over the file (file entries survive). failover, once edited in the
+  // dashboard, is AUTHORITATIVE — the stored set REPLACES the file's `failover` so a pair
+  // removed in the UI stays removed (to go back to the file config, clear overrides.json).
+  // A corrupt/invalid overrides file is ignored rather than bricking startup.
   const stored = readJson(OVERRIDES_FILE, {});
   const dashOverrides = {
     tokenPrices: (stored && typeof stored.tokenPrices === "object") ? stored.tokenPrices : {},
@@ -1391,8 +1441,10 @@ export function createRouter(config, options = {}) {
     readBody(req, maxBytes)
       .then((body) => {
         const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
-        // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take effect.
-        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, config.failover || null, groupState);
+        // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take
+        // effect; an empty map counts as "no pairs" (don't buffer every error needlessly).
+        const liveFailover = config.failover && Object.keys(config.failover).length ? config.failover : null;
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });

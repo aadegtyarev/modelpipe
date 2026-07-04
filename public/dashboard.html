@@ -139,7 +139,9 @@ let failoverPairs={};
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
 function pricestr(pin,pout){return pin==null?'price —':'$'+pin+' / $'+pout+' per 1M in·out'}
-function isMetered(pid){return billingByProvider[pid]!=='subscription'}
+// Metered only when the route table explicitly says so — an unknown provider (e.g. a
+// failed /v1/models fetch) HIDES the $ rather than fabricating one (honesty-first default).
+function isMetered(pid){return billingByProvider[pid]==='metered'}
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function escJs(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
 
@@ -247,13 +249,12 @@ async function load(){
       fetch("/v1/sessions").then(r=>r.json()),
       fetch("/v1/models").then(r=>r.json()).catch(()=>({data:[]})),
     ]);
-    // Build providerId -> billing map from the route table.
+    // Build providerId -> billing map from the route table, using the SERVER-computed
+    // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
     billingByProvider={};
     const cfg=(models.data||[]).map(m=>{
-      const h=m.host||'';let pid=h;
-      if(h.includes('anthropic'))pid='anthropic';else if(h.includes('z.ai'))pid='glm';
-      else if(h.includes('deepseek'))pid='deepseek';else if(h.includes('openrouter'))pid='openrouter';
-      billingByProvider[pid]=m.billing||billingByProvider[pid]||'metered';
+      const pid=m.provider||m.host||'';
+      if(m.billing)billingByProvider[pid]=m.billing;
       return{...m,pid};
     });
 

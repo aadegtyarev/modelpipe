@@ -33,12 +33,16 @@ export function readJson(name, fallback = null) {
   }
 }
 
-// Write a JSON file to the store dir (creating it if needed). Returns true on success,
-// false on any failure. Never throws.
+// Write a JSON file to the store dir (creating it if needed). Atomic: write a temp file
+// then rename over the target, so a crash mid-write can't leave a half-written (corrupt)
+// file. Returns true on success, false on any failure. Never throws.
 export function writeJson(name, data) {
   try {
     ensureDir();
-    fs.writeFileSync(path.join(MODELPIPE_DIR, name), JSON.stringify(data), "utf8");
+    const target = path.join(MODELPIPE_DIR, name);
+    const tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data), "utf8");
+    fs.renameSync(tmp, target);
     return true;
   } catch {
     return false;
