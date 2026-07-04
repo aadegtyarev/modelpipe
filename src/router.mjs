@@ -265,6 +265,24 @@ export function isPassthrough(route) {
   return route && route.auth === "passthrough";
 }
 
+// True for a key-swap route that opts into fallback auth (auth.fallback === true):
+// forward the client's OWN auth header when it sent one, otherwise inject the backend key.
+// "Use the token that flies if present, else the one the proxy holds." Lets Claude Code
+// pass its own Anthropic token through while the proxy's key covers clients that send none.
+export function isFallbackAuth(route) {
+  return !!(route && route.auth && typeof route.auth === "object" && route.auth.fallback === true);
+}
+
+// True when the incoming request already carries a non-empty client auth header
+// (x-api-key or authorization) — i.e. the client "flew" its own token.
+export function clientHasAuth(headers) {
+  for (const name of CLIENT_AUTH_HEADERS) {
+    const v = headers && headers[name];
+    if (typeof v === "string" && v.length > 0) return true;
+  }
+  return false;
+}
+
 // Resolve a route's backend auth header from the environment. Returns
 // { name, value }; throws a 500 RouterError when the named env var is unset/empty
 // — fail-closed: the router never forwards a request without the backend's own key.
@@ -332,11 +350,17 @@ export function validateConfig(config) {
       throw new Error(`${at}.billing: must be "metered" or "subscription" when present`);
     }
     // auth is EITHER the string "passthrough" (forward the client's auth unchanged)
-    // OR a key-swap object { header, keyEnv, scheme? }.
+    // OR a key-swap object { header, keyEnv, scheme?, fallback? }.
     if (route.auth === "passthrough") continue;
     if (!route.auth || typeof route.auth !== "object") throw new Error(`${at}.auth: missing (object or "passthrough")`);
     if (typeof route.auth.header !== "string" || route.auth.header.length === 0) throw new Error(`${at}.auth.header: missing`);
     if (typeof route.auth.keyEnv !== "string" || route.auth.keyEnv.length === 0) throw new Error(`${at}.auth.keyEnv: missing`);
+    // fallback: OPTIONAL boolean. true ⇒ forward the client's OWN auth header when it sent
+    // one, and inject keyEnv only when it didn't ("the token that flies wins, else the
+    // proxy's"). Default false = always swap in keyEnv.
+    if (route.auth.fallback !== undefined && typeof route.auth.fallback !== "boolean") {
+      throw new Error(`${at}.auth.fallback: must be a boolean when present`);
+    }
   }
   if (visionCount > 1) throw new Error("config.routes: at most one route may set forImages: true (the vision fallback target)");
 
@@ -450,6 +474,7 @@ export function listConfig(config) {
       const authView = { header: route.auth.header };
       if (route.auth.scheme !== undefined) authView.scheme = route.auth.scheme;
       authView.keyEnv = route.auth.keyEnv; // the env-var NAME, never a key value
+      if (route.auth.fallback === true) authView.fallback = true;
       out.auth = authView;
     }
     if (route.forImages !== undefined) out.forImages = route.forImages;
@@ -646,8 +671,13 @@ function relayBuffered(res, status, upstreamHeaders, buffered) {
 // stats collector and request start time for usage tracking.
 function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {}) {
   const passthrough = isPassthrough(route);
+  // Fallback auth: if the client flew its own token, forward it (like passthrough);
+  // otherwise inject the proxy's backend key (like key-swap). "The one that flies wins,
+  // else the one the proxy holds."
+  const fallbackClientAuth = isFallbackAuth(route) && clientHasAuth(req.headers);
+  const keepClientAuth = passthrough || fallbackClientAuth;
   let auth = null;
-  if (!passthrough) {
+  if (!keepClientAuth) {
     try {
       auth = resolveAuthHeader(route);
     } catch (err) {
@@ -667,8 +697,9 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {})
   const upstream = new URL(route.base_url);
   log(`${modelFromBody(body)} -> ${upstream.host}`);
 
-  // Passthrough keeps the client's auth header; key-swap drops it and sets the backend's.
-  const headers = sanitizeHeaders(req.headers, upstream.host, { keepClientAuth: passthrough });
+  // Passthrough (or fallback with a client token present) keeps the client's auth header;
+  // key-swap drops it and sets the backend's.
+  const headers = sanitizeHeaders(req.headers, upstream.host, { keepClientAuth });
   if (auth) headers[auth.name] = auth.value;
   if (body.length) headers["content-length"] = String(body.length);
 
@@ -1409,18 +1440,31 @@ export function createRouter(config, options = {}) {
       }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
-    // POST /v1/failover/reset — clear all (or one) active failover state
-    if (dashboard && req.method === "POST" && req.url === "/v1/failover/reset") {
-      let cleared = 0;
-      // Optional query param: /v1/failover/reset?model=claude-opus-4-8
+    // POST /v1/failover/reset — clear active failover state without a restart.
+    //   (no param)   → clear ALL pair state AND wind every group offset back to 0
+    //   ?model=<id>  → clear one model's pair failover state
+    //   ?group=<n>   → wind group #n's offset back to 0 (fixes a stuck double-shift)
+    // NOTE: match the PATHNAME so a query string still routes here (a plain `=== req.url`
+    // check would miss "/v1/failover/reset?group=0").
+    if (dashboard && req.method === "POST" &&
+        (req.url === "/v1/failover/reset" || req.url.startsWith("/v1/failover/reset?"))) {
       const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
       const targetModel = url.searchParams.get("model");
+      const targetGroup = url.searchParams.get("group");
+      let cleared = 0;
       if (targetModel) {
         if (failoverState.delete(targetModel)) cleared = 1;
+      } else if (targetGroup !== null) {
+        const g = Number(targetGroup);
+        if (Number.isInteger(g) && groupState[g]) {
+          if (groupState[g].offset > 0) { groupState[g].offset = 0; groupState[g].shiftedAt = 0; cleared = 1; }
+        } else {
+          sendError(res, 400, `no failover group #${targetGroup}`);
+          return;
+        }
       } else {
         cleared = failoverState.size;
         failoverState.clear();
-        // Also wind every group offset back to 0 (revert all shifts).
         for (const gs of groupState) { if (gs.offset > 0) { gs.offset = 0; gs.shiftedAt = 0; cleared++; } }
       }
       res.writeHead(200, { "content-type": "application/json" });

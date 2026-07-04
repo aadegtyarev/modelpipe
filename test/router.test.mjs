@@ -35,6 +35,8 @@ import {
   ladderPosition,
   effectiveLadderModel,
   resolveGroup,
+  isFallbackAuth,
+  clientHasAuth,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -169,6 +171,31 @@ function get(port, urlPath) {
     );
     req.on("error", reject);
     req.end();
+  });
+}
+
+// POST /v1/messages with caller-controlled headers (to exercise fallback auth: send or
+// omit the client's own auth header). Unlike `request`, sets NO auth header by default.
+function requestH(port, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(payload));
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+        headers: { "content-type": "application/json", "content-length": data.length, ...headers } },
+      (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8"), headers: res.headers })); },
+    );
+    req.on("error", reject); req.write(data); req.end();
+  });
+}
+
+// A bare POST to an arbitrary path (for management endpoints like /v1/failover/reset).
+function postPath(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: urlPath, method: "POST" },
+      (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8") })); },
+    );
+    req.on("error", reject); req.end();
   });
 }
 
@@ -432,6 +459,20 @@ async function main() {
   check("resolveGroup returns position", resolveGroup(groups, gs0, "glm-5.1").position, 1);
   check("resolveGroup no ladder match ⇒ null", resolveGroup(groups, gs0, "gpt-x"), null);
   check("resolveGroup no groups ⇒ null", resolveGroup(undefined, gs0, "glm-5.1"), null);
+
+  // ── fallback auth (pure) ────────────────────────────────────────────────────
+  check("isFallbackAuth true when flagged", isFallbackAuth({ auth: { header: "x-api-key", keyEnv: "K", fallback: true } }), true);
+  check("isFallbackAuth false by default", isFallbackAuth({ auth: { header: "x-api-key", keyEnv: "K" } }), false);
+  check("isFallbackAuth false for passthrough", isFallbackAuth({ auth: "passthrough" }), false);
+  check("clientHasAuth true with x-api-key", clientHasAuth({ "x-api-key": "sk" }), true);
+  check("clientHasAuth true with authorization", clientHasAuth({ authorization: "Bearer t" }), true);
+  check("clientHasAuth false when empty", clientHasAuth({ "x-api-key": "" }), false);
+  check("clientHasAuth false when absent", clientHasAuth({ "content-type": "x" }), false);
+  check("validateConfig accepts auth.fallback",
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: true } }] }).routes[0].auth.fallback, true);
+  let fbBadThrew = false;
+  try { validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: "yes" } }] }); } catch { fbBadThrew = true; }
+  check("validateConfig rejects non-boolean fallback", fbBadThrew, true);
 
   // ── validateConfig: failoverGroups ─────────────────────────────────────────
   const baseRoute = { routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }] };
@@ -1080,6 +1121,77 @@ async function main() {
       await close(grpA.server);
       await close(grpB.server);
       await close(grpC.server);
+    }
+  }
+
+  // ── fallback auth e2e (client token wins; else inject the proxy key) ───────
+  {
+    process.env.FB_PROXY_KEY = "PROXY-SIDE-KEY";
+    const fbStub = makeFlexStub(200);
+    const fbPort = await listen(fbStub.server);
+    const fbRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${fbPort}`,
+          auth: { header: "x-api-key", keyEnv: "FB_PROXY_KEY", fallback: true } },
+        { match: "bearer-*", base_url: `http://127.0.0.1:${fbPort}`,
+          auth: { header: "Authorization", scheme: "Bearer", keyEnv: "FB_PROXY_KEY", fallback: true } },
+      ],
+    });
+    const fbRouterPort = await listen(fbRouter);
+    try {
+      // FB1. Client flew its OWN key → forward it, do NOT inject the proxy key.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, { "x-api-key": "CLIENT-OWN-KEY" });
+      check("FB1: client's own key is forwarded", fbStub.received[fbStub.received.length - 1].headers["x-api-key"], "CLIENT-OWN-KEY");
+
+      // FB2. Client sent NO auth → inject the proxy's key.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, {});
+      check("FB2: proxy key injected when client sends none", fbStub.received[fbStub.received.length - 1].headers["x-api-key"], "PROXY-SIDE-KEY");
+
+      // FB3. Client flew an Authorization bearer (OAuth-style) → forwarded verbatim.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, { authorization: "Bearer CLIENT-OAUTH" });
+      check("FB3: client's bearer token is forwarded", fbStub.received[fbStub.received.length - 1].headers["authorization"], "Bearer CLIENT-OAUTH");
+
+      // FB4. Bearer-scheme fallback route, no client auth → inject "Bearer <proxy key>".
+      await requestH(fbRouterPort, { model: "bearer-x", messages: [] }, {});
+      check("FB4: proxy bearer injected when client sends none", fbStub.received[fbStub.received.length - 1].headers["authorization"], "Bearer PROXY-SIDE-KEY");
+    } finally {
+      delete process.env.FB_PROXY_KEY;
+      await close(fbRouter);
+      await close(fbStub.server);
+    }
+  }
+
+  // ── group-reset endpoint (wind a stuck offset back without a restart) ──────
+  {
+    process.env.GR_KEY = "x";
+    const grStub = makeFlexStub(200);
+    const grPort = await listen(grStub.server);
+    const grRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      dashboard: true,
+      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+        { match: "glm-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+      ],
+    });
+    const grRouterPort = await listen(grRouter);
+    try {
+      // Simulate a stuck double-shift.
+      grRouter._modelpipe.groupState[0].offset = 2;
+      const r1 = await postPath(grRouterPort, "/v1/failover/reset?group=0");
+      check("group reset: endpoint matched despite query string", r1.status, 200);
+      check("group reset: offset wound back to 0", grRouter._modelpipe.groupState[0].offset, 0);
+      check("group reset: reported cleared", JSON.parse(r1.body).cleared, 1);
+      // Unknown group → 400.
+      const r2 = await postPath(grRouterPort, "/v1/failover/reset?group=9");
+      check("group reset: unknown group → 400", r2.status, 400);
+    } finally {
+      delete process.env.GR_KEY;
+      await close(grRouter);
+      await close(grStub.server);
     }
   }
 

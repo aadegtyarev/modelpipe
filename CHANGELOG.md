@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Fallback auth** (`auth.fallback: true` on a key-swap route): forward the client's own
+  auth header when it sent one, and inject `keyEnv` only when it didn't ("the token that
+  flies wins, else the proxy's"). Works for `x-api-key` and `Authorization: Bearer` (via
+  `scheme`). New pure exports `isFallbackAuth`, `clientHasAuth`.
+- `POST /v1/failover/reset?group=N` winds a single group's shift offset back without a
+  restart (unsticks a rare double-shift). Also fixed the reset endpoint to match its path
+  when a query string is present (`?model=`/`?group=` previously fell through and 404'd).
+
 ## [0.7.0] - 2026-07-04
 
 ### Added

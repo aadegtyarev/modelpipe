@@ -175,7 +175,7 @@ config only names the env var, read at request time and never logged.
 | --- | --- | --- | --- |
 | `match` | string | **required** | Glob pattern over the model id (`*` is the only wildcard). First match wins — order specific before broad. |
 | `base_url` | string (URL) | **required** | Backend origin. The client's `/v1/messages` path is appended. |
-| `auth` | string or object | **required** | `"passthrough"` forwards the client's auth header unchanged. Object `{header, keyEnv, scheme?}` swaps in a backend key: `header` is the header name (e.g. `x-api-key`), `keyEnv` is the **name** of the env var holding the key (never the key value), `scheme` is an optional prefix (e.g. `"Bearer"` → `Authorization: Bearer <key>`). |
+| `auth` | string or object | **required** | `"passthrough"` forwards the client's auth header unchanged. Object `{header, keyEnv, scheme?, fallback?}` swaps in a backend key: `header` is the header name (e.g. `x-api-key`), `keyEnv` is the **name** of the env var holding the key (never the key value), `scheme` is an optional prefix (e.g. `"Bearer"` → `Authorization: Bearer <key>`). `fallback: true` = **use the client's own token if it flew, else inject `keyEnv`** (see [Fallback auth](#fallback-auth-use-the-clients-token-else-the-proxys)). |
 | `billing` | `"metered"` `"subscription"` | derived | How the dashboard reports money. `metered` = pay-as-you-go (real per-token $). `subscription` = flat plan (tokens + "flat plan" label, no fabricated $). Default: passthrough ⇒ subscription, key-swap ⇒ metered. |
 | `vision` | boolean | `true` | `false` declares this backend has no vision. Image-bearing requests skip straight to the `forImages` target — needed when a backend doesn't 400 on images (soft-200 refusal, server-side image tool). Text-only calls route normally. |
 | `forImages` | boolean | — | Set `true` on **exactly one** route to mark it the vision fallback target. |
@@ -199,6 +199,34 @@ A model-bearing turn can carry an image. modelpipe handles three cases:
   non-vision: an image-bearing request matched by it goes **straight** to the `forImages`
   target (with the `forImagesModel` rewrite), never to that backend first. Text-only
   turns route normally; default is `true`.
+
+## Fallback auth: use the client's token, else the proxy's
+
+There are three ways a route can authenticate to its backend:
+
+- **`"passthrough"`** — always forward the client's own auth header (a subscription/OAuth
+  session with no backend key).
+- **key-swap `{header, keyEnv}`** — always strip the client's auth and inject the proxy's key.
+- **fallback `{header, keyEnv, fallback: true}`** — **the token that flies wins.** If the
+  client sent its own auth (`x-api-key` or `Authorization`), forward it unchanged; only when
+  the client sent none does the proxy inject `keyEnv`. Lets Claude Code pass its own token
+  through while the proxy's key covers clients that send nothing.
+
+```json
+{ "match": "claude-*", "base_url": "https://api.anthropic.com",
+  "auth": { "header": "x-api-key", "keyEnv": "ANTHROPIC_API_KEY", "fallback": true } }
+```
+
+The injected header respects `scheme`, so a Bearer token works too:
+`{ "header": "Authorization", "scheme": "Bearer", "keyEnv": "ANTHROPIC_OAUTH_TOKEN", "fallback": true }`.
+
+> **⚠️ API key vs subscription OAuth token — they are different.** An **API key**
+> (`sk-ant-api…`, sent as `x-api-key`) is long-lived — perfect for `fallback`/key-swap: set
+> it once. A **subscription OAuth token** (`sk-ant-oat…`, sent as `Authorization: Bearer`)
+> is **short-lived and auto-refreshed by Claude Code** — pasting a static one into the proxy
+> env works only until it expires (hours), then breaks. For a subscription, prefer plain
+> **`"passthrough"`**: Claude Code flies its fresh token every request and the proxy just
+> forwards it — nothing to store, nothing to refresh. Use `fallback` with a real API key.
 
 ## Inspecting a config — `--list`
 
@@ -286,7 +314,7 @@ Settings (⚙) or `config.tokenPrices`.
 | `POST /v1/sessions/reset` | Archives current session and starts a new one. |
 | `POST /v1/token-prices` | Updates metered API token prices in-memory + persists them. |
 | `POST /v1/failover` | Sets failover pairs (authoritative) and/or cooldown; persists them. |
-| `POST /v1/failover/reset` | Clears all (or one, via `?model=X`) active failover state and group shifts. |
+| `POST /v1/failover/reset` | No restart needed. No param → clear all pair state + wind every group offset back. `?model=X` → clear one model's pair state. `?group=N` → wind group #N's offset back (unsticks a rare double-shift). |
 
 All endpoints are JSON, secret-free (no keys, no env-var names, only aggregated counts),
 served only on localhost.
@@ -343,6 +371,14 @@ the next tier isn't doubly loaded. That's `failoverGroups`:
 - The **head** (index 0) may be a glob; every lower tier is a rewrite target and **must be a
   concrete model id**. Each tier needs a matching route. Groups take precedence over
   `failover` pairs for any model on a ladder.
+- **Recovery** works even for a passthrough/glob head (which the background pinger can't
+  probe): after the cooldown, the next head request is sent to the real head with its real
+  model id, and a healthy reply winds the whole ladder back one.
+- **Limitation:** the shift is a single scalar offset, so it can't wind back *past* a still-
+  down middle tier — if both the head and a middle tier fail (offset 2) and only the head
+  later recovers, head traffic stays on the lower tier until the middle recovers too. Rare
+  (double failure), self-limiting, and fixable without a restart via
+  `POST /v1/failover/reset?group=N`.
 
 **Routing to other providers.** A backup (pair value or ladder tier) can target any provider
 — including OpenRouter — as long as a route matches its id. To fail opus over to Claude via
