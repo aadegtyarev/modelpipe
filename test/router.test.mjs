@@ -32,6 +32,11 @@ import {
   pickVisionRoute,
   validateConfig,
   listConfig,
+  ladderPosition,
+  effectiveLadderModel,
+  resolveGroup,
+  isFallbackAuth,
+  clientHasAuth,
 } from "../src/router.mjs";
 
 let pass = 0;
@@ -166,6 +171,31 @@ function get(port, urlPath) {
     );
     req.on("error", reject);
     req.end();
+  });
+}
+
+// POST /v1/messages with caller-controlled headers (to exercise fallback auth: send or
+// omit the client's own auth header). Unlike `request`, sets NO auth header by default.
+function requestH(port, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(payload));
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+        headers: { "content-type": "application/json", "content-length": data.length, ...headers } },
+      (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8"), headers: res.headers })); },
+    );
+    req.on("error", reject); req.write(data); req.end();
+  });
+}
+
+// A bare POST to an arbitrary path (for management endpoints like /v1/failover/reset).
+function postPath(port, urlPath) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: urlPath, method: "POST" },
+      (res) => { const c = []; res.on("data", (x) => c.push(x)); res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(c).toString("utf8") })); },
+    );
+    req.on("error", reject); req.end();
   });
 }
 
@@ -408,6 +438,58 @@ async function main() {
   check("pickFailoverModel empty string model ⇒ null", pickFailoverModel({ "a-*": "b" }, ""), null);
   check("pickFailoverModel exact match", pickFailoverModel({ "glm-5.1": "deepseek-v4-pro" }, "glm-5.1"), "deepseek-v4-pro");
   check("pickFailoverModel first match wins", pickFailoverModel({ "claude-*": "glm-5.1", "claude-opus-*": "deepseek" }, "claude-opus-4-8"), "glm-5.1");
+
+  // ── failover GROUPS: pure helpers ──────────────────────────────────────────
+  const LADDER = ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"];
+  check("ladderPosition head glob matches", ladderPosition(LADDER, "claude-opus-4-8"), 0);
+  check("ladderPosition concrete tier matches", ladderPosition(LADDER, "glm-5.1"), 1);
+  check("ladderPosition last tier matches", ladderPosition(LADDER, "deepseek-v4-pro"), 2);
+  check("ladderPosition no match ⇒ -1", ladderPosition(LADDER, "gpt-x"), -1);
+  check("ladderPosition empty model ⇒ -1", ladderPosition(LADDER, ""), -1);
+  check("effectiveLadderModel offset 0 = self", effectiveLadderModel(LADDER, 0, 0), "claude-opus-*");
+  check("effectiveLadderModel offset 1 shifts head→glm", effectiveLadderModel(LADDER, 1, 0), "glm-5.1");
+  check("effectiveLadderModel offset 1 shifts glm→deepseek", effectiveLadderModel(LADDER, 1, 1), "deepseek-v4-pro");
+  check("effectiveLadderModel clamps at last tier", effectiveLadderModel(LADDER, 5, 2), "deepseek-v4-pro");
+  const groups = [{ ladder: LADDER, mode: "shift" }];
+  const gs0 = [{ offset: 0 }];
+  const gs1 = [{ offset: 1 }];
+  check("resolveGroup offset 0: opus serves itself", resolveGroup(groups, gs0, "claude-opus-4-8").effectiveModel, "claude-opus-*");
+  check("resolveGroup offset 1: opus → glm", resolveGroup(groups, gs1, "claude-opus-4-8").effectiveModel, "glm-5.1");
+  check("resolveGroup offset 1: glm → deepseek (whole ladder shifts)", resolveGroup(groups, gs1, "glm-5.1").effectiveModel, "deepseek-v4-pro");
+  check("resolveGroup returns position", resolveGroup(groups, gs0, "glm-5.1").position, 1);
+  check("resolveGroup no ladder match ⇒ null", resolveGroup(groups, gs0, "gpt-x"), null);
+  check("resolveGroup no groups ⇒ null", resolveGroup(undefined, gs0, "glm-5.1"), null);
+
+  // ── fallback auth (pure) ────────────────────────────────────────────────────
+  check("isFallbackAuth true when flagged", isFallbackAuth({ auth: { header: "x-api-key", keyEnv: "K", fallback: true } }), true);
+  check("isFallbackAuth false by default", isFallbackAuth({ auth: { header: "x-api-key", keyEnv: "K" } }), false);
+  check("isFallbackAuth false for passthrough", isFallbackAuth({ auth: "passthrough" }), false);
+  check("clientHasAuth true with x-api-key", clientHasAuth({ "x-api-key": "sk" }), true);
+  check("clientHasAuth true with authorization", clientHasAuth({ authorization: "Bearer t" }), true);
+  check("clientHasAuth false when empty", clientHasAuth({ "x-api-key": "" }), false);
+  check("clientHasAuth false when absent", clientHasAuth({ "content-type": "x" }), false);
+  check("validateConfig accepts auth.fallback",
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: true } }] }).routes[0].auth.fallback, true);
+  let fbBadThrew = false;
+  try { validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K", fallback: "yes" } }] }); } catch { fbBadThrew = true; }
+  check("validateConfig rejects non-boolean fallback", fbBadThrew, true);
+
+  // ── validateConfig: failoverGroups ─────────────────────────────────────────
+  const baseRoute = { routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }] };
+  check("validateConfig accepts valid failoverGroups",
+    validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1", "c-1"], mode: "shift" }] }).failoverGroups[0].mode, "shift");
+  let grpNotArrThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: {} }); } catch { grpNotArrThrew = true; }
+  check("validateConfig rejects non-array failoverGroups", grpNotArrThrew, true);
+  let grpShortThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*"] }] }); } catch { grpShortThrew = true; }
+  check("validateConfig rejects ladder < 2 tiers", grpShortThrew, true);
+  let grpGlobTargetThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-*"] }] }); } catch { grpGlobTargetThrew = true; }
+  check("validateConfig rejects glob in a lower (target) tier", grpGlobTargetThrew, true);
+  let grpBadModeThrew = false;
+  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1"], mode: "wat" }] }); } catch { grpBadModeThrew = true; }
+  check("validateConfig rejects bad group mode", grpBadModeThrew, true);
 
   // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
   const listSample = {
@@ -941,6 +1023,176 @@ async function main() {
     await close(foA.server);
     await close(foB.server);
     await close(foC.server);
+  }
+
+  // ── failover GROUP shift e2e (the whole ladder moves down together) ────────
+  {
+    process.env.TEST_GRP_KEY = "GRP-SECRET";
+    const grpA = makeFlexStub(200); // claude-* backend (head)
+    const grpB = makeFlexStub(200); // glm-5.1 backend
+    const grpC = makeFlexStub(200); // deepseek backend
+    const grpAPort = await listen(grpA.server);
+    const grpBPort = await listen(grpB.server);
+    const grpCPort = await listen(grpC.server);
+    const grpConfig = {
+      listen: { host: "127.0.0.1", port: 0 },
+      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
+      failoverRecoveryIntervalMs: 1000,
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${grpAPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+        { match: "glm-5.1", base_url: `http://127.0.0.1:${grpBPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${grpCPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+      ],
+    };
+    const grpRouter = createRouter(grpConfig);
+    const grpPort = await listen(grpRouter);
+    try {
+      // G0. Healthy head at offset 0 must forward the ORIGINAL concrete model id, NOT the
+      //     ladder's glob head ("claude-opus-*"). Guards the glob-head rewrite bug.
+      grpA.setStatus(200);
+      const g0 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G0" }] });
+      check("G0 group: healthy head serves itself", g0.status, 200);
+      check("G0 group: forwards the REAL model id (not the glob)", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
+      check("G0 group: offset still 0", grpRouter._modelpipe.groupState[0].offset, 0);
+      grpA.received.length = 0;
+
+      // G1. Head (opus) 429 → reactive shift to glm; offset becomes 1.
+      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
+      grpB.setStatus(200);
+      const g1 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G1" }] });
+      check("G1 group: head A hit", grpA.received.length, 1);
+      check("G1 group: head A got the real model id (not glob)", JSON.parse(grpA.received[0].body).model, "claude-opus-4-8");
+      check("G1 group: glm B served the reroute", grpB.received.length, 1);
+      check("G1 group: client gets 200", g1.status, 200);
+      check("G1 group: B got rewritten model", JSON.parse(grpB.received[0].body).model, "glm-5.1");
+      check("G1 group: offset shifted to 1", grpRouter._modelpipe.groupState[0].offset, 1);
+
+      // G2. THE KEY FEATURE: glm's OWN traffic now pre-routes to deepseek (whole ladder
+      //     shifted), even though glm itself never failed.
+      const cBefore = grpC.received.length;
+      const bBefore = grpB.received.length;
+      grpC.setStatus(200);
+      const g2 = await request(grpPort, { model: "glm-5.1", messages: [{ role: "user", content: "G2" }] });
+      check("G2 group: glm traffic shifted to deepseek", grpC.received.length, cBefore + 1);
+      check("G2 group: glm backend B NOT hit for glm traffic", grpB.received.length, bBefore);
+      check("G2 group: deepseek got rewritten model", JSON.parse(grpC.received[grpC.received.length - 1].body).model, "deepseek-v4-pro");
+      check("G2 group: client gets 200", g2.status, 200);
+
+      // G3. opus pre-routes to glm during shift (head A skipped).
+      const aBefore3 = grpA.received.length;
+      const bBefore3 = grpB.received.length;
+      const g3 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G3" }] });
+      check("G3 group: head A skipped (pre-route)", grpA.received.length, aBefore3);
+      check("G3 group: glm B served opus", grpB.received.length, bBefore3 + 1);
+      check("G3 group: client gets 200", g3.status, 200);
+
+      // G4. The synthetic pinger must NOT probe a GLOB head (ladder[offset-1]="claude-opus-*"):
+      //     a glob has no concrete id to ping with, so the pinger skips it and offset stays.
+      //     (Recovery for a glob/passthrough head is the live-request path in G4b.)
+      grpA.setStatus(200);
+      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // ancient → cooldown elapsed
+      const pinger = grpRouter._modelpipe.failoverPinger;
+      await pinger.poll();
+      check("G4 group: pinger does NOT wind back a glob head (offset stays 1)", grpRouter._modelpipe.groupState[0].offset, 1);
+
+      // G4b. LIVE-REQUEST recovery (the passthrough/glob-head path the pinger can't probe):
+      //      force a shift, then a head request after cooldown probes the real head and
+      //      winds back on success — no synthetic ping involved.
+      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
+      await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-shift" }] });
+      check("G4b: shifted to offset 1", grpRouter._modelpipe.groupState[0].offset, 1);
+      grpA.setStatus(200); // head recovered
+      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // cooldown elapsed
+      const aBefore4b = grpA.received.length;
+      const g4b = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-probe" }] });
+      check("G4b: live head probe hit the real head A", grpA.received.length, aBefore4b + 1);
+      check("G4b: probe forwarded the real model id", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
+      check("G4b: client got 200", g4b.status, 200);
+      check("G4b: offset wound back to 0 by the live request", grpRouter._modelpipe.groupState[0].offset, 0);
+
+      // G5. After recovery, opus serves itself again.
+      const aBefore5 = grpA.received.length;
+      const g5 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G5" }] });
+      check("G5 group: head A serves itself after recovery", grpA.received.length, aBefore5 + 1);
+      check("G5 group: client gets 200", g5.status, 200);
+    } finally {
+      delete process.env.TEST_GRP_KEY;
+      await close(grpRouter);
+      await close(grpA.server);
+      await close(grpB.server);
+      await close(grpC.server);
+    }
+  }
+
+  // ── fallback auth e2e (client token wins; else inject the proxy key) ───────
+  {
+    process.env.FB_PROXY_KEY = "PROXY-SIDE-KEY";
+    const fbStub = makeFlexStub(200);
+    const fbPort = await listen(fbStub.server);
+    const fbRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${fbPort}`,
+          auth: { header: "x-api-key", keyEnv: "FB_PROXY_KEY", fallback: true } },
+        { match: "bearer-*", base_url: `http://127.0.0.1:${fbPort}`,
+          auth: { header: "Authorization", scheme: "Bearer", keyEnv: "FB_PROXY_KEY", fallback: true } },
+      ],
+    });
+    const fbRouterPort = await listen(fbRouter);
+    try {
+      // FB1. Client flew its OWN key → forward it, do NOT inject the proxy key.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, { "x-api-key": "CLIENT-OWN-KEY" });
+      check("FB1: client's own key is forwarded", fbStub.received[fbStub.received.length - 1].headers["x-api-key"], "CLIENT-OWN-KEY");
+
+      // FB2. Client sent NO auth → inject the proxy's key.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, {});
+      check("FB2: proxy key injected when client sends none", fbStub.received[fbStub.received.length - 1].headers["x-api-key"], "PROXY-SIDE-KEY");
+
+      // FB3. Client flew an Authorization bearer (OAuth-style) → forwarded verbatim.
+      await requestH(fbRouterPort, { model: "claude-opus-4-8", messages: [] }, { authorization: "Bearer CLIENT-OAUTH" });
+      check("FB3: client's bearer token is forwarded", fbStub.received[fbStub.received.length - 1].headers["authorization"], "Bearer CLIENT-OAUTH");
+
+      // FB4. Bearer-scheme fallback route, no client auth → inject "Bearer <proxy key>".
+      await requestH(fbRouterPort, { model: "bearer-x", messages: [] }, {});
+      check("FB4: proxy bearer injected when client sends none", fbStub.received[fbStub.received.length - 1].headers["authorization"], "Bearer PROXY-SIDE-KEY");
+    } finally {
+      delete process.env.FB_PROXY_KEY;
+      await close(fbRouter);
+      await close(fbStub.server);
+    }
+  }
+
+  // ── group-reset endpoint (wind a stuck offset back without a restart) ──────
+  {
+    process.env.GR_KEY = "x";
+    const grStub = makeFlexStub(200);
+    const grPort = await listen(grStub.server);
+    const grRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      dashboard: true,
+      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
+      routes: [
+        { match: "claude-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+        { match: "glm-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+      ],
+    });
+    const grRouterPort = await listen(grRouter);
+    try {
+      // Simulate a stuck double-shift.
+      grRouter._modelpipe.groupState[0].offset = 2;
+      const r1 = await postPath(grRouterPort, "/v1/failover/reset?group=0");
+      check("group reset: endpoint matched despite query string", r1.status, 200);
+      check("group reset: offset wound back to 0", grRouter._modelpipe.groupState[0].offset, 0);
+      check("group reset: reported cleared", JSON.parse(r1.body).cleared, 1);
+      // Unknown group → 400.
+      const r2 = await postPath(grRouterPort, "/v1/failover/reset?group=9");
+      check("group reset: unknown group → 400", r2.status, 400);
+    } finally {
+      delete process.env.GR_KEY;
+      await close(grRouter);
+      await close(grStub.server);
+    }
   }
 
   if (fails.length) {
