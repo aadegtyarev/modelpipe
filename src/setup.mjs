@@ -142,9 +142,33 @@ export async function runSetup(argv = []) {
     const port = Number(await ask("Listen port", "8787")) || 8787;
     const dashboard = await yesno("Enable the dashboard (/dashboard)?", true);
 
+    // Optional automatic failover: a ladder over the chosen models + progressive retry.
+    // A "shift" ladder drops the WHOLE priority chain one tier when the head provider fails
+    // (e.g. opus down → opus's traffic AND every backup all move down together); "cascade"
+    // just walks the ladder per request on error. Only the head (first) may be a glob.
+    let failoverGroups, failoverRecoveryBackoffMs;
+    const ladderCandidates = chosen.filter((c) => c.route.match !== "*/*").map((c) => c.p.defaultModel).filter(Boolean);
+    if (ladderCandidates.length >= 2 && await yesno("Set up automatic failover (reroute to a backup model when a provider is down)?", true)) {
+      const suggestion = ladderCandidates.join(" ");
+      const raw = await ask("  failover ladder, top→bottom (head first; only the head may be a glob)", suggestion);
+      const ladder = raw.split(/\s+/).filter(Boolean);
+      if (ladder.length >= 2) {
+        const modeIn = await ask("  mode: (1) shift — head fails, whole ladder drops together  (2) cascade — walk down per request", "1");
+        failoverGroups = [{ ladder, mode: modeIn.trim() === "2" ? "cascade" : "shift" }];
+        const mins = await ask("  recovery retries in minutes (progressive backoff, comma-sep — so we don't hammer)", "1,5,10");
+        const arr = mins.split(",").map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0).map((m) => Math.round(m * 60000));
+        if (arr.length) failoverRecoveryBackoffMs = arr;
+      } else {
+        process.stdout.write("  (skipped — a ladder needs at least 2 model ids)\n");
+      }
+      process.stdout.write("\n");
+    }
+
     // Order specific globs before the OpenRouter */* catch-all (first match wins).
     const routes = chosen.map((c) => c.route).sort((a, b) => (a.match === "*/*" ? 1 : 0) - (b.match === "*/*" ? 1 : 0));
     const config = { listen: { host: "127.0.0.1", port }, dashboard, routes };
+    if (failoverGroups) config.failoverGroups = failoverGroups;
+    if (failoverRecoveryBackoffMs) config.failoverRecoveryBackoffMs = failoverRecoveryBackoffMs;
     validateConfig(config); // fail loudly before writing anything
 
     fs.writeFileSync(routesPath, JSON.stringify(config, null, 2) + "\n", "utf8");

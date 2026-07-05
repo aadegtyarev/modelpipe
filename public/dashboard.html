@@ -83,6 +83,46 @@ canvas{display:block;width:100%;height:200px}
 .routing{background:var(--card-bg);border:1px solid var(--orange);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:14px}
 .routing .hdr{color:var(--orange);font-weight:600;margin-bottom:4px}
 .routing .line{padding:2px 0}
+
+/* Failover group editor */
+.grp{border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:10px 0;background:var(--card-bg)}
+.grp-hd{display:flex;align-items:center;gap:10px;margin-bottom:4px;flex-wrap:wrap}
+.grp-title{font-weight:600}
+.grp-mode{width:auto;min-width:210px}
+.grp-hint{color:var(--muted);font-size:12px;margin-bottom:10px}
+.tiers{display:flex;flex-direction:column}
+.tier{display:flex;align-items:center;gap:10px}
+.t-num{width:22px;height:22px;flex:0 0 22px;border-radius:50%;background:var(--border);color:var(--text);font-size:12px;display:flex;align-items:center;justify-content:center}
+.t-in{flex:1;max-width:340px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.t-tag{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.t-del{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;width:24px;height:24px;cursor:pointer;font-size:14px;line-height:1}
+.t-del:hover{color:#fff;background:var(--red);border-color:var(--red)}
+.t-arrow{color:var(--text);font-size:13px;font-weight:600;margin:2px 0 2px 6px;padding-left:8px;border-left:2px solid var(--muted);min-height:18px;display:flex;align-items:center;gap:6px}
+.t-arrow span{opacity:.7;font-weight:400;font-size:12px}
+.t-add{background:transparent;color:var(--blue);border:1px dashed var(--border);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+.t-add:hover{border-color:var(--blue)}
+.grp-save{background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer}
+.grp-del{background:transparent;color:var(--red);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}
+.grp-del:hover{background:var(--red);color:#fff;border-color:var(--red)}
+.grp-status{margin-top:10px;font-size:13px;color:var(--muted)}
+.wb{background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer}
+.t-dead{color:var(--red);font-weight:600}
+.t-live{color:var(--orange);font-weight:600}
+.muted{color:var(--muted)}
+
+/* Scenario ("what happens") view under each ladder */
+.scen{margin-top:12px;border-top:1px dashed var(--border);padding-top:10px}
+.scen-hd{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.scen-row{display:flex;gap:10px;align-items:flex-start;padding:6px 8px;border-radius:6px;margin:4px 0}
+.scen-live{background:rgba(240,160,40,.10);border:1px solid var(--orange)}
+.scen-badge{flex:0 0 auto;font-size:11px;padding:2px 9px;border-radius:10px;background:var(--border);color:var(--text);white-space:nowrap;margin-top:1px}
+.scen-live .scen-badge{background:var(--orange);color:#fff}
+.scen-body{font-size:13px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.scen-when{color:var(--text)}
+.scen-mut{color:var(--muted)}
+.sr{display:inline-block;margin-right:14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--text)}
+.sr b{color:var(--orange);font-weight:700}
+.scen-foot{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.45}
 </style>
 </head>
 <body>
@@ -118,7 +158,16 @@ canvas{display:block;width:100%;height:200px}
     <input class="i" id="foBackup" placeholder="backup model (e.g. glm-5.1)" style="flex:1">
     <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addFailoverPair()">Add</button>
   </div>
-  <div id="failoverGroups" style="margin-top:10px"></div>
+  <h3 style="margin:18px 0 4px">Failover groups</h3>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">A priority ladder — each tier falls to the one below it when it's unavailable. <b>shift</b>: when the head fails, the whole ladder drops one step together. <b>cascade</b>: each request just walks down on error. Only the head (top) may be a glob (<code>*</code>).</div>
+  <div id="groupsDirtyBar"></div>
+  <div id="failoverGroups"></div>
+  <button class="t-add" style="margin-top:8px" onclick="addGroup()">+ Add failover group</button>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:16px;border-top:1px solid var(--border);padding-top:12px;flex-wrap:wrap">
+    <span style="color:var(--muted);font-size:13px">Recovery retries (minutes, comma-sep — progressive backoff so a down provider isn't hammered):</span>
+    <input class="i" id="foBackoff" placeholder="e.g. 1,5,10 — blank = flat" style="width:180px">
+    <button class="save" onclick="saveBackoff()">Save retries</button>
+  </div>
   <div id="accountPools" style="margin-top:10px"></div>
   <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
 </div>
@@ -148,6 +197,9 @@ let auto=true;
 let histMode=null;               // null = live, id = viewing an archived session
 let billingByProvider={};        // providerId -> "metered" | "subscription"
 let failoverPairs={};
+let failoverGroups=[];            // editable mirror of the server's ladder list
+let groupRuntime=[];              // per-group {offset, effective} from the server (live shift state)
+let groupsDirty=false;            // true while the user has unsaved group edits (blocks refresh clobber)
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
@@ -259,25 +311,17 @@ function renderFailover(fo){
   if(!phtml)phtml='<span style="color:var(--muted)">no pairs configured</span>';
   $('failoverPairs').innerHTML=phtml;
 
-  // Groups (config-file only; shown read-only with current shift state)
+  // Groups — keep the live shift state for status, but DON'T rehydrate the editable model
+  // (or re-render the DOM) while the user has unsaved edits: the 2s auto-refresh must not
+  // wipe what they're typing. Also never clobber the backoff field while it's focused.
   const groups=fo.groups||[];
-  let ghtml='';
-  if(groups.length){
-    ghtml='<h3>Failover groups (config file — '+groups.length+')</h3>';
-    groups.forEach((grp,i)=>{
-      const shifted=grp.offset>0;
-      ghtml+='<div style="margin:3px 0">'+
-        '<span style="color:var(--muted)">['+grp.mode+']</span> '+
-        grp.ladder.map((t,p)=>{
-          const eff=grp.effective[p];
-          const active=eff!==t;
-          return '<span style="color:'+(active?'var(--orange)':'var(--muted)')+'">'+escHtml(t)+(active?' →'+escHtml(eff):'')+'</span>';
-        }).join(' <span style="color:var(--border)">|</span> ')+
-        (shifted?' <span class="tag sub">shifted +'+grp.offset+'</span>':' <span class="tag metered">normal</span>')+
-        '</div>';
-    });
+  groupRuntime=groups.map(g=>({offset:g.offset||0,effective:g.effective||[]}));
+  if(!groupsDirty){
+    failoverGroups=groups.map(g=>({ladder:g.ladder.slice(),mode:g.mode}));
+    renderGroups();
   }
-  $('failoverGroups').innerHTML=ghtml;
+  if(document.activeElement!==$('foBackoff'))
+    $('foBackoff').value=Array.isArray(fo.backoffMs)?fo.backoffMs.map(ms=>+(ms/60000).toFixed(4)).join(','):'';
 
   // Active reactive failovers
   const entries=Object.entries(fo.active||{});
@@ -292,10 +336,139 @@ function renderFailover(fo){
   }
   $('failoverActive').innerHTML=ahtml;
 }
-async function saveFailover(){await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pairs:failoverPairs})});load();}
+async function saveFailover(){
+  const err=validateGroupsLocal();
+  if(err){alert(err);return;}
+  const r=await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({pairs:failoverPairs,groups:failoverGroups.map(g=>({ladder:g.ladder,mode:g.mode}))})});
+  if(!r.ok){alert('Save failed: '+(await r.text()));return;}
+  groupsDirty=false;updateDirtyBar();load();refreshFailover();
+}
 async function addFailoverPair(){const p=$('foPattern').value.trim(),b=$('foBackup').value.trim();if(!p||!b)return;failoverPairs[p]=b;await saveFailover();$('foPattern').value='';$('foBackup').value='';}
 async function removeFailoverPair(p){delete failoverPairs[p];await saveFailover();}
 async function resetFailover(){await fetch("/v1/failover/reset",{method:"POST"});load();}
+// Re-render the settings-panel failover editor from the server. load() only refreshes the
+// top banner, so anything that changes server-side failover state must call this too.
+function refreshFailover(){return fetch("/v1/failover").then(r=>r.json()).then(renderFailover).catch(()=>{});}
+
+// ── Failover groups (ladder editor) ─────────────────────────────────────────────
+// The ladder is edited as a vertical stack of tiers; each "↓" between them means
+// "this tier is unavailable → fall to the one below". Edits stay local (groupsDirty)
+// until Save, so the 2s auto-refresh can't wipe them.
+function ladderChain(grp){ // compact chain — used by the top routing banner
+  const off=grp.offset||0;
+  return grp.ladder.map((t,p)=>{
+    let color='var(--muted)',deco='';
+    if(p<off){color='var(--red)';deco='text-decoration:line-through;opacity:.55';}
+    else if(p===off&&off>0){color='var(--orange)';deco='font-weight:600';}
+    return '<span style="color:'+color+';'+deco+'">'+escHtml(t)+'</span>';
+  }).join(' <span style="color:var(--text)">→</span> ');
+}
+// Derived, read-only "what happens" view — divides the single shift-ladder into the
+// scenarios the user thinks in: normal vs head-down, plus the per-request single steps.
+// Regenerated from the ladder on every render, so it stays correct as tiers are edited.
+function scenarioBlocks(grp,rt){
+  const L=grp.ladder.map(s=>(s||'').trim());
+  if(L.length<2||L.some(x=>!x)) return ''; // hide while a tier is blank mid-edit
+  const n=L.length,off=rt.offset||0,mode=grp.mode||'shift';
+  const redirects=(k)=>{const r=[];for(let p=0;p<n;p++){const to=L[Math.min(p+k,n-1)];if(to!==L[p])r.push('<span class="sr">'+escHtml(L[p])+' <b>→</b> '+escHtml(to)+'</span>');}return r.join('');};
+  let h='<div class="scen"><div class="scen-hd">Что произойдёт</div>';
+  h+='<div class="scen-row'+(off===0?' scen-live':'')+'"><span class="scen-badge">норма'+(off===0?' • сейчас':'')+'</span>'+
+     '<div class="scen-body"><span class="scen-mut">все тиры живы — каждая модель работает сама, переадресации нет</span></div></div>';
+  if(mode==='shift'){
+    h+='<div class="scen-row'+(off>=1?' scen-live':'')+'"><span class="scen-badge">'+(off>=1?('сдвиг • сейчас +'+off):'голова упала')+'</span>'+
+       '<div class="scen-body"><div class="scen-when">«'+escHtml(L[0])+'» недоступна → вся лестница уезжает на тир вниз одним движением:</div>'+redirects(1)+'</div></div>';
+    h+='<div class="scen-foot">Одиночные шаги: любой тир, упавший на конкретном запросе, уводит этот запрос на следующий вниз (те же стрелки). Если недоступны и нижние тиры — доезжает до пола «'+escHtml(L[n-1])+'».</div>';
+  } else {
+    h+='<div class="scen-row"><span class="scen-badge">cascade</span><div class="scen-body"><div class="scen-when">каждый запрос при ошибке своего тира уходит на следующий вниз (лестница целиком не сдвигается):</div>'+redirects(1)+'</div></div>';
+  }
+  return h+'</div>';
+}
+function renderGroups(){
+  let h='';
+  failoverGroups.forEach((grp,gi)=>{
+    const rt=groupRuntime[gi]||{offset:0};
+    const n=grp.ladder.length;
+    h+='<div class="grp">'+
+      '<div class="grp-hd">'+
+        '<span class="grp-title">Group '+(gi+1)+'</span>'+
+        '<select class="i grp-mode" onchange="setGroupMode('+gi+',this.value)">'+
+          '<option value="shift"'+(grp.mode==='shift'?' selected':'')+'>shift — head fails → whole ladder drops</option>'+
+          '<option value="cascade"'+(grp.mode==='cascade'?' selected':'')+'>cascade — each request walks down</option>'+
+        '</select>'+
+        '<span style="flex:1"></span>'+
+        '<button class="grp-save" onclick="saveFailover()">Save</button>'+
+        '<button class="grp-del" onclick="removeFailoverGroup('+gi+')">Delete group</button>'+
+      '</div>'+
+      '<div class="grp-hint">Priority ladder — top is tried first; each tier falls to the one below when it errors or is unavailable.</div>'+
+      '<div class="tiers">';
+    grp.ladder.forEach((t,ti)=>{
+      const isHead=ti===0,isFloor=ti===n-1;
+      let badge='';
+      if(rt.offset>0){ if(ti<rt.offset)badge='<span class="t-dead">down</span>'; else if(ti===rt.offset)badge='<span class="t-live">serving now</span>'; }
+      const tag=(isHead?'head — may be a glob':(isFloor?'floor — last resort':'backup'));
+      h+='<div class="tier">'+
+           '<span class="t-num">'+(ti+1)+'</span>'+
+           '<input class="i t-in" value="'+escHtml(t)+'" placeholder="model id (e.g. glm-5.1)" oninput="setTier('+gi+','+ti+',this.value)">'+
+           '<span class="t-tag">'+tag+' '+badge+'</span>'+
+           '<button class="t-del" onclick="removeTier('+gi+','+ti+')" title="remove tier">×</button>'+
+         '</div>';
+      if(ti<n-1) h+='<div class="t-arrow">↓</div>';
+    });
+    h+='</div>'+
+      '<button class="t-add" onclick="addTier('+gi+')">+ add tier</button>'+
+      scenarioBlocks(grp,rt)+
+      '<div class="grp-status">Status: '+(rt.offset>0
+        ? '<span class="tag sub">shift +'+rt.offset+' · “'+escHtml(grp.ladder[rt.offset-1]||'')+'” down → serving from “'+escHtml(grp.ladder[rt.offset]||'')+'”</span> <button class="wb" onclick="resetGroup('+gi+')">wind back</button>'
+        : '<span class="tag metered">normal — no failover active</span>')+'</div>'+
+    '</div>';
+  });
+  if(!failoverGroups.length) h='<div class="muted" style="font-size:13px">No failover groups. Click “+ Add failover group” below.</div>';
+  $('failoverGroups').innerHTML=h;
+}
+function markDirty(){groupsDirty=true;updateDirtyBar();}
+function updateDirtyBar(){
+  const el=$('groupsDirtyBar');if(!el)return;
+  el.innerHTML=groupsDirty
+    ? '<div style="display:flex;align-items:center;gap:10px;background:rgba(240,160,40,.12);border:1px solid var(--orange);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:13px">'+
+      '<span style="color:var(--orange);font-weight:600">● Unsaved group changes</span>'+
+      '<button class="grp-save" onclick="saveFailover()">Save</button>'+
+      '<button class="wb" onclick="discardGroups()">Discard</button></div>'
+    : '';
+}
+function discardGroups(){groupsDirty=false;updateDirtyBar();refreshFailover();}
+function setTier(gi,ti,v){failoverGroups[gi].ladder[ti]=v;markDirty();}
+function setGroupMode(gi,v){failoverGroups[gi].mode=v;markDirty();renderGroups();}
+function addTier(gi){failoverGroups[gi].ladder.push('');markDirty();renderGroups();}
+function removeTier(gi,ti){
+  if(failoverGroups[gi].ladder.length<=2){alert('A ladder needs at least 2 tiers (head + one backup).');return;}
+  failoverGroups[gi].ladder.splice(ti,1);markDirty();renderGroups();
+}
+function addGroup(){failoverGroups.push({ladder:['claude-opus-*','glm-5.1'],mode:'shift'});markDirty();renderGroups();}
+function removeFailoverGroup(gi){failoverGroups.splice(gi,1);markDirty();renderGroups();}
+// Client-side mirror of the server's rules — trim empties, need >=2 tiers, glob only in head.
+function validateGroupsLocal(){
+  for(let gi=0;gi<failoverGroups.length;gi++){
+    const lad=failoverGroups[gi].ladder.map(s=>s.trim()).filter(Boolean);
+    if(lad.length<2)return 'Group '+(gi+1)+': needs at least 2 non-empty tiers.';
+    for(let j=1;j<lad.length;j++) if(lad[j].includes('*')) return 'Group '+(gi+1)+', tier '+(j+1)+' “'+lad[j]+'”: only the head (top) may be a glob.';
+    failoverGroups[gi].ladder=lad; // normalize
+  }
+  return null;
+}
+async function resetGroup(i){await fetch("/v1/failover/reset?group="+i,{method:"POST"});load();refreshFailover();}
+async function saveBackoff(){
+  const raw=$('foBackoff').value.trim();
+  let backoffMs=null;
+  if(raw){
+    const mins=raw.split(',').map(s=>parseFloat(s.trim())).filter(n=>!isNaN(n)&&n>0);
+    if(!mins.length){alert('Enter minutes like 1,5,10 (or leave blank for a flat interval).');return;}
+    backoffMs=mins.map(m=>Math.round(m*60000));
+  }
+  const r=await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({backoffMs})});
+  if(!r.ok){alert('Backoff save failed: '+(await r.text()));return;}
+  load();refreshFailover();
+}
 
 async function newSession(){await fetch("/v1/sessions/reset",{method:"POST"});histMode=null;$("sessSelect").value="";load();}
 async function showHistory(){histMode=$("sessSelect").value||null;load();}
@@ -358,10 +531,8 @@ function renderRouting(fo){
   if(!active.length&&!groups.length){$("routing").innerHTML="";return;}
   let h='<div class="routing"><div class="hdr">⚠ Routing redirected — failover active</div>';
   for(const g of groups){
-    h+='<div class="line">'+g.ladder.map((t,p)=>{
-      const eff=g.effective[p],act=eff!==t;
-      return '<span style="color:'+(act?'var(--orange)':'var(--muted)')+'">'+escHtml(t)+(act?' → '+escHtml(eff):'')+'</span>';
-    }).join(' <span style="color:var(--border)">|</span> ')+' <span class="tag sub">['+escHtml(g.mode)+'] shifted +'+g.offset+'</span></div>';
+    h+='<div class="line">['+escHtml(g.mode)+' +'+g.offset+'] '+ladderChain(g)+
+       ' <span class="tag sub">“'+escHtml(g.ladder[g.offset-1])+'” down → now on “'+escHtml(g.ladder[g.offset])+'”</span></div>';
   }
   for(const[m,s]of active){
     const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
