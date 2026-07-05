@@ -513,6 +513,19 @@ export function validateConfig(config) {
       throw new Error("config.failoverRecoveryIntervalMs: must be a number >= 1000");
     }
   }
+  // failoverRecoveryBackoffMs: optional array of increasing probe intervals, e.g.
+  // [60000, 300000, 600000] = probe a still-down primary after 1 min, then 5, then 10,
+  // capping at the last — so we back off instead of hammering. When set it overrides the
+  // flat failoverRecoveryIntervalMs for the recovery cadence.
+  if (config.failoverRecoveryBackoffMs !== undefined) {
+    const bo = config.failoverRecoveryBackoffMs;
+    if (!Array.isArray(bo) || bo.length === 0) {
+      throw new Error("config.failoverRecoveryBackoffMs: must be a non-empty array of intervals (ms)");
+    }
+    for (const [i, v] of bo.entries()) {
+      if (typeof v !== "number" || v < 1000) throw new Error(`config.failoverRecoveryBackoffMs[${i}]: must be a number >= 1000`);
+    }
+  }
 
   return config;
 }
@@ -881,6 +894,7 @@ function handleGroupFailover(ctx, status, buffered, headers, hop) {
   if (ctx.group.mode === "shift" && currentEff === gs.offset && gs.offset < last) {
     gs.offset++;
     gs.shiftedAt = Date.now();
+    gs.attempts = 0; gs.nextProbeAt = 0; // fresh backoff schedule for the newly-shifted tier
     ctx.log(`failover-group[${g}]: head tier "${ladder[currentEff]}" failing (status ${status}) — shift offset -> ${gs.offset} (whole ladder moves down one)`);
   }
 
@@ -931,6 +945,7 @@ function makeResponseHandler(ctx) {
       if (gs && gs.offset === p.fromOffset) {
         gs.offset = p.windTo;
         gs.shiftedAt = Date.now();
+        gs.attempts = 0; gs.nextProbeAt = 0; // recovered — reset the backoff schedule
         ctx.log(`failover-group[${p.groupIndex}]: head recovered on a live request — shift offset -> ${gs.offset}`);
       }
     };
@@ -1186,9 +1201,11 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
       // Only head traffic can probe this way — a lower tier's request can't test the head's
       // model. This is the group analogue of the plain-pairs cooldown fall-through below.
       if (gres.position === 0 && gs.offset > 0 &&
-          Date.now() - (gs.shiftedAt || 0) >= (config.failoverRecoveryIntervalMs || 60000)) {
+          Date.now() - (gs.shiftedAt || 0) >= recoveryWaitMs(config, gs.attempts || 0)) {
         effIndex = gs.offset - 1;
-        gs.shiftedAt = Date.now(); // hold off another probe for a full cooldown
+        gs.shiftedAt = Date.now();       // hold off another probe for the current backoff window
+        gs.attempts = (gs.attempts || 0) + 1; // widen the window if this probe also fails; windback resets it
+        gs.nextProbeAt = 0;              // let the synthetic pinger re-arm from the new shiftedAt
         groupProbe = { groupIndex: gres.groupIndex, fromOffset: gs.offset, windTo: gs.offset - 1 };
       }
       // Served by its OWN tier (effIndex === position) → pass the original body unchanged.
@@ -1280,6 +1297,17 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
 //
 // Similar to QuotaPoller in stats.mjs: setInterval + unref, best-effort.
 
+// Progressive backoff between recovery probes. Attempt N (0-based) waits
+// backoff[min(N, last)] ms — config.failoverRecoveryBackoffMs, e.g. [60000,300000,600000]
+// = 1→5→10 min — so a still-down primary is probed ever less often instead of every
+// cooldown ("не долбить"). Falls back to the flat failoverRecoveryIntervalMs (or 60s)
+// when no schedule is configured. Shared by the synthetic pinger and the live head-probe.
+export function recoveryWaitMs(config, attempts) {
+  const bo = config && config.failoverRecoveryBackoffMs;
+  if (Array.isArray(bo) && bo.length) return bo[Math.min(attempts, bo.length - 1)];
+  return (config && config.failoverRecoveryIntervalMs) || 60000;
+}
+
 class FailoverPinger {
   #failoverState;  // shared Map<modelId, {enteredAt: number}>
   #groupState;     // shared Array<{offset, shiftedAt}> parallel to config.failoverGroups
@@ -1298,16 +1326,21 @@ class FailoverPinger {
 
   async poll() {
     const now = Date.now();
-    // Plain failover pairs.
+    // Plain failover pairs — probe once this entry's backoff window has elapsed, then
+    // widen the window on each failed probe (progressive backoff).
     const toProbe = [];
     for (const [model, state] of this.#failoverState) {
-      if (now - state.enteredAt >= this.#cooldownMs) toProbe.push(model);
+      if (state.nextProbeAt === undefined) { state.attempts = 0; state.nextProbeAt = state.enteredAt + recoveryWaitMs(this.#config, 0); }
+      if (now >= state.nextProbeAt) toProbe.push(model);
     }
     for (const model of toProbe) {
       const r = await this.#probeRecovery(model);
       if (r === "recovered" || r === "no-route") {
         this.#failoverState.delete(model);
         if (r === "recovered") this.#log(`failover-recovery: ${model} primary restored, failover cleared`);
+      } else {
+        const st = this.#failoverState.get(model);
+        if (st) { st.attempts = (st.attempts || 0) + 1; st.nextProbeAt = Date.now() + recoveryWaitMs(this.#config, st.attempts); }
       }
     }
     // Failover groups in "shift" mode: probe the tier we shifted PAST (ladder[offset-1]);
@@ -1321,7 +1354,8 @@ class FailoverPinger {
     for (let g = 0; g < groups.length; g++) {
       const gs = this.#groupState[g];
       if (!gs || gs.offset <= 0) continue;
-      if (now - (gs.shiftedAt || 0) < this.#cooldownMs) continue;
+      if (!gs.nextProbeAt) { gs.attempts = 0; gs.nextProbeAt = (gs.shiftedAt || now) + recoveryWaitMs(this.#config, 0); }
+      if (now < gs.nextProbeAt) continue;
       const probeModel = groups[g].ladder[gs.offset - 1];
       // A glob tier (only the head may be one) has no concrete id to synthesize a probe
       // with — sending the glob string would be a bogus model id. Leave it to the live
@@ -1331,7 +1365,11 @@ class FailoverPinger {
       if (r === "recovered" || r === "no-route") {
         gs.offset--;
         gs.shiftedAt = Date.now();
+        gs.attempts = 0; gs.nextProbeAt = 0; // re-arm backoff for the next tier (if still shifted)
         this.#log(`failover-group[${g}]: tier "${probeModel}" restored — shift offset -> ${gs.offset} (ladder winds back up one)`);
+      } else {
+        gs.attempts = (gs.attempts || 0) + 1;
+        gs.nextProbeAt = Date.now() + recoveryWaitMs(this.#config, gs.attempts);
       }
     }
   }
@@ -1415,6 +1453,14 @@ export function createRouter(config, options = {}) {
   const dashOverrides = {
     tokenPrices: (stored && typeof stored.tokenPrices === "object") ? stored.tokenPrices : {},
     failover: (stored && typeof stored.failover === "object") ? stored.failover : {},
+    // failoverGroups: null = never edited in the UI (use the file's groups); an array
+    // (possibly empty) = the dashboard-set group list, AUTHORITATIVE across restart —
+    // an empty array means "the user deleted every group", which must survive a restart.
+    failoverGroups: (stored && Array.isArray(stored.failoverGroups)) ? stored.failoverGroups : null,
+    // failoverBackoffMs: undefined = never edited (use the file); an array = the dashboard-set
+    // progressive-retry schedule; null = explicitly cleared back to the flat cooldown.
+    failoverBackoffMs: (stored && Array.isArray(stored.failoverBackoffMs)) ? stored.failoverBackoffMs
+      : (stored && stored.failoverBackoffMs === null ? null : undefined),
     // billing: { <providerId|accountLabel>: "metered" | "subscription" } — dashboard-only
     // display override when the derived default guesses wrong (e.g. a metered z.ai key).
     billing: (stored && typeof stored.billing === "object") ? stored.billing : {},
@@ -1422,15 +1468,26 @@ export function createRouter(config, options = {}) {
   {
     const beforeTP = config.tokenPrices;
     const beforeFO = config.failover;
+    const beforeFG = config.failoverGroups;
+    const beforeBO = config.failoverRecoveryBackoffMs;
     try {
       if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
       // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
       // replace, not a merge) — so a pair removed in the UI stays removed across restart.
       if (Object.keys(dashOverrides.failover).length) config.failover = { ...dashOverrides.failover };
+      // Groups: same authoritative-replace semantics; null sentinel = leave the file's groups.
+      if (dashOverrides.failoverGroups !== null) config.failoverGroups = dashOverrides.failoverGroups;
+      // Backoff schedule: undefined = untouched, array = set, null = cleared to flat cooldown.
+      if (dashOverrides.failoverBackoffMs !== undefined) {
+        if (dashOverrides.failoverBackoffMs === null) delete config.failoverRecoveryBackoffMs;
+        else config.failoverRecoveryBackoffMs = dashOverrides.failoverBackoffMs;
+      }
       validateConfig(config);
     } catch {
       config.tokenPrices = beforeTP;
       config.failover = beforeFO;
+      config.failoverGroups = beforeFG;
+      config.failoverRecoveryBackoffMs = beforeBO;
     }
   }
   // Persist ONLY the dashboard-set overrides (best-effort).
@@ -1444,7 +1501,7 @@ export function createRouter(config, options = {}) {
   const failoverConfig = config.failover || null;
   const failoverState = new Map();
   // Per-group shift state (offset winds down/up as the head tier fails/recovers).
-  const groupState = (config.failoverGroups || []).map(() => ({ offset: 0, shiftedAt: 0 }));
+  const groupState = (config.failoverGroups || []).map(() => ({ offset: 0, shiftedAt: 0, attempts: 0, nextProbeAt: 0 }));
 
   // Account pools: per-route rotation state, keyed by the route object. Each account tracks
   // exhaustedUntil (cooldown after a rate-limit); rr is the round-robin cursor (-1 so the
@@ -1464,8 +1521,12 @@ export function createRouter(config, options = {}) {
   const hasGroups = groupState.length > 0;
   if (hasPairs || hasGroups) {
     const cooldown = config.failoverRecoveryIntervalMs || 60000;
+    // Poll at the SHORTEST backoff step so a 1-min probe can actually fire; longer steps
+    // are honoured per-entry via nextProbeAt (a 10-min entry is simply skipped until due).
+    const bo = config.failoverRecoveryBackoffMs;
+    const pollEvery = (Array.isArray(bo) && bo.length) ? bo[0] : cooldown;
     failoverPinger = new FailoverPinger(failoverState, config, log, cooldown, groupState);
-    failoverPinger.start(cooldown);
+    failoverPinger.start(pollEvery);
   }
 
   // Dashboard stats + quota polling (enabled by config.dashboard)
@@ -1567,7 +1628,13 @@ export function createRouter(config, options = {}) {
         effective: grp.ladder.map((_, p) => effectiveLadderModel(grp.ladder, (groupState[g] && groupState[g].offset) || 0, p)),
       }));
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ config: config.failover || {}, active, groups }));
+      res.end(JSON.stringify({
+        config: config.failover || {},
+        active,
+        groups,
+        cooldownMs: config.failoverRecoveryIntervalMs || 60000,
+        backoffMs: Array.isArray(config.failoverRecoveryBackoffMs) ? config.failoverRecoveryBackoffMs : null,
+      }));
       return;
     }
     // POST /v1/failover — merge failover pairs in-memory (same pattern as POST /v1/plans)
@@ -1576,7 +1643,7 @@ export function createRouter(config, options = {}) {
         try {
           const data = JSON.parse(body.toString("utf8"));
           if (typeof data !== "object") throw new Error("must be an object");
-          const { pairs, cooldownMs } = data;
+          const { pairs, groups, cooldownMs, backoffMs } = data;
           if (pairs !== undefined) {
             if (!pairs || typeof pairs !== "object") throw new Error("pairs must be an object { modelGlob: backupModelId }");
             // Validate each pair the SAME way startup does (R5): non-empty string glob →
@@ -1591,18 +1658,56 @@ export function createRouter(config, options = {}) {
             config.failover = { ...pairs };
             dashOverrides.failover = { ...pairs };
           }
+          if (groups !== undefined) {
+            // Validate groups the SAME way startup does (validateConfig): ladder of >=2
+            // ids, only the head may be a glob, lower tiers concrete, mode shift|cascade.
+            if (!Array.isArray(groups)) throw new Error("groups must be an array of { ladder, mode? }");
+            for (const [gi, grp] of groups.entries()) {
+              const at = `groups[${gi}]`;
+              if (!grp || typeof grp !== "object") throw new Error(`${at}: must be an object { ladder, mode? }`);
+              if (!Array.isArray(grp.ladder) || grp.ladder.length < 2) throw new Error(`${at}.ladder: must be an array of at least 2 model ids`);
+              for (const [j, entry] of grp.ladder.entries()) {
+                if (typeof entry !== "string" || entry.length === 0) throw new Error(`${at}.ladder[${j}]: must be a non-empty model id`);
+                if (j >= 1 && entry.includes("*")) throw new Error(`${at}.ladder[${j}] "${entry}": only the head (index 0) may be a glob; lower tiers must be concrete model ids`);
+              }
+              if (grp.mode !== undefined && grp.mode !== "shift" && grp.mode !== "cascade") throw new Error(`${at}.mode: must be "shift" or "cascade"`);
+            }
+            // Normalize to { ladder, mode } and REPLACE the running group list.
+            const norm = groups.map((g) => ({ ladder: g.ladder.slice(), mode: g.mode || "shift" }));
+            config.failoverGroups = norm;
+            dashOverrides.failoverGroups = norm;
+            // Rebuild groupState IN PLACE — the pinger and forward() both hold this exact
+            // array reference by closure; reassigning it would leave them pointing at the
+            // stale one. A group edit resets every shift offset (the ladders changed).
+            groupState.length = 0;
+            for (let i = 0; i < norm.length; i++) groupState.push({ offset: 0, shiftedAt: 0, attempts: 0, nextProbeAt: 0 });
+          }
           if (cooldownMs !== undefined) {
             if (typeof cooldownMs !== "number" || cooldownMs < 1000) throw new Error("cooldownMs must be a number >= 1000");
             config.failoverRecoveryIntervalMs = cooldownMs;
+          }
+          if (backoffMs !== undefined) {
+            // null / empty array clears the schedule (back to the flat cooldown).
+            if (backoffMs === null) { delete config.failoverRecoveryBackoffMs; dashOverrides.failoverBackoffMs = null; }
+            else {
+              if (!Array.isArray(backoffMs) || backoffMs.length === 0) throw new Error("backoffMs must be a non-empty array of ms (or null)");
+              for (const [i, v] of backoffMs.entries()) if (typeof v !== "number" || v < 1000) throw new Error(`backoffMs[${i}] must be a number >= 1000`);
+              config.failoverRecoveryBackoffMs = backoffMs.slice();
+              dashOverrides.failoverBackoffMs = backoffMs.slice();
+            }
           }
           // Clean stale failoverState entries whose patterns no longer exist.
           for (const model of failoverState.keys()) {
             if (!pickFailoverModel(config.failover, model)) failoverState.delete(model);
           }
-          // Start the pinger if pairs now exist and it wasn't running
-          if (config.failover && Object.keys(config.failover).length > 0 && !failoverPinger) {
-            failoverPinger = new FailoverPinger(failoverState, config, log, config.failoverRecoveryIntervalMs || 60000, groupState);
-            failoverPinger.start(config.failoverRecoveryIntervalMs || 60000);
+          // Start the pinger if any failover (pairs OR groups) now exists and it wasn't running
+          const failoverExists = (config.failover && Object.keys(config.failover).length > 0) ||
+            (Array.isArray(config.failoverGroups) && config.failoverGroups.length > 0);
+          if (failoverExists && !failoverPinger) {
+            const cd = config.failoverRecoveryIntervalMs || 60000;
+            const bo = config.failoverRecoveryBackoffMs;
+            failoverPinger = new FailoverPinger(failoverState, config, log, cd, groupState);
+            failoverPinger.start((Array.isArray(bo) && bo.length) ? bo[0] : cd);
           }
           saveOverrides();
           res.writeHead(200, { "content-type": "application/json" });
