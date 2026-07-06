@@ -67,6 +67,33 @@ including OpenRouter — as long as a route matches its id:
 
 (Order the OpenRouter `*/*`-style route **last** — first match wins.)
 
+## The `effective` head signal
+
+`GET /v1/failover` returns an `effective` object — a ready-to-consume view of what the **head
+slot** resolves to *right now*, so an external consumer reads one field instead of re-deriving
+`groups[].effective[offset]` and keeping its own model→window table:
+
+```jsonc
+"effective": {
+  "believed": "glm-5.2",   // the configured head (offset 0) — what the client still thinks it's on
+  "head":     "glm-5.1",   // the model actually serving the head now (after any shift)
+  "window":   200000,      // head's effective context window — from resolveWindow, not the client
+  "shifted":  true,        // offset > 0 (fast branch)
+  "recoversInSec": 240,    // ETA to the next head-recovery probe window; null when healthy
+  "accountCooldown": null  // secs until the head's account pool has a live key again, else null
+}
+```
+
+- **`window`** is the single source of truth — `effectiveWindow`/`resolveWindow`, min'd with any
+  learned ceiling. No consumer needs to hardcode a model→window table.
+- **Healthy head** (offset 0): `head === believed`, `shifted:false`, `recoversInSec:null`.
+- **`null`** when no failover group is configured (plain pairs reroute per-model; there's no
+  coordinated head to report). With multiple groups it reflects the **first** group.
+- Built for an **out-of-harness compaction trigger**: Claude Code doesn't auto-compact on a
+  downshift (its window is static, it doesn't know the head dropped), so an external loop that
+  reads `effective.window` is the way to fit the shrunk window. A statusline is a simpler
+  consumer of the same field.
+
 ## Account pools
 
 Several accounts on the **same** provider — e.g. two GLM Coding Plan subscriptions, or a few

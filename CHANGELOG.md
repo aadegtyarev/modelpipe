@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account label through from `dispatch`/rotation, matching the error path.
 
 ### Added
+- **`effective` downshift signal** on `GET /v1/failover` (issue #18): a ready-to-consume,
+  machine-readable view of what the **head slot** resolves to right now — `{ believed, head,
+  window, shifted, recoversInSec, accountCooldown }` — so an external consumer (statusline, an
+  out-of-harness compaction trigger, the dashboard) reads one field instead of re-deriving
+  `effective[offset]` and keeping its own model→window table. `window` comes from the same
+  `resolveWindow`/`effectiveWindow` the router uses (min'd with any learned ceiling), never the
+  client's size. Healthy head (offset 0) reports `head === believed`, `shifted:false`,
+  `recoversInSec:null`; `null` when no failover group is configured.
 - **Concurrency limiter** (`concurrency` config + `GET`/`POST /v1/concurrency`): some providers
   cap **simultaneous** requests per subscription/key (e.g. the z.ai GLM Coding Plan allows only
   a few glm-5.2 in flight at once). Firing the N+1th just earns a limit-429, which failover then

@@ -10,7 +10,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/router.test.mjs && node test/stats.test.mjs && node test/compact.test.mjs && node test/compact-integration.test.mjs && node test/concurrency.test.mjs && node test/account-cooldown.test.mjs"
+    "test": "node test/router.test.mjs && node test/stats.test.mjs && node test/compact.test.mjs && node test/compact-integration.test.mjs && node test/concurrency.test.mjs && node test/account-cooldown.test.mjs && node test/effective-signal.test.mjs"
   },
   "files": [
     "bin/",
