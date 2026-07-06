@@ -172,6 +172,17 @@ canvas{display:block;width:100%;height:200px}
   <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
 </div>
 
+<div class="panel" id="schedulesPanel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+    <h3 style="margin:0">Scheduled routing (dodge peak-priced models by time of day)</h3>
+    <button class="save" onclick="saveSchedules()">Save</button>
+  </div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">During each window, requests for the model glob are rewritten to a cheaper target. Times are in the timezone set per schedule — <b>GLM peak = 14:00–18:00 at +08:00</b> (GLM-5.2 / GLM-5-Turbo cost 3× quota then). Evaluated against the system clock via UTC, so it's correct regardless of the host timezone.</div>
+  <div id="schedDirtyBar"></div>
+  <div id="schedulesList"></div>
+  <button class="t-add" style="margin-top:8px" onclick="addSchedule()">+ Add schedule</button>
+</div>
+
 <div class="panel" id="billingPanel">
   <h3>Billing (how the dashboard reports $ per provider)</h3>
   <div style="color:var(--muted);font-size:12px;margin-bottom:6px">metered = show real per-token cost · flat plan = subscription (tokens only, no $) · auto = derive from the route</div>
@@ -200,6 +211,8 @@ let failoverPairs={};
 let failoverGroups=[];            // editable mirror of the server's ladder list
 let groupRuntime=[];              // per-group {offset, effective} from the server (live shift state)
 let groupsDirty=false;            // true while the user has unsaved group edits (blocks refresh clobber)
+let schedules=[];                 // editable mirror of the server's schedule list (with live .active)
+let schedulesDirty=false;         // true while the user has unsaved schedule edits (blocks refresh clobber)
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
@@ -222,12 +235,14 @@ const colors={};
 
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel'),sp=$('schedulesPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
   bp.style.display=show?'block':'none';
+  sp.style.display=show?'block':'none';
   if(show){
+    refreshSchedules();
     fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const models=st.models||{},tpOver=st.tokenPrices||{};
@@ -470,18 +485,108 @@ async function saveBackoff(){
   load();refreshFailover();
 }
 
+// ── Scheduled routing (time-of-day cost control) ─────────────────────────────────
+// Each schedule rewrites a model glob to a cheaper target while any of its wall-clock
+// windows (in the schedule's own TZ) is open. Edits stay local (schedulesDirty) until
+// Save so the 2s auto-refresh can't wipe them — same pattern as the group editor.
+function renderSchedules(){
+  let h='';
+  schedules.forEach((s,si)=>{
+    h+='<div class="grp">'+
+      '<div class="grp-hd">'+
+        '<span class="grp-title">Schedule '+(si+1)+'</span>'+
+        (s.active?'<span class="t-live">active now</span>':'<span class="muted" style="font-size:12px">idle</span>')+
+        '<span style="flex:1"></span>'+
+        '<button class="grp-save" onclick="saveSchedules()">Save</button>'+
+        '<button class="grp-del" onclick="removeSchedule('+si+')">Delete</button>'+
+      '</div>'+
+      '<div class="tier" style="margin-bottom:6px;flex-wrap:wrap">'+
+        '<input class="i t-in" value="'+escHtml(s.match)+'" placeholder="model glob (e.g. glm-5.2)" oninput="setSched('+si+',\'match\',this.value)">'+
+        '<span class="t-arrow" style="border:none;padding:0;margin:0">→</span>'+
+        '<input class="i t-in" value="'+escHtml(s.to)+'" placeholder="cheaper model (e.g. glm-5.1)" oninput="setSched('+si+',\'to\',this.value)">'+
+        '<span class="t-tag">TZ</span>'+
+        '<input class="i" style="width:88px" value="'+escHtml(s.tz)+'" placeholder="+08:00" oninput="setSched('+si+',\'tz\',this.value)">'+
+      '</div>'+
+      '<div class="grp-hint">Windows (HH:MM–HH:MM, in the TZ above). While any is open, «'+escHtml(s.match||'…')+'» → «'+escHtml(s.to||'…')+'».</div>'+
+      '<div class="tiers">';
+    (s.windows||[]).forEach((w,wi)=>{
+      h+='<div class="tier">'+
+        '<span class="t-num">'+(wi+1)+'</span>'+
+        '<input class="i" style="width:82px;font-family:ui-monospace,Menlo,Consolas,monospace" value="'+escHtml(w[0])+'" placeholder="14:00" oninput="setWin('+si+','+wi+',0,this.value)">'+
+        '<span class="muted">–</span>'+
+        '<input class="i" style="width:82px;font-family:ui-monospace,Menlo,Consolas,monospace" value="'+escHtml(w[1])+'" placeholder="18:00" oninput="setWin('+si+','+wi+',1,this.value)">'+
+        '<button class="t-del" onclick="removeWin('+si+','+wi+')" title="remove window">×</button>'+
+      '</div>';
+    });
+    h+='</div>'+
+      '<button class="t-add" onclick="addWin('+si+')">+ add window</button>'+
+    '</div>';
+  });
+  if(!schedules.length) h='<div class="muted" style="font-size:13px">No schedules. Click “+ Add schedule” to route away from a peak-priced model during set hours.</div>';
+  $('schedulesList').innerHTML=h;
+}
+function markSchedDirty(){schedulesDirty=true;updateSchedDirtyBar();}
+function updateSchedDirtyBar(){
+  const el=$('schedDirtyBar');if(!el)return;
+  el.innerHTML=schedulesDirty
+    ? '<div style="display:flex;align-items:center;gap:10px;background:rgba(240,160,40,.12);border:1px solid var(--orange);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:13px">'+
+      '<span style="color:var(--orange);font-weight:600">● Unsaved schedule changes</span>'+
+      '<button class="grp-save" onclick="saveSchedules()">Save</button>'+
+      '<button class="wb" onclick="discardSchedules()">Discard</button></div>'
+    : '';
+}
+function discardSchedules(){schedulesDirty=false;updateSchedDirtyBar();refreshSchedules();}
+function setSched(si,k,v){schedules[si][k]=v;markSchedDirty();}
+function setWin(si,wi,idx,v){schedules[si].windows[wi][idx]=v;markSchedDirty();}
+function addWin(si){schedules[si].windows.push(['14:00','18:00']);markSchedDirty();renderSchedules();}
+function removeWin(si,wi){
+  if(schedules[si].windows.length<=1){alert('A schedule needs at least one window.');return;}
+  schedules[si].windows.splice(wi,1);markSchedDirty();renderSchedules();
+}
+function addSchedule(){schedules.push({match:'glm-5.2',to:'glm-5.1',tz:'+08:00',windows:[['14:00','18:00']],active:false});markSchedDirty();renderSchedules();}
+function removeSchedule(si){schedules.splice(si,1);markSchedDirty();renderSchedules();}
+async function saveSchedules(){
+  // Client-side mirror of the server rules — trim, need match+to, >=1 window of HH:MM–HH:MM.
+  const norm=[];
+  for(let i=0;i<schedules.length;i++){
+    const s=schedules[i];
+    const match=(s.match||'').trim(),to=(s.to||'').trim(),tz=(s.tz||'').trim()||'Z';
+    if(!match||!to){alert('Schedule '+(i+1)+': needs both a model glob and a target model.');return;}
+    const wins=[];
+    for(const w of (s.windows||[])){
+      const a=(w[0]||'').trim(),b=(w[1]||'').trim();
+      if(!/^\d{1,2}:\d{2}$/.test(a)||!/^\d{1,2}:\d{2}$/.test(b)){alert('Schedule '+(i+1)+': times must be HH:MM.');return;}
+      wins.push([a,b]);
+    }
+    if(!wins.length){alert('Schedule '+(i+1)+': needs at least one window.');return;}
+    norm.push({match,to,tz,windows:wins});
+  }
+  const r=await fetch("/v1/schedules",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({schedules:norm})});
+  if(!r.ok){alert('Schedule save failed: '+(await r.text()));return;}
+  schedulesDirty=false;updateSchedDirtyBar();refreshSchedules();
+}
+// Re-render the schedule editor from the server (skipped while the user has unsaved edits).
+function refreshSchedules(){
+  return fetch("/v1/schedules").then(r=>r.json()).then(d=>{
+    if(schedulesDirty)return;
+    schedules=(d.schedules||[]).map(s=>({match:s.match,to:s.to,tz:s.tz,windows:(s.windows||[]).map(w=>w.slice()),active:!!s.active}));
+    updateSchedDirtyBar();renderSchedules();
+  }).catch(()=>{});
+}
+
 async function newSession(){await fetch("/v1/sessions/reset",{method:"POST"});histMode=null;$("sessSelect").value="";load();}
 async function showHistory(){histMode=$("sessSelect").value||null;load();}
 
 // ── Load + render ─────────────────────────────────────────────────────────────
 async function load(){
   try{
-    const[stats,quotas,sessions,models,failover]=await Promise.all([
+    const[stats,quotas,sessions,models,failover,sched]=await Promise.all([
       fetch("/v1/stats").then(r=>r.json()),
       fetch("/v1/quotas").then(r=>r.json()),
       fetch("/v1/sessions").then(r=>r.json()),
       fetch("/v1/models").then(r=>r.json()).catch(()=>({data:[]})),
       fetch("/v1/failover").then(r=>r.json()).catch(()=>({config:{},active:{},groups:[]})),
+      fetch("/v1/schedules").then(r=>r.json()).catch(()=>({schedules:[]})),
     ]);
     // Build providerId -> billing map from the route table, using the SERVER-computed
     // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
@@ -513,7 +618,7 @@ async function load(){
       if(arch){stats.session=arch.session;stats.models=arch.models;stats.timeline=[];}
     }
     render(stats,quotas,cfg);
-    renderRouting(failover);
+    renderRouting(failover,sched);
     $("e").style.display="none";
   }catch(err){$("e").style.display="block";$("e").textContent="fetch error: "+err.message}
   $("r").textContent="Updated: "+new Date().toLocaleTimeString()+"  —  auto-refresh "+(auto?"ON":"OFF");
@@ -524,22 +629,36 @@ async function load(){
 // redirected (a reactive failover pair is active, or a failover group is shifted off its
 // head tier). Silent when routing is normal (the model cards already show where traffic
 // goes). Hidden while viewing an archived session (failover state is live, not historical).
-function renderRouting(fo){
-  if(!fo||histMode){$("routing").innerHTML="";return;}
-  const active=Object.entries(fo.active||{});
-  const groups=(fo.groups||[]).filter(g=>g.offset>0);
-  if(!active.length&&!groups.length){$("routing").innerHTML="";return;}
-  let h='<div class="routing"><div class="hdr">⚠ Routing redirected — failover active</div>';
-  for(const g of groups){
-    h+='<div class="line">['+escHtml(g.mode)+' +'+g.offset+'] '+ladderChain(g)+
-       ' <span class="tag sub">“'+escHtml(g.ladder[g.offset-1])+'” down → now on “'+escHtml(g.ladder[g.offset])+'”</span></div>';
+function renderRouting(fo,sched){
+  if(histMode){$("routing").innerHTML="";return;}
+  const active=Object.entries((fo&&fo.active)||{});
+  const groups=((fo&&fo.groups)||[]).filter(g=>g.offset>0);
+  const activeScheds=((sched&&sched.schedules)||[]).filter(s=>s.active);
+  let h='';
+  // Failover redirection is an anomaly → orange warning banner.
+  if(active.length||groups.length){
+    h+='<div class="routing"><div class="hdr">⚠ Routing redirected — failover active</div>';
+    for(const g of groups){
+      h+='<div class="line">['+escHtml(g.mode)+' +'+g.offset+'] '+ladderChain(g)+
+         ' <span class="tag sub">“'+escHtml(g.ladder[g.offset-1])+'” down → now on “'+escHtml(g.ladder[g.offset])+'”</span></div>';
+    }
+    for(const[m,s]of active){
+      const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+      h+='<div class="line"><span style="color:var(--orange)">'+escHtml(m)+'</span> → rerouted to backup (since '+t+')</div>';
+    }
+    h+='</div>';
   }
-  for(const[m,s]of active){
-    const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
-    h+='<div class="line"><span style="color:var(--orange)">'+escHtml(m)+'</span> → rerouted to backup (since '+t+')</div>';
+  // Scheduled routing is intentional (cost control) → calm green info banner.
+  if(activeScheds.length){
+    h+='<div class="routing" style="border-color:var(--green)"><div class="hdr" style="color:var(--green)">💸 Saving quota — scheduled routing active</div>';
+    for(const s of activeScheds){
+      h+='<div class="line"><span style="color:var(--green)">'+escHtml(s.match)+'</span> → '+escHtml(s.to)+
+         ' <span class="tag sub">peak window ('+(s.windows||[]).map(w=>escHtml(w[0])+'–'+escHtml(w[1])).join(', ')+' '+escHtml(s.tz)+')</span></div>';
+    }
+    h+='</div>';
   }
-  h+='</div>';
   $("routing").innerHTML=h;
+  return;
 }
 
 function render(stats,quotas,cfg){

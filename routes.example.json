@@ -17,6 +17,7 @@
     "tokenPrices": "OPTIONAL object { modelGlob: { input, output } } — per-model metered API prices in $ per 1M tokens; keys may use * globs; falls back to the built-in catalog. Editable at runtime (⚙ → token prices) and persisted.",
     "failover": "OPTIONAL object { modelGlob: backupModelId } — per-model backup on a retryable error (see _failover_doc).",
     "failoverGroups": "OPTIONAL array of ordered ladders (see _failoverGroups_doc) — coordinated 'shift the whole ladder' failover.",
+    "schedules": "OPTIONAL array of time-of-day model rewrites (see _schedules_doc) — proactively route away from a peak-priced model during set hours.",
     "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB) — request body size cap; requests exceeding it get a 413",
     "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog"
   },
@@ -33,6 +34,11 @@
   "_failoverGroups_doc": "OPTIONAL array of ordered ladders — a shared priority chain multiple models ride together. mode:\"shift\" (default): when the HEAD tier fails (e.g. Anthropic down), the WHOLE ladder shifts down one — opus→glm AND glm's own traffic→deepseek at the same time — and winds back when the head recovers. mode:\"cascade\": walk the ladder per-request on error (no coordinated shift). The head (index 0) may be a glob; every lower tier is a rewrite target and MUST be a concrete model id. Groups take precedence over `failover` pairs. Remove this block if you only want per-model pairs.",
   "failoverRecoveryIntervalMs": 60000,
   "_failoverRecoveryIntervalMs_doc": "OPTIONAL number, default 60000. Minimum ms between recovery pings to a failed-over primary (and between group re-probe/wind-back). Must be >= 1000.",
+  "schedules": [
+    { "match": "glm-5.2", "to": "glm-5.1", "tz": "+08:00", "windows": [["14:00", "18:00"]] },
+    { "match": "glm-5-turbo", "to": "glm-4.5-air", "tz": "+08:00", "windows": [["14:00", "18:00"]] }
+  ],
+  "_schedules_doc": "OPTIONAL array of time-of-day model rewrites (proactive cost control). While any window is open, a request whose model matches `match` is rewritten to the cheaper `to` BEFORE routing/failover/vision — as if the client had asked for `to`. Each entry: `match` (model glob), `to` (concrete replacement model id — must resolve to a route), `tz` (a FIXED UTC offset like \"+08:00\" / \"-0530\" / \"Z\", NOT a named zone), `windows` (non-empty array of [\"HH:MM\",\"HH:MM\"] 24h pairs; from>to wraps past midnight; the range is [from,to) — start inclusive, end exclusive). Times are read in `tz` and evaluated against the SYSTEM CLOCK via the UTC epoch, so they're correct no matter how the host's local timezone is set. First matching schedule with an open window wins; `to` == the incoming model is a no-op. Unlike failover (reactive, on error) this fires on EVERY matching request in-window. Editable at runtime (⚙ Settings → Scheduled routing) and persisted. EXAMPLE ABOVE: z.ai bills GLM-5.2 / GLM-5-Turbo at 3x quota during peak (14:00–18:00 UTC+8); off-peak tiers glm-5.1 / glm-4.5-air carry no multiplier, so peak traffic drops to them and stays on the flat Coding Plan. Off-peak it uses the full-strength models normally.",
   "routes": [
     {
       "match": "claude-*",

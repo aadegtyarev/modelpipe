@@ -258,6 +258,97 @@ export function resolveGroup(groups, groupState, model) {
   return null;
 }
 
+// ── Scheduled routing (time-of-day cost control) ──────────────────────────────
+// A SCHEDULE proactively rewrites a model id during a wall-clock window — e.g. a
+// provider that bills a peak-hours multiplier (GLM: GLM-5.2 / GLM-5-Turbo cost 3x
+// quota 14:00–18:00 UTC+8) can be dodged by dropping to a cheaper same-plan tier for
+// those hours only. Unlike `failover`/`failoverGroups` (reactive, on error), a schedule
+// fires on EVERY matching request while its window is open. The window is expressed in
+// the PROVIDER's timezone (a fixed UTC offset) and evaluated against the system clock via
+// the UTC epoch — so it is correct no matter how the host machine's local timezone is set.
+
+// Pure: parse a fixed UTC offset ("+08:00" | "+08" | "-0530" | "Z" | "UTC" | "") into
+// minutes east of UTC. null when malformed. Empty / "Z" / "UTC" ⇒ 0.
+export function parseTzOffset(tz) {
+  if (tz == null || tz === "" || tz === "Z" || tz === "UTC") return 0;
+  const m = /^([+-])(\d{2}):?(\d{2})?$/.exec(String(tz));
+  if (!m) return null;
+  const hh = Number(m[2]);
+  const mm = Number(m[3] || 0);
+  if (hh > 23 || mm > 59) return null;
+  return (m[1] === "-" ? -1 : 1) * (hh * 60 + mm);
+}
+
+// Pure: parse "H:MM" / "HH:MM" into minute-of-day (0..1439); null when malformed.
+export function parseHHMM(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s));
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (hh > 23 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
+// Pure: is minute-of-day `minute` inside [from, to)? A window with from > to wraps past
+// midnight (e.g. 22:00→02:00). from === to is an empty window (never active).
+export function inWindow(minute, from, to) {
+  if (from === to) return false;
+  return from < to ? (minute >= from && minute < to) : (minute >= from || minute < to);
+}
+
+// Pure: minute-of-day (0..1439) at UTC offset `offsetMinutes` for epoch ms `nowMs`.
+function minuteOfDayAt(nowMs, offsetMinutes) {
+  const shifted = nowMs + offsetMinutes * 60000;
+  const dayMs = ((shifted % 86400000) + 86400000) % 86400000;
+  return Math.floor(dayMs / 60000);
+}
+
+// Pure: the replacement model id for `model` if any schedule window is open at epoch
+// `nowMs`, else null. First matching schedule with an open window wins; a schedule whose
+// `to` equals the incoming model id is a no-op and skipped. `schedules` is the validated
+// config.schedules array — each { match: glob, to: model id, tz: offset, windows: [[from,to]] }.
+export function resolveSchedule(schedules, model, nowMs) {
+  if (!Array.isArray(schedules) || typeof model !== "string" || model.length === 0) return null;
+  for (const s of schedules) {
+    if (!s || typeof s.to !== "string" || s.to === model) continue;
+    if (typeof s.match !== "string" || !globToRegExp(s.match).test(model)) continue;
+    const off = parseTzOffset(s.tz);
+    if (off == null) continue;
+    const minute = minuteOfDayAt(nowMs, off);
+    const windows = Array.isArray(s.windows) ? s.windows : [];
+    for (const w of windows) {
+      const from = parseHHMM(w && w[0]);
+      const to = parseHHMM(w && w[1]);
+      if (from == null || to == null) continue;
+      if (inWindow(minute, from, to)) return s.to;
+    }
+  }
+  return null;
+}
+
+// Validate a schedules array the SAME way whether it arrives from the config file or the
+// dashboard POST (no weaker path than the file). Throws on the first problem; returns a
+// normalized copy ({ match, to, tz, windows } only) on success. `prefix` labels errors.
+export function validateSchedules(schedules, prefix = "config.schedules") {
+  if (!Array.isArray(schedules)) throw new Error(`${prefix}: must be an array of { match, to, tz, windows }`);
+  return schedules.map((s, i) => {
+    const at = `${prefix}[${i}]`;
+    if (!s || typeof s !== "object") throw new Error(`${at}: must be an object { match, to, tz, windows }`);
+    if (typeof s.match !== "string" || s.match.length === 0) throw new Error(`${at}.match: must be a non-empty model glob`);
+    try { globToRegExp(s.match); } catch (e) { throw new Error(`${at}.match: not a valid glob: ${e.message}`); }
+    if (typeof s.to !== "string" || s.to.length === 0) throw new Error(`${at}.to: must be a non-empty model id`);
+    if (parseTzOffset(s.tz) == null) throw new Error(`${at}.tz: must be a fixed UTC offset like "+08:00" (or "Z")`);
+    if (!Array.isArray(s.windows) || s.windows.length === 0) throw new Error(`${at}.windows: must be a non-empty array of ["HH:MM","HH:MM"] pairs`);
+    const windows = s.windows.map((w, j) => {
+      if (!Array.isArray(w) || w.length !== 2 || parseHHMM(w[0]) == null || parseHHMM(w[1]) == null) {
+        throw new Error(`${at}.windows[${j}]: must be ["HH:MM","HH:MM"] with valid 24h times`);
+      }
+      return [w[0], w[1]];
+    });
+    return { match: s.match, to: s.to, tz: s.tz == null ? "Z" : s.tz, windows };
+  });
+}
+
 // True when a route forwards the client's incoming auth header unchanged instead of
 // swapping in a backend key (auth: "passthrough"). Lets a subscription/OAuth Claude
 // Code session use the Anthropic/default route with NO backend API key.
@@ -526,6 +617,12 @@ export function validateConfig(config) {
       if (typeof v !== "number" || v < 1000) throw new Error(`config.failoverRecoveryBackoffMs[${i}]: must be a number >= 1000`);
     }
   }
+  // schedules: optional array of time-window model rewrites (proactive cost control) —
+  // see validateSchedules / resolveSchedule. Normalized in place so the running config
+  // carries a clean copy.
+  if (config.schedules !== undefined) {
+    config.schedules = validateSchedules(config.schedules);
+  }
 
   return config;
 }
@@ -596,6 +693,8 @@ export function listConfig(config) {
     return out;
   });
   if (config && Array.isArray(config.failoverGroups)) safe.failoverGroups = config.failoverGroups;
+  // schedules hold model ids/globs + wall-clock windows — no secrets, safe to surface.
+  if (config && Array.isArray(config.schedules)) safe.schedules = config.schedules;
   return safe;
 }
 
@@ -800,7 +899,7 @@ function relayBuffered(res, status, upstreamHeaders, buffered) {
 // swap — the body buffer is never transformed (passthrough; image bytes untouched).
 // `statsCtx` (optional): { stats, startTime } — when dashboard is enabled, carries the
 // stats collector and request start time for usage tracking.
-function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {}) {
+function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, providerId: optProviderId } = {}) {
   const passthrough = isPassthrough(route);
   // Fallback auth: if the client flew its own token, forward it (like passthrough);
   // otherwise inject the proxy's backend key (like key-swap). "The one that flies wins,
@@ -814,7 +913,7 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {})
     } catch (err) {
       if (statsCtx && statsCtx.stats) {
         statsCtx.stats.record({
-          providerId: providerIdFromUrl(route.base_url),
+          providerId: optProviderId || providerIdFromUrl(route.base_url),
           model: modelFromBody(body),
           durationMs: Date.now() - statsCtx.startTime,
           inputTokens: 0, outputTokens: 0, status: err.status || 500,
@@ -838,7 +937,7 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx } = {})
   // upstream hanging.
   res.on("error", () => {});
 
-  const providerId = providerIdFromUrl(route.base_url);
+  const providerId = optProviderId || providerIdFromUrl(route.base_url);
   const model = modelFromBody(body);
 
   const client = upstream.protocol === "http:" ? http : https;
@@ -1013,6 +1112,7 @@ function makeResponseHandler(ctx) {
                   groupProbe: null,
                 }),
                 statsCtx: ctx.statsCtx,
+                providerId: acct.label,
               });
               return;
             }
@@ -1156,6 +1256,7 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
   proxyToRoute(setup.effRoute, carryCtx.req, carryCtx.res, sendBody, carryCtx.log, {
     onResponse: makeResponseHandler(ctx),
     statsCtx: carryCtx.statsCtx,
+    providerId: setup.providerId,
   });
 }
 
@@ -1168,7 +1269,19 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
 // `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
 function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null) {
-  const model = modelFromBody(body);
+  let model = modelFromBody(body);
+  // SCHEDULE PRE-ROUTE (proactive cost control): while a configured wall-clock window is
+  // open, rewrite the model to a cheaper target BEFORE routing/group/failover/vision — so
+  // the whole pipeline (route match, failover ladders, stats) sees the scheduled model as
+  // if the client had asked for it. Off-window (or no schedules) this is a no-op.
+  if (model && Array.isArray(config.schedules) && config.schedules.length > 0) {
+    const scheduled = resolveSchedule(config.schedules, model, Date.now());
+    if (scheduled && scheduled !== model) {
+      log(`schedule: ${model} -> ${scheduled}`);
+      body = rewriteModelInBody(body, scheduled);
+      model = scheduled;
+    }
+  }
   const route = pickRoute(model, config.routes);
   if (!route) {
     sendError(res, 400, model ? `no route for model "${model}"` : "request has no routable model");
@@ -1464,12 +1577,17 @@ export function createRouter(config, options = {}) {
     // billing: { <providerId|accountLabel>: "metered" | "subscription" } — dashboard-only
     // display override when the derived default guesses wrong (e.g. a metered z.ai key).
     billing: (stored && typeof stored.billing === "object") ? stored.billing : {},
+    // schedules: null = never edited in the UI (use the file's schedules); an array
+    // (possibly empty) = the dashboard-set schedule list, AUTHORITATIVE across restart —
+    // an empty array means "the user deleted every schedule", which must survive a restart.
+    schedules: (stored && Array.isArray(stored.schedules)) ? stored.schedules : null,
   };
   {
     const beforeTP = config.tokenPrices;
     const beforeFO = config.failover;
     const beforeFG = config.failoverGroups;
     const beforeBO = config.failoverRecoveryBackoffMs;
+    const beforeSC = config.schedules;
     try {
       if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
       // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
@@ -1482,12 +1600,15 @@ export function createRouter(config, options = {}) {
         if (dashOverrides.failoverBackoffMs === null) delete config.failoverRecoveryBackoffMs;
         else config.failoverRecoveryBackoffMs = dashOverrides.failoverBackoffMs;
       }
+      // Schedules: same authoritative-replace semantics; null sentinel = leave the file's.
+      if (dashOverrides.schedules !== null) config.schedules = dashOverrides.schedules;
       validateConfig(config);
     } catch {
       config.tokenPrices = beforeTP;
       config.failover = beforeFO;
       config.failoverGroups = beforeFG;
       config.failoverRecoveryBackoffMs = beforeBO;
+      config.schedules = beforeSC;
     }
   }
   // Persist ONLY the dashboard-set overrides (best-effort).
@@ -1747,6 +1868,48 @@ export function createRouter(config, options = {}) {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, cleared }));
+      return;
+    }
+
+    // GET /v1/schedules — current time-window model rewrites + which are active right now.
+    if (dashboard && req.method === "GET" && req.url === "/v1/schedules") {
+      const now = Date.now();
+      const list = (config.schedules || []).map((s) => {
+        const off = parseTzOffset(s.tz);
+        let active = false;
+        if (off != null) {
+          const shifted = now + off * 60000;
+          const minute = Math.floor((((shifted % 86400000) + 86400000) % 86400000) / 60000);
+          active = (s.windows || []).some((w) => {
+            const from = parseHHMM(w[0]);
+            const to = parseHHMM(w[1]);
+            return from != null && to != null && inWindow(minute, from, to);
+          });
+        }
+        return { match: s.match, to: s.to, tz: s.tz, windows: s.windows, active };
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ schedules: list }));
+      return;
+    }
+    // POST /v1/schedules — replace the schedule list in-memory + persist (authoritative,
+    // same pattern as POST /v1/failover groups). Body: an array, or { schedules: [...] }.
+    // Validated the SAME way as the config file (validateSchedules) — no weaker path.
+    if (dashboard && req.method === "POST" && req.url === "/v1/schedules") {
+      readBody(req, 16384).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          const arr = Array.isArray(data) ? data : (data && data.schedules);
+          const norm = validateSchedules(arr, "schedules");
+          config.schedules = norm;
+          dashOverrides.schedules = norm;
+          saveOverrides();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, schedules: config.schedules }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
 
