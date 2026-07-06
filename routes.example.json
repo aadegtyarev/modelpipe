@@ -26,9 +26,9 @@
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
-  "concurrency": { "glm-5.2": 3, "glm-*": 8 },
+  "concurrency": { "glm-5.2": 3, "glm-5.1": 6, "glm-*": 8, "deepseek-v4-pro": 200 },
   "concurrencyQueueTimeoutMs": 45000,
-  "_concurrency_doc": "Per-(provider,model) simultaneous-request caps — the overflow is QUEUED, not degraded to a backup (see _config_shape.concurrency and docs/failover.md#concurrency-limiting). FIRST MATCH WINS so glm-5.2 (3 concurrent) is listed before glm-* (8). z.ai's GLM Coding Plan meters concurrency per subscription; these keep modelpipe from tripping that limit and needlessly failing over. Remove this block for no concurrency limiting (unlimited).",
+  "_concurrency_doc": "Per-(provider,model) simultaneous-request caps — the overflow is QUEUED, not degraded to a backup (see _config_shape.concurrency and docs/failover.md#concurrency-limiting). FIRST MATCH WINS so the specific tiers (glm-5.2=3, glm-5.1=6) are listed BEFORE the broad glm-*=8 catch-all; deepseek-v4-pro=200 is effectively unlimited (metered pay-as-you-go, no concurrency cap to respect). The limit is PER ACCOUNT/KEY: on a route with an `accounts` pool the key is the account label, so a 2-account pool carries 2x the number here (3 ⇒ up to 6 concurrent across two live keys) and a parked/exhausted key simply contributes 0 — modelpipe scales to whatever keys are live, no need to bake the account count into the number. z.ai's GLM Coding Plan meters concurrency per model per subscription; these keep modelpipe from tripping that and needlessly failing over. Remove this block for no concurrency limiting (unlimited).",
   "compact": {
     "enabled": true,
     "safetyPct": 0.95,
