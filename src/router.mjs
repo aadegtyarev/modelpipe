@@ -49,6 +49,40 @@ import {
   decompressIfNeeded,
 } from "./stats.mjs";
 import { readJson, writeJson, OVERRIDES_FILE } from "./store.mjs";
+import {
+  fitToWindow, resolveWindow, isContextOverflow, parseOverflowLimit, bodyTokens, COMPACT_DEFAULTS,
+} from "./compact.mjs";
+
+// Effective context window for a model = min(configured/glob window, anything learned from a
+// prior overflow). `learned` is the per-model self-calibration map threaded through ctx.
+function effectiveWindow(compact, learned, model) {
+  const configured = resolveWindow(compact, model);
+  const cap = learned && learned[model];
+  return cap ? Math.min(configured, cap) : configured;
+}
+
+// Record a model's real window learned from an overflow error, persisting the map. Only ever
+// lowers (the smallest observed ceiling wins). Best-effort — never throws.
+function learnWindow(learned, model, tokens, log) {
+  if (!learned || !model || !(tokens > 0)) return;
+  if (learned[model] && learned[model] <= tokens) return;
+  learned[model] = tokens;
+  writeJson("compact-learned-windows.json", learned);
+  if (log) log(`compact: learned window for ${model} <= ${tokens}`);
+}
+
+// Fit a request Buffer to `windowTokens`, returning a Buffer (original if it already fits or on
+// any parse error — fail-open). `label` names the model for the log line.
+function fitBufferToWindow(bodyBuf, windowTokens, safetyPct, label, log) {
+  try {
+    const parsed = JSON.parse(bodyBuf.toString("utf8"));
+    if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) return bodyBuf;
+    const { parsed: fitted, trimmed, cut } = fitToWindow(parsed, windowTokens, safetyPct);
+    if (!trimmed) return bodyBuf;
+    if (log) log(`compact: trim ${label} to window ${windowTokens} (dropped head[0:${cut}])`);
+    return Buffer.from(JSON.stringify(fitted));
+  } catch { return bodyBuf; }
+}
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
 const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per request
@@ -452,8 +486,30 @@ function validateAuth(auth, at) {
   if (auth.fallback !== undefined && typeof auth.fallback !== "boolean") throw new Error(`${at}.auth.fallback: must be a boolean when present`);
 }
 
+// Validate + normalize the `compact` context-compaction block, filling defaults (compaction
+// is ON by default). Used both for the config file and the dashboard POST path, so the two
+// can never diverge. Returns a fully-populated, safe object. Throws on a bad type/range.
+export function validateCompact(compact, prefix = "config.compact") {
+  if (compact !== undefined && (typeof compact !== "object" || compact === null || Array.isArray(compact))) {
+    throw new Error(`${prefix}: must be an object when present`);
+  }
+  const c = { ...COMPACT_DEFAULTS, ...(compact && typeof compact === "object" ? compact : {}) };
+  if (typeof c.enabled !== "boolean") throw new Error(`${prefix}.enabled: must be a boolean`);
+  if (typeof c.safetyPct !== "number" || !(c.safetyPct > 0) || c.safetyPct > 1) throw new Error(`${prefix}.safetyPct: must be a number in (0,1]`);
+  if (typeof c.windowDefault !== "number" || c.windowDefault <= 0) throw new Error(`${prefix}.windowDefault: must be a positive number of tokens`);
+  if (!Number.isInteger(c.maxOverflowRetries) || c.maxOverflowRetries < 0) throw new Error(`${prefix}.maxOverflowRetries: must be a non-negative integer`);
+  if (c.window === undefined || c.window === null) c.window = {};
+  if (typeof c.window !== "object" || Array.isArray(c.window)) throw new Error(`${prefix}.window: must be an object { modelGlob: tokens }`);
+  for (const [glob, tok] of Object.entries(c.window)) {
+    if (typeof tok !== "number" || tok <= 0) throw new Error(`${prefix}.window["${glob}"]: must be a positive number of tokens`);
+    try { globToRegExp(glob); } catch (e) { throw new Error(`${prefix}.window: key "${glob}" is not a valid glob: ${e.message}`); }
+  }
+  return c;
+}
+
 export function validateConfig(config) {
   if (!config || typeof config !== "object") throw new Error("config: not an object");
+  if (config.compact !== undefined) validateCompact(config.compact);
   if (!Array.isArray(config.routes) || config.routes.length === 0) {
     throw new Error("config.routes: must be a non-empty array");
   }
@@ -1059,7 +1115,10 @@ function makeResponseHandler(ctx) {
     // semantics for oversized error bodies.
     const isFailoverCandidate = (ctx.failoverConfig || ctx.group || (ctx.account && ctx.route))
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
-    if (status !== 400 && !isFailoverCandidate) {
+    // 413 is also buffered so the context-overflow safety net can classify it (some backends
+    // signal an oversized request with 413 rather than a 400).
+    const compactOn = ctx.config.compact && ctx.config.compact.enabled;
+    if (status !== 400 && !(compactOn && status === 413) && !isFailoverCandidate) {
       windBackProbe(); // a non-candidate response to a recovery probe = head is back
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
         ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
@@ -1072,6 +1131,34 @@ function makeResponseHandler(ctx) {
       if (err) {
         if (!ctx.res.headersSent) sendError(ctx.res, 502, "upstream error response could not be relayed");
         else ctx.res.destroy();
+        return;
+      }
+
+      // 0. CONTEXT-OVERFLOW SAFETY NET: the backend rejected the request as too long for its
+      //    window — our proactive downshift-fit under-estimated, or the model's real window is
+      //    smaller than configured. Learn the real ceiling (from the error message when it
+      //    states one), hard-trim the body, and retry — up to maxOverflowRetries, shrinking the
+      //    target each time so it converges. Out of retries → relay the error honestly.
+      if (ctx.config.compact && ctx.config.compact.enabled && isContextOverflow(status, buffered)) {
+        const attempt = ctx.overflowRetry || 0;
+        const limit = parseOverflowLimit(buffered);
+        let sent = 0;
+        try { sent = bodyTokens(JSON.parse(ctx.body.toString("utf8"))); } catch { /* keep 0 */ }
+        learnWindow(ctx.learnedWindows, ctx.model, limit || (sent ? Math.floor(sent * 0.9) : 0), ctx.log);
+        const maxRetries = ctx.config.compact.maxOverflowRetries ?? 2;
+        if (attempt < maxRetries) {
+          const base = limit || effectiveWindow(ctx.config.compact, ctx.learnedWindows, ctx.model);
+          const win = Math.floor(base * [0.9, 0.7, 0.5][Math.min(attempt, 2)]);
+          const trimmed = fitBufferToWindow(ctx.body, win, 1, `${ctx.model} overflow-retry ${attempt + 1}`, ctx.log);
+          recordStat(ctx, status);
+          ctx.log(`compact: context overflow from ${ctx.model} — hard-trim + retry ${attempt + 1}/${maxRetries}`);
+          dispatch(ctx.route, trimmed, ctx, { model: ctx.model, overflowRetry: attempt + 1 });
+          return;
+        }
+        if (ctx.statsCtx && ctx.statsCtx.stats) {
+          ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
+        }
+        relayBuffered(ctx.res, status, headers, buffered);
         return;
       }
 
@@ -1245,15 +1332,32 @@ function accountSetup(route, accountPools) {
 // route, next account) is handled inline in makeResponseHandler, not here.
 function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
   const setup = accountSetup(targetRoute, carryCtx.accountPools);
+  const targetModel = overrides.model || carryCtx.model;
+
+  // DOWNSHIFT SAFETY NET (see compact.mjs): if this hop routes to a model whose context window
+  // is SMALLER than the client's original model (a failover downshift, e.g. 1M → 256K), the
+  // grown conversation may not fit — trim it to the target's window before sending. Only fires
+  // on a genuine downshift: the primary hop (same/again window) is never touched, so the
+  // harness stays in charge of normal compaction. Off unless config.compact.enabled.
+  const compact = carryCtx.config && carryCtx.config.compact;
+  let outBody = sendBody;
+  if (compact && compact.enabled && carryCtx.clientModel) {
+    const targetWin = effectiveWindow(compact, carryCtx.learnedWindows, targetModel);
+    const clientWin = effectiveWindow(compact, carryCtx.learnedWindows, carryCtx.clientModel);
+    if (targetWin < clientWin) {
+      outBody = fitBufferToWindow(sendBody, targetWin, compact.safetyPct, targetModel, carryCtx.log);
+    }
+  }
+
   const ctx = {
     ...carryCtx,
     ...overrides,
     route: targetRoute,
-    body: sendBody,
+    body: outBody,
     providerId: setup.providerId,
     account: setup.account,
   };
-  proxyToRoute(setup.effRoute, carryCtx.req, carryCtx.res, sendBody, carryCtx.log, {
+  proxyToRoute(setup.effRoute, carryCtx.req, carryCtx.res, outBody, carryCtx.log, {
     onResponse: makeResponseHandler(ctx),
     statsCtx: carryCtx.statsCtx,
     providerId: setup.providerId,
@@ -1268,8 +1372,11 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
 // models — when set, requests for that model pre-route to its backup.
 // `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
-function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null) {
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null, learnedWindows = {}) {
   let model = modelFromBody(body);
+  // The model the CLIENT sized its context against (before any schedule/failover rewrite) —
+  // the reference window for the downshift safety net in dispatch().
+  const clientModel = model;
   // SCHEDULE PRE-ROUTE (proactive cost control): while a configured wall-clock window is
   // open, rewrite the model to a cheaper target BEFORE routing/group/failover/vision — so
   // the whole pipeline (route match, failover ladders, stats) sees the scheduled model as
@@ -1293,7 +1400,7 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
   // Build the base ctx for makeResponseHandler — the shared context threaded through every
   // hop (vision reroute, failover reroute, account rotation). providerId/account/route are
   // set per hop by dispatch().
-  const baseCtx = { res, req, body, log, model, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, failoverState, failoverConfig, groupState, accountPools, failoverHopCount: 0 };
+  const baseCtx = { res, req, body, log, model, clientModel, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, failoverState, failoverConfig, groupState, accountPools, failoverHopCount: 0 };
 
   // 0a. FAILOVER GROUP PRE-ROUTE: a model riding a ladder is served by its group's
   //     effective tier (position + current shift offset). Takes precedence over plain
@@ -1554,6 +1661,7 @@ class FailoverPinger {
 // (used by the self-test to capture the routing line).
 export function createRouter(config, options = {}) {
   validateConfig(config);
+  config.compact = validateCompact(config.compact); // normalize + default-on
   const maxBytes = config.maxBodyBytes || DEFAULT_MAX_BODY_BYTES;
   const log = options.log || defaultLogger();
 
@@ -1581,6 +1689,9 @@ export function createRouter(config, options = {}) {
     // (possibly empty) = the dashboard-set schedule list, AUTHORITATIVE across restart —
     // an empty array means "the user deleted every schedule", which must survive a restart.
     schedules: (stored && Array.isArray(stored.schedules)) ? stored.schedules : null,
+    // compact: null = never edited in the UI (use the file's compact block / defaults); an
+    // object = the dashboard-set compaction config, AUTHORITATIVE across restart.
+    compact: (stored && stored.compact && typeof stored.compact === "object" && !Array.isArray(stored.compact)) ? stored.compact : null,
   };
   {
     const beforeTP = config.tokenPrices;
@@ -1588,6 +1699,7 @@ export function createRouter(config, options = {}) {
     const beforeFG = config.failoverGroups;
     const beforeBO = config.failoverRecoveryBackoffMs;
     const beforeSC = config.schedules;
+    const beforeCM = config.compact;
     try {
       if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
       // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
@@ -1602,6 +1714,8 @@ export function createRouter(config, options = {}) {
       }
       // Schedules: same authoritative-replace semantics; null sentinel = leave the file's.
       if (dashOverrides.schedules !== null) config.schedules = dashOverrides.schedules;
+      // Compact: authoritative-replace, re-normalized so a stored partial still gets defaults.
+      if (dashOverrides.compact !== null) config.compact = validateCompact(dashOverrides.compact);
       validateConfig(config);
     } catch {
       config.tokenPrices = beforeTP;
@@ -1609,6 +1723,7 @@ export function createRouter(config, options = {}) {
       config.failoverGroups = beforeFG;
       config.failoverRecoveryBackoffMs = beforeBO;
       config.schedules = beforeSC;
+      config.compact = beforeCM;
     }
   }
   // Persist ONLY the dashboard-set overrides (best-effort).
@@ -1674,6 +1789,11 @@ export function createRouter(config, options = {}) {
       quotaPoller.start(30000);
     }
   }
+
+  // Self-calibration store (see compact.mjs): a model's REAL context window, learned from an
+  // overflow error. Persisted per model under ~/.modelpipe/ so later requests fit it up front.
+  // Loaded once here; threaded into forward() → ctx and mutated by the reactive overflow path.
+  const learnedWindows = readJson("compact-learned-windows.json", {}) || {};
 
   const server = http.createServer((req, res) => {
     // Dashboard endpoints (before body reading)
@@ -1912,6 +2032,31 @@ export function createRouter(config, options = {}) {
       }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
+    // GET /v1/compact — the live, normalized context-compaction config (for the dashboard UI).
+    if (dashboard && req.method === "GET" && req.url === "/v1/compact") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ compact: config.compact }));
+      return;
+    }
+    // POST /v1/compact — replace the compaction config in-memory + persist (authoritative).
+    // Body: the compact object, or { compact: {...} }. Validated the SAME way as the file.
+    if (dashboard && req.method === "POST" && req.url === "/v1/compact") {
+      readBody(req, 16384).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          const raw = (data && typeof data === "object" && data.compact) ? data.compact : data;
+          const norm = validateCompact(raw, "compact");
+          config.compact = norm;
+          dashOverrides.compact = norm;
+          saveOverrides();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, compact: config.compact }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
+      return;
+    }
 
     // GET /v1/accounts — per-route account-pool state (labels, strategy, cooldowns).
     if (dashboard && req.method === "GET" && req.url === "/v1/accounts") {
@@ -2000,7 +2145,7 @@ export function createRouter(config, options = {}) {
         // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take
         // effect; an empty map counts as "no pairs" (don't buffer every error needlessly).
         const liveFailover = config.failover && Object.keys(config.failover).length ? config.failover : null;
-        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState, accountPools);
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState, accountPools, learnedWindows);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });

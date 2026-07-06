@@ -44,6 +44,7 @@ A shell `export` or a systemd `EnvironmentFile` still wins over it. Copy
 | `failoverGroups` | `[{ladder, mode?}]` | — | Coordinated [group failover](failover.md#group-failover). |
 | `failoverRecoveryIntervalMs` | number | `60000` | Min ms between recovery probes / account cooldown. Must be ≥ 1000. |
 | `proxyUrl` | string | — | Public URL of this proxy, surfaced in `--list`. |
+| `compact` | object | on by default | [Context fitting](compaction.md): trim a request to fit a smaller window on failover downshift (safety net; steady-state compaction is the harness's job). Editable at runtime (⚙) and persisted. |
 | `routes[]` | array | required | Route entries (below). |
 
 ## Route fields

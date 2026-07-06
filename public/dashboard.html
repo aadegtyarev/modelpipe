@@ -183,6 +183,27 @@ canvas{display:block;width:100%;height:200px}
   <button class="t-add" style="margin-top:8px" onclick="addSchedule()">+ Add schedule</button>
 </div>
 
+<div class="panel" id="compactPanel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+    <h3 style="margin:0">Context fitting (trim to fit a smaller window on failover downshift)</h3>
+    <label style="font-size:13px;color:var(--muted)"><input type="checkbox" id="cpEnabled"> enabled</label>
+    <button class="save" onclick="saveCompact()">Save</button>
+  </div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Safety net, not steady-state compaction (that's the harness's job). When a request is routed to a model whose context window is <b>smaller</b> than the client's — a failover downshift (e.g. 1M → 256K) where the grown conversation no longer fits — the older turns are mechanically dropped to a stable checkpoint (tool_use/tool_result pairs kept intact) so it fits. If a backend still rejects a request as too long, the real window is <b>learned</b> and the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path.</div>
+  <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)">
+    <label>safety % of window <input class="i" id="cpSafetyPct" size="4"></label>
+    <label>default window (tokens) <input class="i" id="cpWindowDefault" size="9"></label>
+    <label>overflow retries <input class="i" id="cpMaxRetries" size="3"></label>
+  </div>
+  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens) — order specific ids before broad globs</h3>
+  <div id="cpWindowRows"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+    <input class="i" id="cpWinGlob" placeholder="model id/glob (e.g. glm-5.2 or claude-*)" style="flex:1">
+    <input class="i" id="cpWinTokens" placeholder="tokens (e.g. 1000000)" style="width:160px">
+    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addCompactWindow()">Add</button>
+  </div>
+</div>
+
 <div class="panel" id="billingPanel">
   <h3>Billing (how the dashboard reports $ per provider)</h3>
   <div style="color:var(--muted);font-size:12px;margin-bottom:6px">metered = show real per-token cost · flat plan = subscription (tokens only, no $) · auto = derive from the route</div>
@@ -233,15 +254,59 @@ const CONSOLE={
 };
 const colors={};
 
+// ── Context compaction ───────────────────────────────────────────────────────
+let compactWindow={};                // editable mirror of compact.window (glob → tokens)
+const cpPct=v=>v!=null?Math.round(v*1000)/10:'';   // 0.95 → 95
+function renderCompact(d){
+  const c=(d&&d.compact)||{};
+  compactWindow={...(c.window||{})};
+  $('cpEnabled').checked=!!c.enabled;
+  $('cpSafetyPct').value=cpPct(c.safetyPct);
+  $('cpWindowDefault').value=c.windowDefault!=null?c.windowDefault:'';
+  $('cpMaxRetries').value=c.maxOverflowRetries!=null?c.maxOverflowRetries:'';
+  renderCompactWindows();
+}
+function renderCompactWindows(){
+  let h='';
+  for(const[g,t]of Object.entries(compactWindow)){
+    h+='<div style="display:flex;gap:6px;align-items:center;margin:2px 0">'+
+      '<span style="min-width:200px;color:var(--muted)">'+escHtml(g)+'</span>'+
+      '<input class="i" data-g="'+escHtml(g)+'" value="'+t+'" size="10" onchange="compactWindow[this.dataset.g]=+this.value">'+
+      '<button style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px" onclick="removeCompactWindow(\''+escHtml(g)+'\')">×</button></div>';
+  }
+  if(!h)h='<div class="muted" style="font-size:13px">No per-model overrides — all models use the default window.</div>';
+  $('cpWindowRows').innerHTML=h;
+}
+function addCompactWindow(){
+  const g=$('cpWinGlob').value.trim(),t=+$('cpWinTokens').value;
+  if(!g||!(t>0)){alert('Enter a model glob and a positive token count.');return;}
+  compactWindow[g]=t;$('cpWinGlob').value='';$('cpWinTokens').value='';renderCompactWindows();
+}
+function removeCompactWindow(g){delete compactWindow[g];renderCompactWindows();}
+async function saveCompact(){
+  const body={
+    enabled:$('cpEnabled').checked,
+    safetyPct:(+$('cpSafetyPct').value)/100,
+    windowDefault:+$('cpWindowDefault').value,
+    maxOverflowRetries:+$('cpMaxRetries').value,
+    window:compactWindow,
+  };
+  const r=await fetch("/v1/compact",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('Compaction save failed: '+(e.error||r.status));return;}
+  renderCompact(await r.json());
+}
+
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel'),sp=$('schedulesPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel'),sp=$('schedulesPanel'),cp=$('compactPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
   bp.style.display=show?'block':'none';
   sp.style.display=show?'block':'none';
+  cp.style.display=show?'block':'none';
   if(show){
+    fetch("/v1/compact").then(r=>r.json()).then(renderCompact).catch(()=>{});
     refreshSchedules();
     fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{

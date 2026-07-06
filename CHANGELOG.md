@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account label through from `dispatch`/rotation, matching the error path.
 
 ### Added
+- **Context fitting** (`compact` config + ⚙ Settings → *Context fitting*, **on by default**):
+  a safety net for the **failover downshift** — when a request running against a 1M-window
+  model fails over to a smaller-window backup (e.g. 256K), the grown conversation no longer
+  fits and the backup would reject it. The client can't prevent this (it still thinks it's on
+  the 1M model); only the proxy knows it rerouted. On a hop to a smaller-window model, the
+  request is mechanically trimmed to fit — dropping older turns to a **stable checkpoint** with
+  `tool_use`/`tool_result` pairs kept intact (never a dangling-pair 400). If a backend still
+  rejects a request as too long, the real window is **learned** (parsed from the error, else
+  ~90% of what was sent) and persisted per model, then the request is hard-trimmed and retried
+  (`maxOverflowRetries`). No summarizer, no per-session state, zero added latency on the normal
+  path. Steady-state compaction is left to the harness (Claude Code's native auto-compact).
+  Per-model windows via `compact.window`.
 - **Scheduled routing** (`schedules` config + ⚙ Settings → *Scheduled routing*): proactively
   rewrite a model glob to a cheaper target during set wall-clock windows — e.g. dodge z.ai's
   peak-hours quota multiplier (GLM-5.2 / GLM-5-Turbo cost 3× during 14:00–18:00 UTC+8) by
