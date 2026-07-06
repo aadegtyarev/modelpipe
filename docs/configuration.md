@@ -45,6 +45,8 @@ A shell `export` or a systemd `EnvironmentFile` still wins over it. Copy
 | `failoverRecoveryIntervalMs` | number | `60000` | Min ms between recovery probes / account cooldown. Must be ≥ 1000. |
 | `proxyUrl` | string | — | Public URL of this proxy, surfaced in `--list`. |
 | `compact` | object | on by default | [Context fitting](compaction.md): trim a request to fit a smaller window on failover downshift (safety net; steady-state compaction is the harness's job). Editable at runtime (⚙) and persisted. |
+| `concurrency` | `{modelGlob: maxInt}` | — | Max **simultaneous** in-flight requests per `(provider, model)`; overflow is queued, not failed. First match wins (order specific ids before globs). Per account/key. See [Concurrency limiting](failover.md#concurrency-limiting). Editable at runtime (`/v1/concurrency`) and persisted. |
+| `concurrencyQueueTimeoutMs` | number | `45000` | How long a request waits in a full concurrency queue before it's treated as a backend 429 (→ account rotation / model failover). Must be ≥ 1000. |
 | `routes[]` | array | required | Route entries (below). |
 
 ## Route fields

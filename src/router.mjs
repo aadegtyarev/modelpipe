@@ -42,6 +42,7 @@ import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
   StatsCollector, QuotaPoller, DASHBOARD_HTML,
@@ -52,6 +53,7 @@ import { readJson, writeJson, OVERRIDES_FILE } from "./store.mjs";
 import {
   fitToWindow, resolveWindow, isContextOverflow, parseOverflowLimit, bodyTokens, COMPACT_DEFAULTS,
 } from "./compact.mjs";
+import { ConcurrencyLimiter, resolveConcurrencyLimit } from "./concurrency.mjs";
 
 // Effective context window for a model = min(configured/glob window, anything learned from a
 // prior overflow). `learned` is the per-model self-calibration map threaded through ctx.
@@ -86,6 +88,26 @@ function fitBufferToWindow(bodyBuf, windowTokens, safetyPct, label, log) {
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
 const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per request
+// How long a request may wait in a full concurrency queue before it is treated as a 429
+// from the backend (→ account rotation / model failover). Kept well under a typical client
+// request timeout so the "wait, then failover" safety valve fires before the client gives up.
+const DEFAULT_QUEUE_TIMEOUT_MS = 45000;
+
+// A synthetic upstream response used when a concurrency-queue wait times out — there is no
+// real backend response, but feeding a 429 into the normal response handler reuses the entire
+// tested reroute cascade (account rotation → group/pair failover), and, when no failover is
+// configured, relays a clean 429 to the client instead of a silent hang. It's an empty-bodied
+// Readable carrying an Anthropic-shaped overloaded_error so both paths read cleanly.
+function makeSyntheticLimitResponse() {
+  const payload = Buffer.from(JSON.stringify({
+    type: "error",
+    error: { type: "overloaded_error", message: "modelpipe: backend concurrency limit reached and the request queue wait timed out" },
+  }), "utf8");
+  const r = Readable.from([payload]);
+  r.statusCode = 429;
+  r.headers = { "content-type": "application/json" };
+  return r;
+}
 
 // Hop-specific headers the router always recomputes for the upstream — never
 // forwarded verbatim.
@@ -679,6 +701,28 @@ export function validateConfig(config) {
   if (config.schedules !== undefined) {
     config.schedules = validateSchedules(config.schedules);
   }
+  // concurrency: optional object mapping model globs to a max number of SIMULTANEOUS in-flight
+  // requests against that (provider, model). E.g. { "glm-5.2": 3, "glm-*": 8 }. First match
+  // wins, so order specific ids before broad globs. An unmatched model is unlimited. The limit
+  // is per account/key (a pool of 2 accounts carries 2× the limit). See concurrency.mjs.
+  if (config.concurrency !== undefined) {
+    if (!config.concurrency || typeof config.concurrency !== "object" || Array.isArray(config.concurrency)) {
+      throw new Error("config.concurrency: must be an object { modelGlob: maxConcurrent }");
+    }
+    for (const [glob, limit] of Object.entries(config.concurrency)) {
+      if (typeof glob !== "string" || glob.length === 0) throw new Error(`config.concurrency: key "${glob}" must be a non-empty model glob`);
+      if (!Number.isInteger(limit) || limit < 1) throw new Error(`config.concurrency["${glob}"]: must be a positive integer (max simultaneous requests)`);
+      try { globToRegExp(glob); } catch (e) { throw new Error(`config.concurrency: key "${glob}" is not a valid glob: ${e.message}`); }
+    }
+  }
+  // concurrencyQueueTimeoutMs: optional number, default 45000. How long a request may wait in a
+  // full concurrency queue before it is treated as a backend 429 (→ account rotation / model
+  // failover). Must be >= 1000 to keep it above the network noise floor.
+  if (config.concurrencyQueueTimeoutMs !== undefined) {
+    if (typeof config.concurrencyQueueTimeoutMs !== "number" || config.concurrencyQueueTimeoutMs < 1000) {
+      throw new Error("config.concurrencyQueueTimeoutMs: must be a number >= 1000");
+    }
+  }
 
   return config;
 }
@@ -955,7 +999,7 @@ function relayBuffered(res, status, upstreamHeaders, buffered) {
 // swap — the body buffer is never transformed (passthrough; image bytes untouched).
 // `statsCtx` (optional): { stats, startTime } — when dashboard is enabled, carries the
 // stats collector and request start time for usage tracking.
-function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, providerId: optProviderId } = {}) {
+async function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, providerId: optProviderId, limiter, concLimit, queueTimeoutMs } = {}) {
   const passthrough = isPassthrough(route);
   // Fallback auth: if the client flew its own token, forward it (like passthrough);
   // otherwise inject the proxy's backend key (like key-swap). "The one that flies wins,
@@ -996,6 +1040,30 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, provid
   const providerId = optProviderId || providerIdFromUrl(route.base_url);
   const model = modelFromBody(body);
 
+  // CONCURRENCY GATE: when this (providerId, model) has a configured limit, hold the request
+  // in a FIFO queue until a slot frees rather than firing it and risking a limit-429. release
+  // is idempotent and wired onto every terminal event below, so a slot is freed exactly once
+  // no matter how the exchange ends (stream complete, buffered-for-reroute, error, or client
+  // disconnect). Unlimited models get a no-op release and skip all of this.
+  let release = null;
+  if (limiter && concLimit > 0 && concLimit !== Infinity) {
+    const key = `${providerId}\u0000${model}`;
+    try {
+      release = await limiter.acquire(key, concLimit, queueTimeoutMs || 0);
+    } catch (e) {
+      // Queue wait timed out (or any acquire failure) — no slot was taken. Treat it as a 429
+      // from this backend so the normal cascade (account rotation → model failover) runs; with
+      // no failover configured this relays a clean 429 to the client instead of hanging.
+      log(`concurrency: ${model} @ ${providerId} queue wait timed out (limit ${concLimit}) — treating as 429`);
+      if (onResponse) onResponse(makeSyntheticLimitResponse());
+      else sendError(res, 503, "backend concurrency limit reached; request queue wait timed out");
+      return;
+    }
+    // The client may have disconnected while we were queued — don't open an upstream call
+    // nobody is waiting for; just free the slot.
+    if (res.writableEnded || res.destroyed) { release(); return; }
+  }
+
   const client = upstream.protocol === "http:" ? http : https;
   const upstreamReq = client.request(
     {
@@ -1006,11 +1074,27 @@ function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, provid
       method: req.method,
       headers,
     },
-    onResponse || ((upstreamRes) => pipeResponse(upstreamRes, res, statsCtx
-      ? { stats: statsCtx.stats, providerId, model, startTime: statsCtx.startTime }
-      : null)),
+    (upstreamRes) => {
+      if (release) {
+        // The provider counts the request in flight until IT finishes sending the response
+        // (streamed SSE runs to 'end'); release then. 'close'/'aborted'/'error' are backstops.
+        // Registered BEFORE the handler runs so the slot is freed before any same-key reroute
+        // (e.g. an overflow hard-trim retry) tries to re-acquire it.
+        upstreamRes.on("end", release);
+        upstreamRes.on("close", release);
+        upstreamRes.on("aborted", release);
+        upstreamRes.on("error", release);
+      }
+      (onResponse || ((r) => pipeResponse(r, res, statsCtx
+        ? { stats: statsCtx.stats, providerId, model, startTime: statsCtx.startTime }
+        : null)))(upstreamRes);
+    },
   );
+  // Backstop: a client disconnect (or normal response completion) frees the slot even if the
+  // upstream never emits a terminal event.
+  if (release) res.on("close", release);
   upstreamReq.on("error", () => {
+    if (release) release();
     if (statsCtx && statsCtx.stats) {
       statsCtx.stats.record({ providerId, model, durationMs: Date.now() - statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
     }
@@ -1105,6 +1189,16 @@ function makeResponseHandler(ctx) {
       }
     };
 
+    // An account in a pool that answers cleanly has recovered → reset its progressive-cooldown
+    // counter so its NEXT limit-hit starts back at the first (1-min) ladder rung instead of the
+    // last one it climbed to. The account analogue of windBackProbe for a ladder.
+    const resetAccountBackoff = () => {
+      if (!ctx.account || !ctx.route || !ctx.accountPools) return;
+      const pool = ctx.accountPools.get(ctx.route);
+      const acct = pool && pool.accounts[ctx.account.idx];
+      if (acct && acct.attempts) acct.attempts = 0;
+    };
+
     // Fast path — success / SSE (2xx) and every other non-error that is neither a
     // 400 (vision classifier) nor a failover-candidate status. These are NEVER
     // buffered, so streaming stays intact.
@@ -1120,6 +1214,7 @@ function makeResponseHandler(ctx) {
     const compactOn = ctx.config.compact && ctx.config.compact.enabled;
     if (status !== 400 && !(compactOn && status === 413) && !isFailoverCandidate) {
       windBackProbe(); // a non-candidate response to a recovery probe = head is back
+      resetAccountBackoff(); // a clean answer means this account's cooldown ladder resets
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
         ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
         : null);
@@ -1183,7 +1278,15 @@ function makeResponseHandler(ctx) {
           const pool = ctx.accountPools.get(ctx.route);
           if (pool) {
             const now = Date.now();
-            pool.accounts[ctx.account.idx].exhaustedUntil = now + (ctx.config.failoverRecoveryIntervalMs || 60000);
+            // PROGRESSIVE cooldown: park the exhausted account for recoveryWaitMs(attempts) —
+            // the SAME 1→5→10-min ladder (config.failoverRecoveryBackoffMs) model failover
+            // rides, not a flat 60s. attempts counts consecutive limit-hits on THIS account;
+            // it climbs the ladder each repeat park and is reset to 0 the next time the account
+            // serves a request cleanly (recovery). Falls back to the flat cooldown when no
+            // backoff schedule is configured.
+            const exhausted = pool.accounts[ctx.account.idx];
+            exhausted.exhaustedUntil = now + recoveryWaitMs(ctx.config, exhausted.attempts || 0);
+            exhausted.attempts = (exhausted.attempts || 0) + 1;
             const nextIdx = pickAccountIndex(pool, now, ctx.account.idx);
             if (accountEligible(pool, nextIdx, now)) {
               recordStat(ctx, status); // record the error on the exhausted account label
@@ -1200,6 +1303,10 @@ function makeResponseHandler(ctx) {
                 }),
                 statsCtx: ctx.statsCtx,
                 providerId: acct.label,
+                limiter: ctx.limiter,
+                // Same model, but the next account has its OWN per-key concurrency budget.
+                concLimit: resolveConcurrencyLimit(ctx.config && ctx.config.concurrency, ctx.model),
+                queueTimeoutMs: queueTimeoutOf(ctx.config),
               });
               return;
             }
@@ -1300,6 +1407,7 @@ function makeResponseHandler(ctx) {
         ctx.log(`error-relay: ${ctx.model} status=${status} msg="${diagMsg}"`);
       } catch { /* never fail on diagnostics */ }
       windBackProbe(); // a non-retryable response to a recovery probe = head is back
+      resetAccountBackoff(); // account answered (a non-limit error) — it's reachable, reset its ladder
       if (ctx.statsCtx && ctx.statsCtx.stats) {
         ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
       }
@@ -1361,7 +1469,16 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
     onResponse: makeResponseHandler(ctx),
     statsCtx: carryCtx.statsCtx,
     providerId: setup.providerId,
+    limiter: carryCtx.limiter,
+    concLimit: resolveConcurrencyLimit(carryCtx.config && carryCtx.config.concurrency, targetModel),
+    queueTimeoutMs: queueTimeoutOf(carryCtx.config),
   });
+}
+
+// The queue-wait ceiling for this config, in ms (config.concurrencyQueueTimeoutMs or the
+// default). Beyond it a queued request is treated as a backend 429 (rotation/failover).
+function queueTimeoutOf(config) {
+  return (config && config.concurrencyQueueTimeoutMs) || DEFAULT_QUEUE_TIMEOUT_MS;
 }
 
 // Route one buffered request to its backend, with the reactive vision fallback
@@ -1372,7 +1489,7 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
 // models — when set, requests for that model pre-route to its backup.
 // `failoverConfig` is the config.failover mapping (model glob → backup model id).
 // `statsCtx` (optional): { stats } — when dashboard is enabled.
-function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null, learnedWindows = {}) {
+function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, failoverState = null, failoverConfig = null, groupState = null, accountPools = null, learnedWindows = {}, limiter = null) {
   let model = modelFromBody(body);
   // The model the CLIENT sized its context against (before any schedule/failover rewrite) —
   // the reference window for the downshift safety net in dispatch().
@@ -1400,7 +1517,7 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, f
   // Build the base ctx for makeResponseHandler — the shared context threaded through every
   // hop (vision reroute, failover reroute, account rotation). providerId/account/route are
   // set per hop by dispatch().
-  const baseCtx = { res, req, body, log, model, clientModel, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, failoverState, failoverConfig, groupState, accountPools, failoverHopCount: 0 };
+  const baseCtx = { res, req, body, log, model, clientModel, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, failoverState, failoverConfig, groupState, accountPools, limiter, failoverHopCount: 0 };
 
   // 0a. FAILOVER GROUP PRE-ROUTE: a model riding a ladder is served by its group's
   //     effective tier (position + current shift offset). Takes precedence over plain
@@ -1692,6 +1809,10 @@ export function createRouter(config, options = {}) {
     // compact: null = never edited in the UI (use the file's compact block / defaults); an
     // object = the dashboard-set compaction config, AUTHORITATIVE across restart.
     compact: (stored && stored.compact && typeof stored.compact === "object" && !Array.isArray(stored.compact)) ? stored.compact : null,
+    // concurrency: null = never edited in the UI (use the file's concurrency map); an object
+    // = the dashboard-set per-model concurrency limits, AUTHORITATIVE across restart (an empty
+    // object means "the user cleared every limit", which must survive a restart).
+    concurrency: (stored && stored.concurrency && typeof stored.concurrency === "object" && !Array.isArray(stored.concurrency)) ? stored.concurrency : null,
   };
   {
     const beforeTP = config.tokenPrices;
@@ -1700,6 +1821,7 @@ export function createRouter(config, options = {}) {
     const beforeBO = config.failoverRecoveryBackoffMs;
     const beforeSC = config.schedules;
     const beforeCM = config.compact;
+    const beforeCC = config.concurrency;
     try {
       if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
       // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
@@ -1716,6 +1838,8 @@ export function createRouter(config, options = {}) {
       if (dashOverrides.schedules !== null) config.schedules = dashOverrides.schedules;
       // Compact: authoritative-replace, re-normalized so a stored partial still gets defaults.
       if (dashOverrides.compact !== null) config.compact = validateCompact(dashOverrides.compact);
+      // Concurrency: same authoritative-replace semantics; null sentinel = leave the file's map.
+      if (dashOverrides.concurrency !== null) config.concurrency = dashOverrides.concurrency;
       validateConfig(config);
     } catch {
       config.tokenPrices = beforeTP;
@@ -1724,6 +1848,7 @@ export function createRouter(config, options = {}) {
       config.failoverRecoveryBackoffMs = beforeBO;
       config.schedules = beforeSC;
       config.compact = beforeCM;
+      config.concurrency = beforeCC;
     }
   }
   // Persist ONLY the dashboard-set overrides (best-effort).
@@ -1732,6 +1857,11 @@ export function createRouter(config, options = {}) {
   // so a repeat image call pre-routes to the vision target without the failing first
   // hop. Ephemeral, holds only model ids — never any request payload.
   const nonVisionCache = new Map();
+
+  // Per-backend concurrency limiter (FIFO queue keyed by providerId+model). Holds requests to
+  // a concurrency-limited (provider, model) rather than firing them into a limit-429. Empty of
+  // state until a request actually queues; unlimited models never touch it.
+  const limiter = new ConcurrencyLimiter();
 
   // Failover state + recovery pinger
   const failoverConfig = config.failover || null;
@@ -1748,7 +1878,7 @@ export function createRouter(config, options = {}) {
       accountPools.set(route, {
         strategy: route.strategy || "failover",
         rr: -1,
-        accounts: route.accounts.map((a) => ({ label: a.label, auth: a.auth, base_url: a.base_url || null, exhaustedUntil: 0 })),
+        accounts: route.accounts.map((a) => ({ label: a.label, auth: a.auth, base_url: a.base_url || null, exhaustedUntil: 0, attempts: 0 })),
       });
     }
   }
@@ -2058,6 +2188,55 @@ export function createRouter(config, options = {}) {
       return;
     }
 
+    // GET /v1/concurrency — configured per-model limits + the live queue state (honest, real
+    // active/queued counts from the limiter — never a fabricated number).
+    if (dashboard && req.method === "GET" && req.url === "/v1/concurrency") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        config: config.concurrency || {},
+        queueTimeoutMs: queueTimeoutOf(config),
+        // key is "providerId\u0000model"; split for a readable dashboard row.
+        live: limiter.snapshot().map((s) => {
+          const sep = s.key.indexOf("\u0000");
+          return { provider: sep >= 0 ? s.key.slice(0, sep) : s.key, model: sep >= 0 ? s.key.slice(sep + 1) : "", active: s.active, limit: s.limit, queued: s.queued };
+        }),
+      }));
+      return;
+    }
+    // POST /v1/concurrency — replace the per-model concurrency limits in-memory + persist
+    // (authoritative, same pattern as compact/schedules). Body: the { modelGlob: max } map, or
+    // { concurrency: {...} } / { concurrency, queueTimeoutMs }. Validated the SAME way as the file.
+    if (dashboard && req.method === "POST" && req.url === "/v1/concurrency") {
+      readBody(req, 16384).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          if (!data || typeof data !== "object") throw new Error("must be an object { modelGlob: maxConcurrent }");
+          const map = (data.concurrency && typeof data.concurrency === "object") ? data.concurrency : data;
+          const clean = {};
+          for (const [glob, limit] of Object.entries(map)) {
+            if (glob === "concurrency" || glob === "queueTimeoutMs") continue; // envelope keys, not globs
+            if (typeof glob !== "string" || glob.length === 0) throw new Error(`key "${glob}" must be a non-empty model glob`);
+            if (!Number.isInteger(limit) || limit < 1) throw new Error(`"${glob}": must be a positive integer`);
+            try { globToRegExp(glob); } catch (ge) { throw new Error(`key "${glob}" is not a valid glob: ${ge.message}`); }
+            clean[glob] = limit;
+          }
+          if (data.queueTimeoutMs !== undefined) {
+            if (typeof data.queueTimeoutMs !== "number" || data.queueTimeoutMs < 1000) throw new Error("queueTimeoutMs must be a number >= 1000");
+            config.concurrencyQueueTimeoutMs = data.queueTimeoutMs;
+          }
+          // The posted set is authoritative (replace) — a limit removed in the UI stays removed.
+          config.concurrency = clean;
+          dashOverrides.concurrency = clean;
+          saveOverrides();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, concurrency: config.concurrency, queueTimeoutMs: queueTimeoutOf(config) }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
+      return;
+    }
+
     // GET /v1/accounts — per-route account-pool state (labels, strategy, cooldowns).
     if (dashboard && req.method === "GET" && req.url === "/v1/accounts") {
       const now = Date.now();
@@ -2072,6 +2251,10 @@ export function createRouter(config, options = {}) {
             label: a.label,
             exhausted: (a.exhaustedUntil || 0) > now,
             cooldownUntil: a.exhaustedUntil || 0,
+            // How many ms remain on the current park (0 when live) and how far up the
+            // progressive-cooldown ladder this account has climbed (0 = fresh / recovered).
+            cooldownRemainingMs: Math.max(0, (a.exhaustedUntil || 0) - now),
+            attempts: a.attempts || 0,
           })),
         });
       }
@@ -2112,7 +2295,7 @@ export function createRouter(config, options = {}) {
       for (const pool of accountPools.values()) {
         for (const a of pool.accounts) {
           if (label && a.label !== label) continue;
-          if ((a.exhaustedUntil || 0) > 0) { a.exhaustedUntil = 0; cleared++; }
+          if ((a.exhaustedUntil || 0) > 0 || (a.attempts || 0) > 0) { a.exhaustedUntil = 0; a.attempts = 0; cleared++; }
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -2145,13 +2328,13 @@ export function createRouter(config, options = {}) {
         // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take
         // effect; an empty map counts as "no pairs" (don't buffer every error needlessly).
         const liveFailover = config.failover && Object.keys(config.failover).length ? config.failover : null;
-        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState, accountPools, learnedWindows);
+        forward(config, req, res, body, log, nonVisionCache, statsCtx, failoverState, liveFailover, groupState, accountPools, learnedWindows, limiter);
       })
       .catch((err) => sendError(res, err.status || 400, err.message || "bad request"));
   });
 
   // Expose stats + quotaPoller for teardown in tests
-  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger, groupState, accountPools };
+  server._modelpipe = { stats, quotaPoller, failoverState, failoverPinger, groupState, accountPools, limiter };
 
   // Archive session on graceful shutdown
   server.on("close", () => {

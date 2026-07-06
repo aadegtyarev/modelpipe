@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Account-pool cooldown is now progressive** (was a flat 60s): when an account in a pool
+  hits a rate-limit it is parked on the SAME `failoverRecoveryBackoffMs` ladder (1→5→10 min)
+  that model failover already rode — instead of re-probing a still-limited primary every 60s
+  and eating a wasted `primary -> backup` round-trip on each request. The counter climbs the
+  ladder on each repeat park and resets to the first rung the moment the account serves a
+  request cleanly. `GET /v1/accounts` now surfaces each account's `attempts` and
+  `cooldownRemainingMs`; `POST /v1/accounts/reset` clears both.
 - **GLM billing honesty**: the z.ai GLM Anthropic endpoint is the Coding Plan (a flat
   subscription), but a key-swap route defaulted to `metered` — so GLM usage showed a
   fabricated per-token $. `routeBilling` now defaults z.ai/GLM to `subscription`.
@@ -17,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account label through from `dispatch`/rotation, matching the error path.
 
 ### Added
+- **Concurrency limiter** (`concurrency` config + `GET`/`POST /v1/concurrency`): some providers
+  cap **simultaneous** requests per subscription/key (e.g. the z.ai GLM Coding Plan allows only
+  a few glm-5.2 in flight at once). Firing the N+1th just earns a limit-429, which failover then
+  "fixes" by degrading to a weaker model. Instead, `concurrency` (a `{ modelGlob: maxConcurrent }`
+  map, first-match-wins like `compact.window`) holds the overflow in a **FIFO queue** until an
+  in-flight slot frees, so the client keeps the strong model — it just waits. The limit is per
+  `(providerId, model)`, so with an **account pool** each key carries its own budget (2 keys ⇒
+  2× concurrent). A queued request that isn't served within `concurrencyQueueTimeoutMs`
+  (default 45s) is treated as a backend 429 → account rotation → model failover (the "wait, then
+  failover" safety valve). Any 429 that still gets through is therefore a *real* limit, so the
+  limiter and failover compose cleanly. Unlimited models are a zero-overhead no-op. Editable at
+  runtime and persisted.
 - **Context fitting** (`compact` config + ⚙ Settings → *Context fitting*, **on by default**):
   a safety net for the **failover downshift** — when a request running against a 1M-window
   model fails over to a smaller-window backup (e.g. 256K), the grown conversation no longer

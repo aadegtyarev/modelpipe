@@ -89,17 +89,55 @@ Anthropic API keys — rolling onto the next when one runs out of quota:
   **`base_url`**. With `accounts` set, route-level `auth` is optional.
 - **Key/backend-level** rotation — the model id is **not** rewritten. The same request just goes
   out under a different key.
-- **On a limit** the active account is parked for `failoverRecoveryIntervalMs`; the request
-  retries on the next eligible account, and the parked one is retried automatically once the
-  cooldown elapses.
+- **On a limit** the active account is parked and the request retries on the next eligible
+  account; the parked one becomes eligible again once its cooldown elapses. The park is
+  **progressive** — it climbs the same `failoverRecoveryBackoffMs` ladder (1→5→10 min) model
+  failover rides, so a persistently rate-limited key is re-probed ever less often instead of
+  every 60s. The ladder resets to its first rung the moment the account serves a request
+  cleanly. (With no `failoverRecoveryBackoffMs` set, it falls back to a flat
+  `failoverRecoveryIntervalMs`.)
 - **`strategy`** — `"failover"` (default) drains the primary and moves down on a limit;
   `"round-robin"` spreads requests to stretch total quota.
 - Works for any provider; opt-in per route.
-- **State:** `GET /v1/accounts` shows labels + cooldowns; `POST /v1/accounts/reset` (optionally
-  `?label=X`) clears cooldowns without a restart.
+- **State:** `GET /v1/accounts` shows labels, cooldowns, `cooldownRemainingMs`, and each
+  account's `attempts` (how far up the cooldown ladder it has climbed); `POST /v1/accounts/reset`
+  (optionally `?label=X`) clears both without a restart.
 
 Account rotation is the innermost layer: it happens **within** a route first; only when a pool
 has no live account left does model-level `failover`/`failoverGroups` take over.
 
 > **Subscription tokens expire.** A GLM Coding-Plan token or an Anthropic OAuth token is
 > short-lived — account pools are most robust with **long-lived API keys**.
+
+## Concurrency limiting
+
+Some providers cap **simultaneous** requests per subscription/key — e.g. the z.ai GLM Coding
+Plan only allows a few `glm-5.2` requests in flight at once. Firing the N+1th just earns a
+limit-`429`, which failover then "fixes" by degrading to a weaker backup model. That's the wrong
+cure: the model isn't down, it's momentarily busy.
+
+`concurrency` holds the overflow in a **FIFO queue** until an in-flight slot frees, so the
+client keeps the strong model — it just waits a moment:
+
+```json
+"concurrency": { "glm-5.2": 3, "glm-*": 8 },
+"concurrencyQueueTimeoutMs": 45000
+```
+
+- **First match wins** (like `compact.window`) — order specific ids before broad globs
+  (`glm-5.2` before `glm-*`). An unmatched model is **unlimited** (zero overhead — the gate is
+  opt-in per model, never a global throttle).
+- **Per account/key.** The limit is keyed by `(providerId, model)`, and for a pooled route
+  `providerId` is the account label — so a pool of two keys carries **2× the limit** at once,
+  matching how a provider meters the cap (per subscription).
+- **Held for the whole response.** A slot is occupied until the backend finishes sending
+  (streamed SSE included), matching the provider's own in-flight accounting.
+- **Wait, then failover.** A request that can't get a slot within `concurrencyQueueTimeoutMs`
+  (default 45s) is treated as a backend `429` → account rotation → model failover. So the queue
+  is the primary mechanism and failover is the safety valve; and any `429` that *does* get
+  through is a genuine limit (quota/overload), where failover is the right response. The two
+  compose cleanly.
+
+**State & runtime edits.** `GET /v1/concurrency` returns the configured limits plus the live
+queue (real `active`/`queued` counts per key — never a fabricated number). `POST /v1/concurrency`
+replaces the map (and optionally `queueTimeoutMs`), validated like the file and persisted.
