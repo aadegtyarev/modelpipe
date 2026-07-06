@@ -19,10 +19,21 @@
     "failoverGroups": "OPTIONAL array of ordered ladders (see _failoverGroups_doc) — coordinated 'shift the whole ladder' failover.",
     "schedules": "OPTIONAL array of time-of-day model rewrites (see _schedules_doc) — proactively route away from a peak-priced model during set hours.",
     "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB) — request body size cap; requests exceeding it get a 413",
-    "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog"
+    "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog",
+    "compact": "OPTIONAL object — context compaction, ON BY DEFAULT (see docs/compaction.md). Keeps a session under the model's context window without the client's built-in /compact (unreliable on non-Anthropic models). When a request exceeds triggerPct (default 0.70) of the window, older turns are summarized by a model into a checkpoint spliced ahead of a verbatim recent tail, landing near targetPct (default 0.15); the summary (<= summaryMaxPct, default 0.08) is cached per session (x-claude-code-session-id) and reused until the history re-crosses the trigger. If the summarizer fails or the request is already oversized, a deterministic mechanical trim to a stable checkpoint (tool_use/tool_result pairs intact) is the safety net. Fields: { enabled(bool), triggerPct, targetPct, summaryMaxPct (all in (0,1), targetPct<triggerPct, summaryMaxPct<targetPct), windowDefault(tokens), window({modelGlob:tokens}), summarizerModel(model id | null = the session's own model) }. Editable at runtime (dashboard ⚙) and persisted."
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
+  "compact": {
+    "enabled": true,
+    "triggerPct": 0.70,
+    "targetPct": 0.15,
+    "summaryMaxPct": 0.08,
+    "windowDefault": 200000,
+    "window": { "claude-*": 1000000, "deepseek-*": 128000 },
+    "summarizerModel": null
+  },
+  "_compact_doc": "Context compaction (ON by default) — see the _config_shape.compact entry above and docs/compaction.md. Summarizes older turns into a checkpoint once a request crosses triggerPct of the window, keeping the session under the limit. summarizerModel:null uses the session's own model; set a cheaper model id to offload summaries. window maps model globs to their context size (Claude with the 1M beta = 1000000). Remove this block to keep defaults.",
   "failover": {
     "claude-opus-*": "glm-5.1",
     "glm-5.1": "deepseek-v4-pro"

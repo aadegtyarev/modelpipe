@@ -49,6 +49,9 @@ import {
   decompressIfNeeded,
 } from "./stats.mjs";
 import { readJson, writeJson, OVERRIDES_FILE } from "./store.mjs";
+import {
+  compactBody, flattenForSummary, COMPACT_DEFAULTS, SUMMARY_PROMPT, SESSION_HEADER,
+} from "./compact.mjs";
 
 const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MB — bound the per-request buffer
 const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per request
@@ -452,8 +455,36 @@ function validateAuth(auth, at) {
   if (auth.fallback !== undefined && typeof auth.fallback !== "boolean") throw new Error(`${at}.auth.fallback: must be a boolean when present`);
 }
 
+// Validate + normalize the `compact` context-compaction block, filling defaults (compaction
+// is ON by default). Used both for the config file and the dashboard POST path, so the two
+// can never diverge. Returns a fully-populated, safe object. Throws on a bad type/range.
+export function validateCompact(compact, prefix = "config.compact") {
+  const c = { ...COMPACT_DEFAULTS, ...(compact && typeof compact === "object" ? compact : {}) };
+  if (compact !== undefined && (typeof compact !== "object" || compact === null || Array.isArray(compact))) {
+    throw new Error(`${prefix}: must be an object when present`);
+  }
+  if (typeof c.enabled !== "boolean") throw new Error(`${prefix}.enabled: must be a boolean`);
+  for (const k of ["triggerPct", "targetPct", "summaryMaxPct"]) {
+    if (typeof c[k] !== "number" || !(c[k] > 0) || c[k] >= 1) throw new Error(`${prefix}.${k}: must be a number in (0,1)`);
+  }
+  if (c.targetPct >= c.triggerPct) throw new Error(`${prefix}: targetPct must be below triggerPct`);
+  if (c.summaryMaxPct >= c.targetPct) throw new Error(`${prefix}: summaryMaxPct must be below targetPct`);
+  if (typeof c.windowDefault !== "number" || c.windowDefault <= 0) throw new Error(`${prefix}.windowDefault: must be a positive number of tokens`);
+  if (c.window === undefined || c.window === null) c.window = {};
+  if (typeof c.window !== "object" || Array.isArray(c.window)) throw new Error(`${prefix}.window: must be an object { modelGlob: tokens }`);
+  for (const [glob, tok] of Object.entries(c.window)) {
+    if (typeof tok !== "number" || tok <= 0) throw new Error(`${prefix}.window["${glob}"]: must be a positive number of tokens`);
+    try { globToRegExp(glob); } catch (e) { throw new Error(`${prefix}.window: key "${glob}" is not a valid glob: ${e.message}`); }
+  }
+  if (c.summarizerModel !== null && (typeof c.summarizerModel !== "string" || c.summarizerModel.length === 0)) {
+    throw new Error(`${prefix}.summarizerModel: must be a non-empty model id or null (use the session model)`);
+  }
+  return c;
+}
+
 export function validateConfig(config) {
   if (!config || typeof config !== "object") throw new Error("config: not an object");
+  if (config.compact !== undefined) validateCompact(config.compact);
   if (!Array.isArray(config.routes) || config.routes.length === 0) {
     throw new Error("config.routes: must be a non-empty array");
   }
@@ -1554,6 +1585,7 @@ class FailoverPinger {
 // (used by the self-test to capture the routing line).
 export function createRouter(config, options = {}) {
   validateConfig(config);
+  config.compact = validateCompact(config.compact); // normalize + default-on
   const maxBytes = config.maxBodyBytes || DEFAULT_MAX_BODY_BYTES;
   const log = options.log || defaultLogger();
 
@@ -1581,6 +1613,9 @@ export function createRouter(config, options = {}) {
     // (possibly empty) = the dashboard-set schedule list, AUTHORITATIVE across restart —
     // an empty array means "the user deleted every schedule", which must survive a restart.
     schedules: (stored && Array.isArray(stored.schedules)) ? stored.schedules : null,
+    // compact: null = never edited in the UI (use the file's compact block / defaults); an
+    // object = the dashboard-set compaction config, AUTHORITATIVE across restart.
+    compact: (stored && stored.compact && typeof stored.compact === "object" && !Array.isArray(stored.compact)) ? stored.compact : null,
   };
   {
     const beforeTP = config.tokenPrices;
@@ -1588,6 +1623,7 @@ export function createRouter(config, options = {}) {
     const beforeFG = config.failoverGroups;
     const beforeBO = config.failoverRecoveryBackoffMs;
     const beforeSC = config.schedules;
+    const beforeCM = config.compact;
     try {
       if (Object.keys(dashOverrides.tokenPrices).length) config.tokenPrices = { ...(config.tokenPrices || {}), ...dashOverrides.tokenPrices };
       // Failover: once edited in the dashboard, the dashboard set is AUTHORITATIVE (a
@@ -1602,6 +1638,8 @@ export function createRouter(config, options = {}) {
       }
       // Schedules: same authoritative-replace semantics; null sentinel = leave the file's.
       if (dashOverrides.schedules !== null) config.schedules = dashOverrides.schedules;
+      // Compact: authoritative-replace, re-normalized so a stored partial still gets defaults.
+      if (dashOverrides.compact !== null) config.compact = validateCompact(dashOverrides.compact);
       validateConfig(config);
     } catch {
       config.tokenPrices = beforeTP;
@@ -1609,6 +1647,7 @@ export function createRouter(config, options = {}) {
       config.failoverGroups = beforeFG;
       config.failoverRecoveryBackoffMs = beforeBO;
       config.schedules = beforeSC;
+      config.compact = beforeCM;
     }
   }
   // Persist ONLY the dashboard-set overrides (best-effort).
@@ -1672,6 +1711,80 @@ export function createRouter(config, options = {}) {
     if (Object.keys(keyEnvs).length > 0) {
       quotaPoller = new QuotaPoller(keyEnvs);
       quotaPoller.start(30000);
+    }
+  }
+
+  // --- context compaction (see compact.mjs) --------------------------------------------
+  // Per-session summary cache, one small JSON file per session id under ~/.modelpipe/.
+  const compactStore = {
+    get: (sid) => readJson(`compact-${sid}.json`, null),
+    set: (sid, v) => writeJson(`compact-${sid}.json`, v),
+  };
+
+  // One-shot request BACK THROUGH this same proxy — reuses all routing/auth/failover so the
+  // summarizer call needs no duplicated backend logic. Marked internal so it isn't itself
+  // compacted, and forced non-streaming so we can collect the whole body. Carries the
+  // caller's own auth (works for passthrough OAuth and is ignored/overwritten for key-swap).
+  function selfRequest(reqHeaders, bodyObj) {
+    return new Promise((resolve, reject) => {
+      const addr = server.address();
+      const port = addr && typeof addr === "object" ? addr.port : ((config.listen && config.listen.port) || 8787);
+      const payload = Buffer.from(JSON.stringify(bodyObj));
+      const headers = { "content-type": "application/json", "content-length": payload.length, "x-modelpipe-internal": "1" };
+      for (const h of ["authorization", "x-api-key", "anthropic-version", "anthropic-beta"]) {
+        if (reqHeaders[h]) headers[h] = reqHeaders[h];
+      }
+      const r = http.request({ host: "127.0.0.1", port, method: "POST", path: "/v1/messages", headers }, (up) => {
+        const chunks = [];
+        up.on("data", (c) => chunks.push(c));
+        up.on("end", () => resolve({ status: up.statusCode || 502, body: Buffer.concat(chunks).toString("utf8") }));
+      });
+      r.on("error", reject);
+      r.end(payload);
+    });
+  }
+
+  // Summarizer dep for compactBody: flatten the head to a text transcript and ask a model to
+  // compress it. Returns the summary text (throws on a non-200 / unparseable response, which
+  // compactBody catches and falls back to a mechanical trim).
+  async function summarizeImpl(reqHeaders, head, model, { maxTokens }) {
+    const summarizerModel = config.compact.summarizerModel || model;
+    const transcript = flattenForSummary(head);
+    const subBody = {
+      model: summarizerModel,
+      max_tokens: Math.max(512, Math.min(maxTokens || 4000, 8000)),
+      stream: false,
+      messages: [{ role: "user", content: `${SUMMARY_PROMPT}\n\n=== TRANSCRIPT START ===\n${transcript}\n=== TRANSCRIPT END ===\n\nProduce the summary now.` }],
+    };
+    const { status, body } = await selfRequest(reqHeaders, subBody);
+    if (status !== 200) throw new Error(`summarizer status ${status}`);
+    const parsed = JSON.parse(body);
+    const text = Array.isArray(parsed.content)
+      ? parsed.content.filter((b) => b && b.type === "text").map((b) => b.text).join("\n")
+      : "";
+    if (!text.trim()) throw new Error("summarizer returned no text");
+    return text;
+  }
+
+  // Run compaction on a main /v1/messages request body; returns the (possibly rewritten)
+  // Buffer to forward. Fail-open: any parse/logic error returns the original body untouched —
+  // compaction must never take the proxy down.
+  async function runCompaction(req, bodyBuf) {
+    if (!config.compact.enabled) return bodyBuf;
+    if (req.headers["x-modelpipe-internal"]) return bodyBuf;
+    if (req.method !== "POST" || !req.url || !req.url.startsWith("/v1/messages")) return bodyBuf;
+    try {
+      const parsed = JSON.parse(bodyBuf.toString("utf8"));
+      if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) return bodyBuf;
+      const model = parsed.model;
+      const deps = { store: compactStore, log, summarize: (h, m, o) => summarizeImpl(req.headers, h, m, o) };
+      const { messages, action } = await compactBody(parsed, req.headers, config.compact, model, deps);
+      if (action === "passthrough") return bodyBuf;
+      log(`compact: ${action} (${model})`);
+      return Buffer.from(JSON.stringify({ ...parsed, messages }));
+    } catch (e) {
+      log(`compact: skipped (${e && e.message})`);
+      return bodyBuf;
     }
   }
 
@@ -1912,6 +2025,31 @@ export function createRouter(config, options = {}) {
       }).catch(() => sendError(res, 400, "invalid body"));
       return;
     }
+    // GET /v1/compact — the live, normalized context-compaction config (for the dashboard UI).
+    if (dashboard && req.method === "GET" && req.url === "/v1/compact") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ compact: config.compact }));
+      return;
+    }
+    // POST /v1/compact — replace the compaction config in-memory + persist (authoritative).
+    // Body: the compact object, or { compact: {...} }. Validated the SAME way as the file.
+    if (dashboard && req.method === "POST" && req.url === "/v1/compact") {
+      readBody(req, 16384).then((body) => {
+        try {
+          const data = JSON.parse(body.toString("utf8"));
+          const raw = (data && typeof data === "object" && data.compact) ? data.compact : data;
+          const norm = validateCompact(raw, "compact");
+          config.compact = norm;
+          dashOverrides.compact = norm;
+          saveOverrides();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, compact: config.compact }));
+        } catch (e) {
+          sendError(res, 400, `invalid: ${e.message}`);
+        }
+      }).catch(() => sendError(res, 400, "invalid body"));
+      return;
+    }
 
     // GET /v1/accounts — per-route account-pool state (labels, strategy, cooldowns).
     if (dashboard && req.method === "GET" && req.url === "/v1/accounts") {
@@ -1995,6 +2133,7 @@ export function createRouter(config, options = {}) {
       return;
     }
     readBody(req, maxBytes)
+      .then((raw) => runCompaction(req, raw))
       .then((body) => {
         const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
         // Pass config.failover LIVE (not the startup snapshot) so dashboard edits take
