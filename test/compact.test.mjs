@@ -1,11 +1,11 @@
-// Self-test for modelpipe context compaction (src/compact.mjs). Pure — NO network, NO disk:
-// the orchestrator's summarizer and store are stubbed. Run: node test/compact.test.mjs
+// Self-test for modelpipe context fitting (src/compact.mjs). Pure — NO network, NO disk.
+// Run: node test/compact.test.mjs
 
 import {
   estimateTokens, overheadTokens, messagesTokens, bodyTokens,
   blocksOf, isRealUserPrompt, tailIsToolClosed, findCheckpoints, chooseCut,
-  spliceSummary, mechanicalTrim, headHash, resolveWindow, compactBody,
-  SESSION_HEADER, COMPACT_DEFAULTS,
+  prependNote, mechanicalTrim, truncateOversizedBlocks, fitToWindow,
+  isContextOverflow, parseOverflowLimit, resolveWindow, COMPACT_DEFAULTS,
 } from "../src/compact.mjs";
 
 let pass = 0;
@@ -15,10 +15,10 @@ function check(name, got, want) {
   if (g === w) { pass++; return; }
   fails.push(`  ✗ ${name}: got ${g}, want ${w}`);
 }
-function ok(name, cond) { check(name, !!cond, true); }
+const ok = (name, cond) => check(name, !!cond, true);
 
 // --- fixtures: a conversation with tool cycles -----------------------------------------
-const pad = (n) => "x".repeat(n); // n chars ≈ n/4 tokens
+const pad = (n) => "x".repeat(n);
 const u = (t) => ({ role: "user", content: [{ type: "text", text: t }] });
 const ur = (id) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] });
 const a = (t, id) => ({ role: "assistant", content: id ? [{ type: "text", text: t }, { type: "tool_use", id, name: "Bash", input: {} }] : [{ type: "text", text: t }] });
@@ -34,13 +34,10 @@ const convo = [
   u("task three " + pad(400)), // 7  checkpoint
 ];
 
-// --- token estimate ---
+// --- token estimate + block helpers ---
 check("estimateTokens string", estimateTokens("abcd"), 1);
 ok("bodyTokens counts system+tools+messages",
-  bodyTokens({ system: pad(40), tools: [{ x: pad(40) }], messages: [u(pad(40))] }) >
-  messagesTokens([u(pad(40))]));
-
-// --- block helpers ---
+  bodyTokens({ system: pad(40), tools: [{ x: pad(40) }], messages: [u(pad(40))] }) > messagesTokens([u(pad(40))]));
 check("blocksOf normalizes string", blocksOf({ content: "hi" }), [{ type: "text", text: "hi" }]);
 ok("isRealUserPrompt text-user", isRealUserPrompt(u("hi")));
 ok("isRealUserPrompt rejects tool_result-user", !isRealUserPrompt(ur("T1")));
@@ -51,75 +48,64 @@ check("findCheckpoints indices", findCheckpoints(convo), [0, 4, 7]);
 ok("tailIsToolClosed at a fresh prompt", tailIsToolClosed(convo, 4));
 ok("tailIsToolClosed false mid-cycle (orphan tool_result)", !tailIsToolClosed(convo, 2));
 
-// --- chooseCut: earliest checkpoint whose tail fits budget ---
-// tail sizes (msgs only): from 7 ≈ 100+, from 4 ≈ 200+, from 0 ≈ 300+ tokens.
+// --- chooseCut ---
 const cps = findCheckpoints(convo);
 check("chooseCut tiny budget -> deepest checkpoint 7", chooseCut(convo, cps, 130, 0), 7);
 check("chooseCut huge budget -> keep all (0)", chooseCut(convo, cps, 100000, 0), 0);
 
-// --- spliceSummary: folds summary into first retained msg, preserves tool pairing ---
-const spliced = spliceSummary(convo, 4, "SUMMARY-TEXT");
-check("spliceSummary length", spliced.length, convo.length - 4);
-ok("spliceSummary first block carries summary", blocksOf(spliced[0])[0].text.includes("SUMMARY-TEXT"));
-ok("spliceSummary keeps original prompt block", blocksOf(spliced[0]).some((b) => b.text && b.text.includes("task two")));
-ok("spliceSummary result is tool-closed", tailIsToolClosed(spliced, 0));
+// --- prependNote / mechanicalTrim ---
+const noted = prependNote(convo, 4, "NOTE");
+check("prependNote length", noted.length, convo.length - 4);
+ok("prependNote carries note", blocksOf(noted[0])[0].text === "NOTE");
+ok("prependNote keeps original prompt", blocksOf(noted[0]).some((b) => b.text && b.text.includes("task two")));
+ok("prependNote tool-closed", tailIsToolClosed(noted, 0));
 
-// --- mechanicalTrim ---
 const mt = mechanicalTrim(convo, 130, 0);
 ok("mechanicalTrim applied", mt.applied);
-ok("mechanicalTrim retained original slice fits budget", messagesTokens(convo.slice(mt.cut)) <= 130);
-ok("mechanicalTrim actually shrank", messagesTokens(mt.messages) < messagesTokens(convo));
+ok("mechanicalTrim retained slice fits budget", messagesTokens(convo.slice(mt.cut)) <= 130);
 ok("mechanicalTrim tool-closed", tailIsToolClosed(mt.messages, 0));
 
-// --- headHash stability / sensitivity ---
-check("headHash stable", headHash(convo, 4), headHash(convo.slice(0), 4));
-ok("headHash changes with count", headHash(convo, 4) !== headHash(convo, 5));
+// --- truncateOversizedBlocks: a single giant turn shrinks under budget ---
+const giant = [u("small"), u("q " + pad(8000))];
+const tb = truncateOversizedBlocks(giant, 200, 0);
+ok("truncateOversizedBlocks shrinks", messagesTokens(tb) < messagesTokens(giant));
+
+// --- fitToWindow ---
+const fitsBody = { system: "", tools: [], messages: convo }; // ~300 tok
+const rFits = fitToWindow(fitsBody, 100000, 0.95);
+ok("fitToWindow no-op when it fits", rFits.trimmed === false && rFits.parsed === fitsBody);
+
+const overBody = { system: "", tools: [], messages: convo };
+const rOver = fitToWindow(overBody, 200, 0.95); // budget 190 < ~300
+ok("fitToWindow trims when over", rOver.trimmed === true);
+ok("fitToWindow result tool-closed", tailIsToolClosed(rOver.parsed.messages, 0));
+ok("fitToWindow result smaller", messagesTokens(rOver.parsed.messages) < messagesTokens(convo));
+
+// giant single turn → falls to block truncation, still produces a body
+const rGiant = fitToWindow({ system: "", tools: [], messages: [u("q " + pad(20000))] }, 500, 0.95);
+ok("fitToWindow handles un-cuttable giant turn", rGiant.trimmed === true);
+ok("fitToWindow giant under budget-ish", bodyTokens(rGiant.parsed) <= 600);
+
+// --- isContextOverflow ---
+const errBody = (m) => Buffer.from(JSON.stringify({ error: { message: m } }));
+ok("overflow: anthropic prompt too long", isContextOverflow(400, errBody("prompt is too long: 250000 tokens > 200000 maximum")));
+ok("overflow: openai context_length_exceeded", isContextOverflow(400, errBody("This model's maximum context length is 128000 tokens")));
+ok("overflow: 413", isContextOverflow(413, errBody("input too long, reduce the length")));
+ok("overflow: rejects rate limit", !isContextOverflow(429, errBody("rate limit exceeded")));
+ok("overflow: rejects unrelated 400", !isContextOverflow(400, errBody("invalid api key")));
+
+// --- parseOverflowLimit ---
+check("parseOverflowLimit '> N maximum'", parseOverflowLimit(errBody("prompt is too long: 250000 tokens > 200000 maximum")), 200000);
+check("parseOverflowLimit 'maximum context length is N'", parseOverflowLimit(errBody("This model's maximum context length is 128000 tokens")), 128000);
+check("parseOverflowLimit none", parseOverflowLimit(errBody("something went wrong")), null);
 
 // --- resolveWindow ---
 check("resolveWindow glob", resolveWindow({ window: { "claude-*": 1000000 }, windowDefault: 200000 }, "claude-opus-4-8"), 1000000);
 check("resolveWindow default", resolveWindow({ window: { "glm-*": 200000 }, windowDefault: 128000 }, "deepseek-v4"), 128000);
+check("resolveWindow order (specific before glob)", resolveWindow({ window: { "glm-5.2": 1000000, "glm-*": 200000 }, windowDefault: 128000 }, "glm-5.2"), 1000000);
 
-// --- orchestrator: passthrough / summarized / reuse / mechanical ---
-const smallWindow = { ...COMPACT_DEFAULTS, windowDefault: 1000 }; // trigger 700, verbatim ~70 tok
-const bigBody = { system: "", tools: [], messages: convo }; // ~300 tok msgs — under trigger 700
-await (async () => {
-  const r = await compactBody(bigBody, {}, smallWindow, "m", { store: memStore(), summarize: async () => "S" });
-  check("passthrough under trigger", r.action, "passthrough");
-})();
+// --- defaults sane ---
+ok("defaults enabled + safetyPct", COMPACT_DEFAULTS.enabled === true && COMPACT_DEFAULTS.safetyPct > 0 && COMPACT_DEFAULTS.safetyPct <= 1);
 
-// Force over-trigger: window 300 -> trigger 210, msgs ~300 tok.
-const tinyWindow = { ...COMPACT_DEFAULTS, windowDefault: 300 };
-await (async () => {
-  let calls = 0;
-  const store = memStore();
-  const headers = { [SESSION_HEADER]: "sess-abc" };
-  const deps = { store, summarize: async () => { calls++; return "SUMMARY"; } };
-  const r1 = await compactBody({ system: "", tools: [], messages: convo }, headers, tinyWindow, "m", deps);
-  check("summarized over trigger", r1.action, "summarized");
-  ok("summary spliced into forwarded messages", JSON.stringify(r1.messages).includes("SUMMARY"));
-  ok("cached after summarize", !!store.get("sess-abc"));
-  // Same request again → reuse cache, NO second summarizer call.
-  const r2 = await compactBody({ system: "", tools: [], messages: convo }, headers, tinyWindow, "m", deps);
-  ok("second call reused or summarized", r2.action === "reuse" || r2.action === "summarized");
-  check("summarizer called exactly once on identical repeat", calls, 1);
-})();
-
-// Summarizer failure → mechanical safety net.
-await (async () => {
-  const deps = { store: memStore(), summarize: async () => { throw new Error("down"); } };
-  const r = await compactBody({ system: "", tools: [], messages: convo }, { [SESSION_HEADER]: "s2" }, tinyWindow, "m", deps);
-  ok("mechanical fallback on summarizer failure", r.action === "mechanical" || r.action === "passthrough");
-  ok("fallback still tool-closed", tailIsToolClosed(r.messages, 0));
-})();
-
-function memStore() {
-  const m = new Map();
-  return { get: (k) => m.get(k) || null, set: (k, v) => m.set(k, v) };
-}
-
-// --- report ---
-if (fails.length) {
-  console.error(`compact.test: ${pass} passed, ${fails.length} FAILED:\n` + fails.join("\n"));
-  process.exit(1);
-}
+if (fails.length) { console.error(`compact.test: ${pass} passed, ${fails.length} FAILED:\n` + fails.join("\n")); process.exit(1); }
 console.log(`compact.test: all ${pass} checks passed`);

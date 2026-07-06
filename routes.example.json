@@ -20,20 +20,18 @@
     "schedules": "OPTIONAL array of time-of-day model rewrites (see _schedules_doc) — proactively route away from a peak-priced model during set hours.",
     "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB) — request body size cap; requests exceeding it get a 413",
     "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog",
-    "compact": "OPTIONAL object — context compaction, ON BY DEFAULT (see docs/compaction.md). Keeps a session under the model's context window without the client's built-in /compact (unreliable on non-Anthropic models). When a request exceeds triggerPct (default 0.70) of the window, older turns are summarized by a model into a checkpoint spliced ahead of a verbatim recent tail, landing near targetPct (default 0.15); the summary (<= summaryMaxPct, default 0.08) is cached per session (x-claude-code-session-id) and reused until the history re-crosses the trigger. If the summarizer fails or the request is already oversized, a deterministic mechanical trim to a stable checkpoint (tool_use/tool_result pairs intact) is the safety net. Fields: { enabled(bool), triggerPct, targetPct, summaryMaxPct (all in (0,1), targetPct<triggerPct, summaryMaxPct<targetPct), windowDefault(tokens), window({modelGlob:tokens}), summarizerModel(model id | null = the session's own model) }. Editable at runtime (dashboard ⚙) and persisted."
+    "compact": "OPTIONAL object — context FITTING (a safety net, not steady-state compaction), ON BY DEFAULT (see docs/compaction.md). Handles the failover downshift: when a request running against a big-window model fails over to a smaller-window backup, the grown conversation no longer fits — the client can't prevent this (only the proxy knows it rerouted), so on a hop to a smaller-window model the request is mechanically trimmed to fit, dropping older turns to a stable checkpoint with tool_use/tool_result pairs intact (never a dangling-pair 400). If a backend still rejects a request as too long, the real window is learned (from the error message, else ~90% of what was sent) and persisted per model, then the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path; steady-state compaction is left to the harness (Claude Code's native auto-compact). Fields: { enabled(bool), safetyPct(0,1] trim to this fraction of the window, windowDefault(tokens for unmatched models), window({modelGlob:tokens} — FIRST MATCH WINS, order specific ids before broad globs), maxOverflowRetries(int>=0) }. Editable at runtime (dashboard ⚙) and persisted; learned windows in ~/.modelpipe/compact-learned-windows.json."
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
   "compact": {
     "enabled": true,
-    "triggerPct": 0.70,
-    "targetPct": 0.15,
-    "summaryMaxPct": 0.08,
+    "safetyPct": 0.95,
     "windowDefault": 200000,
-    "window": { "claude-*": 1000000, "deepseek-*": 128000 },
-    "summarizerModel": null
+    "window": { "glm-5.2": 1000000, "glm-*": 200000, "deepseek-v4-pro": 1000000, "deepseek-v4-flash": 1000000, "claude-opus-*": 1000000, "claude-*": 200000 },
+    "maxOverflowRetries": 2
   },
-  "_compact_doc": "Context compaction (ON by default) — see the _config_shape.compact entry above and docs/compaction.md. Summarizes older turns into a checkpoint once a request crosses triggerPct of the window, keeping the session under the limit. summarizerModel:null uses the session's own model; set a cheaper model id to offload summaries. window maps model globs to their context size (Claude with the 1M beta = 1000000). Remove this block to keep defaults.",
+  "_compact_doc": "Context fitting (ON by default) — a safety net for failover downshift, see the _config_shape.compact entry above and docs/compaction.md. Trims a request to fit the TARGET model's window when it's routed to a smaller-window backup than the client's model. window maps model ids/globs to their context size, FIRST MATCH WINS so list specific ids before broad globs (glm-5.2=1M before glm-*=200K). Steady-state compaction is the harness's job, not this. Remove this block to keep defaults.",
   "failover": {
     "claude-opus-*": "glm-5.1",
     "glm-5.1": "deepseek-v4-pro"

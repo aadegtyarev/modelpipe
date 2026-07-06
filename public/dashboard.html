@@ -185,22 +185,20 @@ canvas{display:block;width:100%;height:200px}
 
 <div class="panel" id="compactPanel">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-    <h3 style="margin:0">Context compaction (summarize old turns to stay under the window)</h3>
+    <h3 style="margin:0">Context fitting (trim to fit a smaller window on failover downshift)</h3>
     <label style="font-size:13px;color:var(--muted)"><input type="checkbox" id="cpEnabled"> enabled</label>
     <button class="save" onclick="saveCompact()">Save</button>
   </div>
-  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">When a request exceeds <b>trigger%</b> of the model's context window, older turns are summarized by the summarizer model into a compact checkpoint, landing around <b>target%</b> of the window (summary ≤ <b>summary max%</b> + a verbatim recent tail). If the summarizer fails, a deterministic mechanical trim to a safe checkpoint keeps the request valid. The per-session summary is cached, so the model is called only when (re)crossing the trigger.</div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Safety net, not steady-state compaction (that's the harness's job). When a request is routed to a model whose context window is <b>smaller</b> than the client's — a failover downshift (e.g. 1M → 256K) where the grown conversation no longer fits — the older turns are mechanically dropped to a stable checkpoint (tool_use/tool_result pairs kept intact) so it fits. If a backend still rejects a request as too long, the real window is <b>learned</b> and the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path.</div>
   <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)">
-    <label>trigger% <input class="i" id="cpTrigger" size="4"></label>
-    <label>target% <input class="i" id="cpTarget" size="4"></label>
-    <label>summary max% <input class="i" id="cpSummaryMax" size="4"></label>
+    <label>safety % of window <input class="i" id="cpSafetyPct" size="4"></label>
     <label>default window (tokens) <input class="i" id="cpWindowDefault" size="9"></label>
-    <label>summarizer model <input class="i" id="cpSummarizer" placeholder="(session model)" size="18"></label>
+    <label>overflow retries <input class="i" id="cpMaxRetries" size="3"></label>
   </div>
-  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens)</h3>
+  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens) — order specific ids before broad globs</h3>
   <div id="cpWindowRows"></div>
   <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-    <input class="i" id="cpWinGlob" placeholder="model glob (e.g. claude-*)" style="flex:1">
+    <input class="i" id="cpWinGlob" placeholder="model id/glob (e.g. glm-5.2 or claude-*)" style="flex:1">
     <input class="i" id="cpWinTokens" placeholder="tokens (e.g. 1000000)" style="width:160px">
     <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addCompactWindow()">Add</button>
   </div>
@@ -258,16 +256,14 @@ const colors={};
 
 // ── Context compaction ───────────────────────────────────────────────────────
 let compactWindow={};                // editable mirror of compact.window (glob → tokens)
-const cpPct=v=>v!=null?Math.round(v*1000)/10:'';   // 0.7 → 70
+const cpPct=v=>v!=null?Math.round(v*1000)/10:'';   // 0.95 → 95
 function renderCompact(d){
   const c=(d&&d.compact)||{};
   compactWindow={...(c.window||{})};
   $('cpEnabled').checked=!!c.enabled;
-  $('cpTrigger').value=cpPct(c.triggerPct);
-  $('cpTarget').value=cpPct(c.targetPct);
-  $('cpSummaryMax').value=cpPct(c.summaryMaxPct);
+  $('cpSafetyPct').value=cpPct(c.safetyPct);
   $('cpWindowDefault').value=c.windowDefault!=null?c.windowDefault:'';
-  $('cpSummarizer').value=c.summarizerModel||'';
+  $('cpMaxRetries').value=c.maxOverflowRetries!=null?c.maxOverflowRetries:'';
   renderCompactWindows();
 }
 function renderCompactWindows(){
@@ -290,12 +286,10 @@ function removeCompactWindow(g){delete compactWindow[g];renderCompactWindows();}
 async function saveCompact(){
   const body={
     enabled:$('cpEnabled').checked,
-    triggerPct:(+$('cpTrigger').value)/100,
-    targetPct:(+$('cpTarget').value)/100,
-    summaryMaxPct:(+$('cpSummaryMax').value)/100,
+    safetyPct:(+$('cpSafetyPct').value)/100,
     windowDefault:+$('cpWindowDefault').value,
+    maxOverflowRetries:+$('cpMaxRetries').value,
     window:compactWindow,
-    summarizerModel:$('cpSummarizer').value.trim()||null,
   };
   const r=await fetch("/v1/compact",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){const e=await r.json().catch(()=>({}));alert('Compaction save failed: '+(e.error||r.status));return;}

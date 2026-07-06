@@ -17,19 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account label through from `dispatch`/rotation, matching the error path.
 
 ### Added
-- **Context compaction** (`compact` config + ⚙ Settings → *Context compaction*, **on by
-  default**): keep a session under its model's context window without the built-in `/compact`
-  (which is unreliable on non-Anthropic models). When a request exceeds `triggerPct` (default
-  70%) of the window, the older turns are summarized by a model into a compact checkpoint —
-  spliced in ahead of a verbatim recent tail so the request lands around `targetPct` (~15%).
-  The summary is cached per session (`x-claude-code-session-id`) and reused until the history
-  re-crosses the trigger, so the summarizer runs occasionally, not every turn. It fixes both
-  the steady-state (never overflow) and the emergency (a huge session loaded from disk) case
-  with one rule — the proxy sees the full `messages` every turn and trims before forwarding.
-  A deterministic **mechanical trim** to a stable checkpoint (tool_use/tool_result pairs kept
-  intact) is the safety net when the summarizer is unavailable or the request is already
-  oversized — so a turn never crashes on a dangling pair. Summarizer defaults to the session
-  model; override with `compact.summarizerModel`. Per-model windows via `compact.window`.
+- **Context fitting** (`compact` config + ⚙ Settings → *Context fitting*, **on by default**):
+  a safety net for the **failover downshift** — when a request running against a 1M-window
+  model fails over to a smaller-window backup (e.g. 256K), the grown conversation no longer
+  fits and the backup would reject it. The client can't prevent this (it still thinks it's on
+  the 1M model); only the proxy knows it rerouted. On a hop to a smaller-window model, the
+  request is mechanically trimmed to fit — dropping older turns to a **stable checkpoint** with
+  `tool_use`/`tool_result` pairs kept intact (never a dangling-pair 400). If a backend still
+  rejects a request as too long, the real window is **learned** (parsed from the error, else
+  ~90% of what was sent) and persisted per model, then the request is hard-trimmed and retried
+  (`maxOverflowRetries`). No summarizer, no per-session state, zero added latency on the normal
+  path. Steady-state compaction is left to the harness (Claude Code's native auto-compact).
+  Per-model windows via `compact.window`.
 - **Scheduled routing** (`schedules` config + ⚙ Settings → *Scheduled routing*): proactively
   rewrite a model glob to a cheaper target during set wall-clock windows — e.g. dodge z.ai's
   peak-hours quota multiplier (GLM-5.2 / GLM-5-Turbo cost 3× during 14:00–18:00 UTC+8) by
