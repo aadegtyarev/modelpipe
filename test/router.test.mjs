@@ -14,9 +14,19 @@
 // backend that needs it, not a claim about DeepSeek.
 //
 // Run: node test/router.test.mjs
+//
+// Hermetic: points the persistence store at a throwaway temp dir via MODELPIPE_DIR
+// (set BEFORE importing router.mjs, since store.mjs reads it at import time), so the
+// dashboard endpoints that persist overrides never touch the real ~/.modelpipe.
 
 import http from "node:http";
-import {
+import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
+
+process.env.MODELPIPE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "modelpipe-router-test-"));
+
+const {
   createRouter,
   pickRoute,
   listModels,
@@ -40,7 +50,12 @@ import {
   pickAccountIndex,
   accountEligible,
   routeBilling,
-} from "../src/router.mjs";
+  parseTzOffset,
+  parseHHMM,
+  inWindow,
+  resolveSchedule,
+  validateSchedules,
+} = await import("../src/router.mjs");
 
 let pass = 0;
 const fails = [];
@@ -453,6 +468,62 @@ async function main() {
   check("pickFailoverModel empty string model ⇒ null", pickFailoverModel({ "a-*": "b" }, ""), null);
   check("pickFailoverModel exact match", pickFailoverModel({ "glm-5.1": "deepseek-v4-pro" }, "glm-5.1"), "deepseek-v4-pro");
   check("pickFailoverModel first match wins", pickFailoverModel({ "claude-*": "glm-5.1", "claude-opus-*": "deepseek" }, "claude-opus-4-8"), "glm-5.1");
+
+  // ── scheduled routing: pure helpers ────────────────────────────────────────
+  check("parseTzOffset +08:00", parseTzOffset("+08:00"), 480);
+  check("parseTzOffset +08 (no minutes)", parseTzOffset("+08"), 480);
+  check("parseTzOffset -0530", parseTzOffset("-0530"), -330);
+  check("parseTzOffset Z ⇒ 0", parseTzOffset("Z"), 0);
+  check("parseTzOffset empty ⇒ 0", parseTzOffset(""), 0);
+  check("parseTzOffset garbage ⇒ null", parseTzOffset("nope"), null);
+  check("parseHHMM 14:00", parseHHMM("14:00"), 840);
+  check("parseHHMM 9:05 (1-digit hour)", parseHHMM("9:05"), 545);
+  check("parseHHMM 24:00 ⇒ null", parseHHMM("24:00"), null);
+  check("parseHHMM 12:60 ⇒ null", parseHHMM("12:60"), null);
+  check("inWindow inside [from,to)", inWindow(9 * 60, 8 * 60, 10 * 60), true);
+  check("inWindow at from (inclusive)", inWindow(8 * 60, 8 * 60, 10 * 60), true);
+  check("inWindow at to (exclusive)", inWindow(10 * 60, 8 * 60, 10 * 60), false);
+  check("inWindow wraps midnight @23:00", inWindow(23 * 60, 22 * 60, 2 * 60), true);
+  check("inWindow wraps midnight @01:00", inWindow(1 * 60, 22 * 60, 2 * 60), true);
+  check("inWindow wraps midnight @12:00 outside", inWindow(12 * 60, 22 * 60, 2 * 60), false);
+  check("inWindow empty (from==to)", inWindow(9 * 60, 9 * 60, 9 * 60), false);
+
+  // GLM peak = 14:00–18:00 UTC+8 == 06:00–10:00 UTC.
+  const SCHED = [
+    { match: "glm-5.2", to: "glm-5.1", tz: "+08:00", windows: [["14:00", "18:00"]] },
+    { match: "glm-5-turbo", to: "glm-4.5-air", tz: "+08:00", windows: [["14:00", "18:00"]] },
+  ];
+  const peakMs = Date.parse("2026-07-06T07:00:00Z"); // 15:00 UTC+8 → peak
+  const offMs = Date.parse("2026-07-06T12:00:00Z");  // 20:00 UTC+8 → off-peak
+  const edgeStart = Date.parse("2026-07-06T06:00:00Z"); // exactly 14:00 UTC+8 → peak (inclusive)
+  const edgeEnd = Date.parse("2026-07-06T10:00:00Z");   // exactly 18:00 UTC+8 → off (exclusive)
+  check("resolveSchedule peak glm-5.2 → glm-5.1", resolveSchedule(SCHED, "glm-5.2", peakMs), "glm-5.1");
+  check("resolveSchedule peak glm-5-turbo → glm-4.5-air", resolveSchedule(SCHED, "glm-5-turbo", peakMs), "glm-4.5-air");
+  check("resolveSchedule off-peak ⇒ null", resolveSchedule(SCHED, "glm-5.2", offMs), null);
+  check("resolveSchedule non-matching model ⇒ null", resolveSchedule(SCHED, "glm-5.1", peakMs), null);
+  check("resolveSchedule window start inclusive", resolveSchedule(SCHED, "glm-5.2", edgeStart), "glm-5.1");
+  check("resolveSchedule window end exclusive", resolveSchedule(SCHED, "glm-5.2", edgeEnd), null);
+  check("resolveSchedule to==model is a no-op", resolveSchedule([{ match: "glm-5.2", to: "glm-5.2", tz: "+08:00", windows: [["14:00", "18:00"]] }], "glm-5.2", peakMs), null);
+  check("resolveSchedule empty list ⇒ null", resolveSchedule([], "glm-5.2", peakMs), null);
+  check("resolveSchedule glob match", resolveSchedule([{ match: "glm-5.*", to: "glm-4.5", tz: "Z", windows: [["00:00", "23:59"]] }], "glm-5.2", peakMs), "glm-4.5");
+
+  // validateSchedules — same rules whether from the file or the dashboard POST.
+  check("validateSchedules normalizes tz null → Z", validateSchedules([{ match: "a", to: "b", windows: [["1:00", "2:00"]] }])[0].tz, "Z");
+  let vsThrew;
+  vsThrew = false; try { validateSchedules("nope"); } catch { vsThrew = true; }
+  check("validateSchedules rejects non-array", vsThrew, true);
+  vsThrew = false; try { validateSchedules([{ match: "", to: "b", tz: "Z", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
+  check("validateSchedules rejects empty match", vsThrew, true);
+  vsThrew = false; try { validateSchedules([{ match: "a", to: "", tz: "Z", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
+  check("validateSchedules rejects empty to", vsThrew, true);
+  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "bad", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
+  check("validateSchedules rejects bad tz", vsThrew, true);
+  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "Z", windows: [] }]); } catch { vsThrew = true; }
+  check("validateSchedules rejects empty windows", vsThrew, true);
+  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "Z", windows: [["25:00", "2:00"]] }]); } catch { vsThrew = true; }
+  check("validateSchedules rejects bad time", vsThrew, true);
+  check("validateConfig accepts valid schedules",
+    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], schedules: SCHED }).schedules.length, 2);
 
   // ── failover GROUPS: pure helpers ──────────────────────────────────────────
   const LADDER = ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"];
@@ -1241,6 +1312,48 @@ async function main() {
       delete process.env.GR_KEY;
       await close(grRouter);
       await close(grStub.server);
+    }
+  }
+
+  // ── scheduled routing e2e (in-window pre-route rewrite + GET/POST /v1/schedules) ──
+  {
+    process.env.SC_KEY = "SC-KEY";
+    const scStub = makeFlexStub(200);
+    const scPort = await listen(scStub.server);
+    const scRouter = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      dashboard: true,
+      // Always-open window (whole day, UTC) so the rewrite is deterministic regardless
+      // of when the test runs.
+      schedules: [{ match: "glm-5.2", to: "glm-5.1", tz: "Z", windows: [["00:00", "23:59"]] }],
+      routes: [
+        { match: "glm-*", base_url: `http://127.0.0.1:${scPort}`, auth: { header: "x-api-key", keyEnv: "SC_KEY" } },
+      ],
+    });
+    const scRouterPort = await listen(scRouter);
+    try {
+      await requestH(scRouterPort, { model: "glm-5.2", messages: [] });
+      check("schedule e2e: glm-5.2 rewritten to glm-5.1 in-window", JSON.parse(scStub.received[0].body).model, "glm-5.1");
+
+      const g = JSON.parse((await get(scRouterPort, "/v1/schedules")).body);
+      check("GET /v1/schedules returns the schedule", g.schedules.length, 1);
+      check("GET /v1/schedules marks it active now", g.schedules[0].active, true);
+
+      // POST replaces the list (authoritative), GET reflects it, and the new mapping routes.
+      const p = await postJson(scRouterPort, "/v1/schedules", { schedules: [{ match: "glm-5.2", to: "glm-4.5", tz: "Z", windows: [["00:00", "23:59"]] }] });
+      check("POST /v1/schedules ok", p.status, 200);
+      const g2 = JSON.parse((await get(scRouterPort, "/v1/schedules")).body);
+      check("POST replaced schedule target", g2.schedules[0].to, "glm-4.5");
+      await requestH(scRouterPort, { model: "glm-5.2", messages: [] });
+      check("schedule e2e: POST-updated mapping takes effect", JSON.parse(scStub.received[scStub.received.length - 1].body).model, "glm-4.5");
+
+      // Invalid POST rejected the SAME way the file is (bad time).
+      const bad = await postJson(scRouterPort, "/v1/schedules", { schedules: [{ match: "x", to: "y", tz: "Z", windows: [["25:00", "2:00"]] }] });
+      check("POST /v1/schedules rejects bad time → 400", bad.status, 400);
+    } finally {
+      delete process.env.SC_KEY;
+      await close(scRouter);
+      await close(scStub.server);
     }
   }
 

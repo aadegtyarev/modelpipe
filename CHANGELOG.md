@@ -11,8 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GLM billing honesty**: the z.ai GLM Anthropic endpoint is the Coding Plan (a flat
   subscription), but a key-swap route defaulted to `metered` — so GLM usage showed a
   fabricated per-token $. `routeBilling` now defaults z.ai/GLM to `subscription`.
+- **Account-pool stats under the right label** (issue #15): the success (streaming) path
+  computed `providerId` from the route URL, so per-account dashboard cards showed zero
+  tokens while all usage piled under the URL-derived id. `proxyToRoute` now takes the
+  account label through from `dispatch`/rotation, matching the error path.
 
 ### Added
+- **Scheduled routing** (`schedules` config + ⚙ Settings → *Scheduled routing*): proactively
+  rewrite a model glob to a cheaper target during set wall-clock windows — e.g. dodge z.ai's
+  peak-hours quota multiplier (GLM-5.2 / GLM-5-Turbo cost 3× during 14:00–18:00 UTC+8) by
+  dropping to a no-multiplier tier for those hours and staying on the flat Coding Plan.
+  Windows are expressed in a fixed UTC offset and evaluated against the system clock via the
+  UTC epoch (correct regardless of the host timezone). Editable in the dashboard and persisted
+  (`GET`/`POST /v1/schedules`); a calm green banner shows when a schedule is saving quota.
 - **Per-provider console links** in the dashboard (Anthropic / z.ai / DeepSeek / OpenRouter),
   not just z.ai.
 - **Billing override in Settings** (`POST /v1/billing`, persisted): flip any provider between
