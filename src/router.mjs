@@ -291,6 +291,58 @@ export function effectiveLadderModel(ladder, offset, p) {
   return ladder[Math.min(p + (offset || 0), last)];
 }
 
+// A ready-to-consume, machine-readable signal of what the HEAD slot resolves to RIGHT NOW —
+// so an external consumer (statusline, an out-of-harness compaction trigger, the dashboard)
+// reads ONE field and reacts, without re-deriving `effective[offset]` or keeping its own
+// model→window table. modelpipe already knows the truth of a downshift; this surfaces it.
+//
+// The head is served by the FIRST failover group (the one carrying the head slot). Returns
+// null when no group is configured (there is no coordinated head to speak of — plain pairs
+// reroute per-model, they don't shift a shared head). Shape:
+//   believed        — the configured head (offset 0): what the client still thinks it's on
+//   head            — the model actually serving the head now (after any shift)
+//   window          — head's effective context window, from effectiveWindow (→ resolveWindow,
+//                     min'd with any learned ceiling) — the SINGLE source, never client-sized
+//   shifted         — offset > 0 (fast branch for a consumer)
+//   recoversInSec   — ETA to the next head-recovery probe window (shiftedAt + recoveryWaitMs);
+//                     null when healthy
+//   accountCooldown — seconds until the head model's account pool has a live key again, when
+//                     every key is currently parked on its progressive backoff; else null
+export function computeEffectiveHead(config, groupState, learnedWindows, accountPools, now) {
+  const groups = config && config.failoverGroups;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+  const grp = groups[0];
+  const gs = (groupState && groupState[0]) || { offset: 0, shiftedAt: 0, attempts: 0, nextProbeAt: 0 };
+  const ladder = grp.ladder;
+  const offset = gs.offset || 0;
+  const believed = ladder[0];
+  const head = effectiveLadderModel(ladder, offset, 0);
+  const shifted = offset > 0;
+  const window = effectiveWindow(config.compact || {}, learnedWindows || {}, head);
+
+  let recoversInSec = null;
+  if (shifted) {
+    const due = (gs.shiftedAt || 0) + recoveryWaitMs(config, gs.attempts || 0);
+    recoversInSec = Math.max(0, Math.ceil((due - now) / 1000));
+  }
+
+  // If the head model's backend is an account pool with every key parked, report how long
+  // until the soonest one frees (progressive account backoff). A single-key backend, a live
+  // key, or a glob head that resolves to no route all report null.
+  let accountCooldown = null;
+  const headRoute = pickRoute(head, config.routes);
+  const pool = headRoute && accountPools && accountPools.get(headRoute);
+  if (pool && pool.accounts.length) {
+    const anyLive = pool.accounts.some((a) => (a.exhaustedUntil || 0) <= now);
+    if (!anyLive) {
+      const soonest = Math.min(...pool.accounts.map((a) => a.exhaustedUntil || 0));
+      accountCooldown = Math.max(0, Math.ceil((soonest - now) / 1000));
+    }
+  }
+
+  return { believed, head, window, shifted, recoversInSec, accountCooldown };
+}
+
 // Pure: resolve which group (if any) a model rides, its position on that ladder, the
 // group's current offset, and the effective tier to route to. `groupState` is a parallel
 // array of { offset } (per group). null when no ladder matches.
@@ -2003,6 +2055,10 @@ export function createRouter(config, options = {}) {
         config: config.failover || {},
         active,
         groups,
+        // Ready-to-consume signal of the head slot's current effective state (see
+        // computeEffectiveHead): believed vs actual head, its window, recovery ETA. null when
+        // no failover group is configured. Consumers read this instead of re-deriving offsets.
+        effective: computeEffectiveHead(config, groupState, learnedWindows, accountPools, Date.now()),
         cooldownMs: config.failoverRecoveryIntervalMs || 60000,
         backoffMs: Array.isArray(config.failoverRecoveryBackoffMs) ? config.failoverRecoveryBackoffMs : null,
       }));
