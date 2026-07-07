@@ -672,13 +672,14 @@ export function validateConfig(config) {
     throw new Error("config.dashboard: must be a boolean (default false) when present");
   }
   // tokenPrices: optional per-model API price overrides ($ per 1M tokens).
-  // E.g. { "claude-opus-*": { input: 15, output: 75 }, "glm-5.2": { input: 1.2, output: 4.0 } }.
-  // Model keys can use * globs. Falls back to built-in PRICE_MAP.
+  // E.g. { "claude-opus-*": { input: 15, output: 75 }, "glm-5.2": { input: 1.2, output: 4.0, cacheRead: 0.26 } }.
+  // cacheRead is optional (price for cache_read_input_tokens); falls back to the input
+  // rate when omitted. Model keys can use * globs. Falls back to built-in PRICE_MAP.
   if (config.tokenPrices !== undefined) {
-    if (typeof config.tokenPrices !== "object") throw new Error("config.tokenPrices: must be an object { model: { input, output } }");
+    if (typeof config.tokenPrices !== "object") throw new Error("config.tokenPrices: must be an object { model: { input, output, cacheRead? } }");
     for (const [key, p] of Object.entries(config.tokenPrices)) {
-      if (!p || typeof p.input !== "number" || typeof p.output !== "number") {
-        throw new Error(`config.tokenPrices.${key}: must be { input: number, output: number }`);
+      if (!p || typeof p.input !== "number" || typeof p.output !== "number" || (p.cacheRead !== undefined && typeof p.cacheRead !== "number")) {
+        throw new Error(`config.tokenPrices.${key}: must be { input: number, output: number, cacheRead?: number }`);
       }
     }
   }
@@ -2024,8 +2025,9 @@ export function createRouter(config, options = {}) {
           // Accept either a bare price map or { tokenPrices } / legacy { _tokenPrices }.
           const prices = data.tokenPrices || data._tokenPrices || data;
           for (const [k, p] of Object.entries(prices)) {
-            if (!p || typeof p.input !== "number" || typeof p.output !== "number" || p.input < 0 || p.output < 0) {
-              throw new Error(`price for "${k}" must be { input: number>=0, output: number>=0 }`);
+            if (!p || typeof p.input !== "number" || typeof p.output !== "number" || p.input < 0 || p.output < 0 ||
+                (p.cacheRead !== undefined && (typeof p.cacheRead !== "number" || p.cacheRead < 0))) {
+              throw new Error(`price for "${k}" must be { input: number>=0, output: number>=0, cacheRead?: number>=0 }`);
             }
           }
           config.tokenPrices = { ...(config.tokenPrices || {}), ...prices };

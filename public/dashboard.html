@@ -734,7 +734,7 @@ function render(stats,quotas,cfg){
   // total tokens, requests, start time. No "effective" proration fantik.
   let meteredCost=0,tokens=0,reqs=0;
   for(const[mid,m]of Object.entries(models)){
-    tokens+=(m.inputTokens||0)+(m.outputTokens||0);
+    tokens+=(m.inputTokens||0)+(m.cacheReadTokens||0)+(m.outputTokens||0);
     reqs+=m.requests||0;
     if(isMetered(m.providerId))meteredCost+=m.cost||0;
   }
@@ -746,12 +746,14 @@ function render(stats,quotas,cfg){
     (s.startedAt?'<div class="stat">'+new Date(s.startedAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false})+'<span class="lbl">started</span></div>':'');
 
   // Model cards
-  const sorted=Object.entries(models).sort((a,b)=>((b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens)));
+  const inTot=m=>(m.inputTokens||0)+(m.cacheReadTokens||0);
+  const sorted=Object.entries(models).sort((a,b)=>((inTot(b[1])+b[1].outputTokens)-(inTot(a[1])+a[1].outputTokens)));
   let mhtml='';
   for(const[mid,m]of sorted){
     const online=m.lastRequestAt>Date.now()-300000;
     const metered=isMetered(m.providerId);
-    const tot=(m.inputTokens+m.outputTokens)||1;
+    const inSum=inTot(m);
+    const tot=(inSum+m.outputTokens)||1;
     // Red dot ONLY when the model is fully failing — traffic sent, zero successful responses.
     const allFail=m.requests>0&&(m.requests-(m.errors||0))===0;
     const dotColor=allFail?'var(--red)':(online?'var(--green)':'var(--muted)');
@@ -761,10 +763,10 @@ function render(stats,quotas,cfg){
       '<div class="provider">'+escHtml(m.providerId)+'</div>'+
       '<div class="price">'+(metered?pricestr(m.priceInput,m.priceOutput):'subscription — cost not metered')+'</div>'+
       '<div class="bar-wrap"><div class="bar">'+
-        '<div class="in" style="width:'+(m.inputTokens/tot*100)+'%"></div>'+
+        '<div class="in" style="width:'+(inSum/tot*100)+'%"></div>'+
         '<div class="out" style="width:'+(m.outputTokens/tot*100)+'%"></div></div></div>'+
       '<div class="metrics">'+
-        '<span><span class="val">'+fmt(m.inputTokens+m.outputTokens)+'</span> <span class="unit">tok</span></span>'+
+        '<span><span class="val">'+fmt(tot)+'</span> <span class="unit">tok</span></span>'+
         '<span><span class="val">'+(metered?usd(m.cost):'—')+'</span></span>'+
         '<span><span class="val">'+fmt(m.requests)+'</span> <span class="unit">req</span></span></div>'+
       '</div>';
@@ -785,7 +787,7 @@ function render(stats,quotas,cfg){
     const cost=sm.reduce((a,m)=>a+(m.cost||0),0);
     const treq=sm.reduce((a,m)=>a+(m.requests||0),0);
     const terr=sm.reduce((a,m)=>a+(m.errors||0),0);
-    const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.outputTokens||0),0);
+    const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.cacheReadTokens||0)+(m.outputTokens||0),0);
     const online=sm.some(m=>m.lastRequestAt>Date.now()-300000);
     // Red dot ONLY when this provider is fully failing — traffic sent, zero successful responses.
     const allFail=treq>0&&(treq-terr)===0;
@@ -825,7 +827,7 @@ function render(stats,quotas,cfg){
     lhtml+='<div class="row'+(e.status>=400?' er':'')+'">'+
       '<span class="t">'+timeStr+'</span>'+
       '<span class="m">'+escHtml(e.model||'?')+'</span>'+
-      '<span class="tok">'+fmt(e.inputTokens)+' in / '+fmt(e.outputTokens)+' out</span>'+
+      '<span class="tok">'+fmt((e.inputTokens||0)+(e.cacheReadTokens||0))+' in / '+fmt(e.outputTokens)+' out</span>'+
       '<span class="cost">'+(metered?usd(e.cost):'—')+'</span>'+
       '<span class="ms">'+fmt(e.durationMs)+'ms</span></div>';
   }
@@ -843,7 +845,7 @@ function drawChart(timeline){
   for(const e of timeline){
     const bin=Math.floor((e.ts-start)/binMs),key=e.model||'?';
     if(!series[key])series[key]=new Array(bins).fill(0);
-    if(bin<bins)series[key][bin]+=(e.inputTokens||0)+(e.outputTokens||0);
+    if(bin<bins)series[key][bin]+=(e.inputTokens||0)+(e.cacheReadTokens||0)+(e.outputTokens||0);
   }
   Object.values(series).forEach(sr=>{for(let i=1;i<sr.length;i++)sr[i]+=sr[i-1]});
   const pad={l:40,r:10,t:8,b:20},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;
