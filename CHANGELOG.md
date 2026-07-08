@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Request routing trace** in the dashboard log: each row now shows **what the client sent →
+  what we routed it to `[provider]` → what the provider echoed back** (`message_start.message.model`
+  / the JSON body's `model`). The client alias appears only when a profile rewrote it; the
+  returned model only when it differs from what we asked (a **provider-side redirect**, shown in
+  orange). Lets you verify at a glance that the client passes the right tier, the right profile
+  substitution happens, and the provider actually serves it — not a silent swap.
+
 ## [0.9.0] - 2026-07-08
 
 ### Fixed
