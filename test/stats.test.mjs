@@ -92,6 +92,28 @@ async function run() {
   check("SSE tracker extracts output_tokens", rec[0].outputTokens, 45);
   check("SSE tracker tags status 200", rec[0].status, 200);
 
+  // ── request trace: client alias, routed model, provider-returned model ──────────
+  const recT = [];
+  const trT = createUsageTracker({ record: (e) => recT.push(e) }, { providerId: "anthropic", model: "claude-sonnet-5", clientModel: "glm-5.2", startTime: Date.now() });
+  const drainedT = drain(trT);
+  // provider echoes a DIFFERENT model id (a provider-side redirect) than we routed to
+  trT.write('event: message_start\ndata: {"message":{"model":"claude-sonnet-5-20260101","usage":{"input_tokens":100}}}\n\n');
+  trT.write('event: message_delta\ndata: {"usage":{"output_tokens":42}}\n\n');
+  trT.end();
+  await drainedT;
+  check("trace: records the client alias", recT[0].clientModel, "glm-5.2");
+  check("trace: records the routed model", recT[0].model, "claude-sonnet-5");
+  check("trace: records the provider-returned model", recT[0].providerModel, "claude-sonnet-5-20260101");
+
+  // trace via the non-streaming JSON fallback (provider model from top-level .model)
+  const recTJ = [];
+  const trTJ = createUsageTracker({ record: (e) => recTJ.push(e) }, { providerId: "deepseek", model: "deepseek-v4-pro", clientModel: "deepseek-v4-pro", startTime: Date.now() });
+  const drainedTJ = drain(trTJ);
+  trTJ.write('{"model":"deepseek-v4-pro-0711","usage":{"input_tokens":5,"output_tokens":7}}');
+  trTJ.end();
+  await drainedTJ;
+  check("trace(json): provider-returned model from JSON body", recTJ[0].providerModel, "deepseek-v4-pro-0711");
+
   // ── SSE usage tracker: cache_creation folds into inputTokens, cache_read stays separate ─
   const recCache = [];
   const trCache = createUsageTracker({ record: (e) => recCache.push(e) }, { providerId: "openrouter", model: "z-ai/glm-5.2", startTime: Date.now() });

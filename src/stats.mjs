@@ -347,11 +347,12 @@ function extractUsage(usage) {
   };
 }
 
-export function createUsageTracker(stats, { providerId, model, startTime }) {
+export function createUsageTracker(stats, { providerId, model, clientModel, startTime }) {
   let buffer = "";
   let inputTokens = 0;
   let cacheReadTokens = 0;
   let outputTokens = 0;
+  let providerModel = null; // the model id the provider ECHOES BACK (catches provider-side redirects)
   let totalBuffer = "";
   let started = false;
   let looksJson = false;
@@ -385,10 +386,13 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
         if (!eventType || !dataStr) continue;
         try {
           const data = JSON.parse(dataStr);
-          if (eventType === "message_start" && data.message && data.message.usage) {
-            const u = extractUsage(data.message.usage);
-            inputTokens += u.inputTokens;
-            cacheReadTokens += u.cacheReadTokens;
+          if (eventType === "message_start" && data.message) {
+            if (data.message.model) providerModel = data.message.model;
+            if (data.message.usage) {
+              const u = extractUsage(data.message.usage);
+              inputTokens += u.inputTokens;
+              cacheReadTokens += u.cacheReadTokens;
+            }
           } else if (eventType === "message_delta" && data.usage) {
             outputTokens += data.usage.output_tokens || 0;
           }
@@ -406,6 +410,7 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
           // Non-streaming JSON response
           try {
             const json = JSON.parse(totalBuffer.trim());
+            if (json.model) providerModel = json.model;
             if (json.usage) {
               const u = extractUsage(json.usage);
               inputTokens = u.inputTokens;
@@ -429,10 +434,13 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
               if (!eventType || !dataStr) continue;
               try {
                 const data = JSON.parse(dataStr);
-                if (eventType === "message_start" && data.message && data.message.usage) {
-                  const u = extractUsage(data.message.usage);
-                  inputTokens += u.inputTokens;
-                  cacheReadTokens += u.cacheReadTokens;
+                if (eventType === "message_start" && data.message) {
+                  if (data.message.model) providerModel = data.message.model;
+                  if (data.message.usage) {
+                    const u = extractUsage(data.message.usage);
+                    inputTokens += u.inputTokens;
+                    cacheReadTokens += u.cacheReadTokens;
+                  }
                 } else if (eventType === "message_delta" && data.usage) {
                   outputTokens += data.usage.output_tokens || 0;
                 }
@@ -445,6 +453,8 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
         stats.record({
           providerId,
           model,
+          clientModel,                 // what the client sent (alias, pre-profile)
+          providerModel,               // what the provider echoed back (post any provider redirect)
           durationMs: Date.now() - startTime,
           inputTokens,
           cacheReadTokens,

@@ -761,7 +761,7 @@ function render(stats,quotas,cfg){
 
   // Request log — cost column only for metered models (blank for flat-plan).
   let lhtml='<div class="row" style="color:var(--muted);font-weight:600">'+
-    '<span class="t">Time</span><span class="m">Model</span><span class="tok">Tokens in / out</span><span class="cost">Cost</span><span class="ms">Duration</span></div>';
+    '<span class="t">Time</span><span class="m">client → routed [provider] → returned</span><span class="tok">Tokens in / out</span><span class="cost">Cost</span><span class="ms">Duration</span></div>';
   const tl=stats.timeline||[];
   for(let i=tl.length-1;i>=Math.max(0,tl.length-50);i--){
     const e=tl[i];
@@ -770,12 +770,32 @@ function render(stats,quotas,cfg){
     const timeStr=new Date(e.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
     lhtml+='<div class="row'+(e.status>=400?' er':'')+'">'+
       '<span class="t">'+timeStr+'</span>'+
-      '<span class="m">'+escHtml(e.model||'?')+'</span>'+
+      '<span class="m" title="'+escHtml(traceTitle(e,pid))+'">'+traceCell(e,pid)+'</span>'+
       '<span class="tok">'+fmt((e.inputTokens||0)+(e.cacheReadTokens||0))+' in / '+fmt(e.outputTokens)+' out</span>'+
       '<span class="cost">'+(metered?usd(e.cost):'—')+'</span>'+
       '<span class="ms">'+fmt(e.durationMs)+'ms</span></div>';
   }
   $("log").innerHTML=lhtml;
+}
+
+// Request routing trace for one log row: what the CLIENT sent → what we ROUTED it to
+// [provider] → what the provider ECHOED BACK. The client alias is shown only when it was
+// rewritten (a profile substitution); the returned model only when it DIFFERS from what we
+// asked (a provider-side redirect) — shown in orange so mismatches pop. Normal rows stay clean.
+function traceCell(e,pid){
+  const routed=e.model||'?', client=e.clientModel, prov=e.providerModel;
+  const arrow=' <span style="color:var(--muted)">→</span> ';
+  let h='';
+  if(client && client!==routed) h+='<span style="color:var(--muted)">'+escHtml(client)+'</span>'+arrow;
+  h+=escHtml(routed);
+  if(pid) h+=' <span class="tag sub" style="opacity:.75">'+escHtml(pid)+'</span>';
+  if(prov && prov!==routed) h+=' <span style="color:var(--orange)">→ '+escHtml(prov)+'</span>';
+  return h;
+}
+function traceTitle(e,pid){
+  return 'client sent: '+(e.clientModel||e.model||'?')
+    +'\nrouted to: '+(e.model||'?')+(pid?' ['+pid+']':'')
+    +'\nprovider returned: '+(e.providerModel||'(not reported)');
 }
 
 function drawChart(timeline){

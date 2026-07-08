@@ -856,7 +856,7 @@ const REROUTE_BUFFER_CAP = 64 * 1024;
 function pipeResponse(upstreamRes, res, ctx = null) {
   const onUpstreamFail = () => {
     if (ctx && ctx.stats) {
-      ctx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+      ctx.stats.record({ providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, durationMs: Date.now() - ctx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
     }
     if (res.headersSent) res.destroy();
     else sendError(res, 502, "upstream response error");
@@ -874,6 +874,7 @@ function pipeResponse(upstreamRes, res, ctx = null) {
     const tracker = createUsageTracker(ctx.stats, {
       providerId: ctx.providerId,
       model: ctx.model,
+      clientModel: ctx.clientModel,
       startTime: ctx.startTime,
     });
     res.writeHead(upstreamRes.statusCode || 502, headers);
@@ -1159,7 +1160,7 @@ function makeResponseHandler(ctx) {
       windBackProbe(); // a non-candidate response to a recovery probe = head is back
       resetAccountBackoff(); // a clean answer means this account's cooldown ladder resets
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
-        ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, startTime: ctx.statsCtx.startTime }
+        ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, startTime: ctx.statsCtx.startTime }
         : null);
       return;
     }
