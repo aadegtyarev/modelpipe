@@ -139,6 +139,23 @@ canvas{display:block;width:100%;height:200px}
   <button class="b" onclick="toggleSettings()" style="color:var(--muted);margin-left:auto">⚙ Settings</button>
 </div>
 
+<div class="panel" id="failoverPanel">
+  <h3 style="margin:0 0 6px">Account pools</h3>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Multiple keys for the same provider — the router rotates to the next on a rate-limit/quota error, <b>below</b> the routing profiles. Failover <i>between</i> providers is now handled by <b>profiles</b>: see the routing banner at the top (pin/clear a profile there) and docs/profiles.md.</div>
+  <div id="accountPools" style="margin-top:10px"></div>
+</div>
+
+<div class="panel" id="profilesPanel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+    <h3 style="margin:0">Profiles &amp; switching rules</h3>
+    <button class="save" onclick="saveProfileConfig()">Save profiles &amp; rules</button>
+    <button class="b" onclick="discardProfileConfig()">Discard</button>
+    <span id="peMsg" style="font-size:12px"></span>
+  </div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:10px">A <b>profile</b> is a named set of alias→target rewrites ("which model goes where"). The active profile is chosen by <b>pin &gt; error-shift &gt; schedule &gt; default</b> (pin/clear at the top banner). Changes apply live — no restart.</div>
+  <div id="peBody"></div>
+</div>
+
 <div class="panel" id="tokenPricesPanel">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
     <h3 style="margin:0">Metered API token prices ($ / 1M in·out) — used for real per-response cost</h3>
@@ -147,40 +164,25 @@ canvas{display:block;width:100%;height:200px}
   <div id="tpriceRows"></div>
 </div>
 
-<div class="panel" id="failoverPanel">
+<div class="panel" id="compactPanel">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-    <h3 style="margin:0">Failover pairs (model glob → backup)</h3>
-    <button class="save" onclick="saveFailover()">Save</button>
+    <h3 style="margin:0">Context fitting (trim to fit a smaller window on failover downshift)</h3>
+    <label style="font-size:13px;color:var(--muted)"><input type="checkbox" id="cpEnabled"> enabled</label>
+    <button class="save" onclick="saveCompact()">Save</button>
   </div>
-  <div id="failoverPairs"></div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Safety net, not steady-state compaction (that's the harness's job). When a request is routed to a model whose context window is <b>smaller</b> than the client's — a failover downshift (e.g. 1M → 256K) where the grown conversation no longer fits — the older turns are mechanically dropped to a stable checkpoint (tool_use/tool_result pairs kept intact) so it fits. If a backend still rejects a request as too long, the real window is <b>learned</b> and the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path.</div>
+  <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)">
+    <label>safety % of window <input class="i" id="cpSafetyPct" size="4"></label>
+    <label>default window (tokens) <input class="i" id="cpWindowDefault" size="9"></label>
+    <label>overflow retries <input class="i" id="cpMaxRetries" size="3"></label>
+  </div>
+  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens) — order specific ids before broad globs</h3>
+  <div id="cpWindowRows"></div>
   <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-    <input class="i" id="foPattern" placeholder="model glob (e.g. claude-opus-*)" style="flex:1">
-    <input class="i" id="foBackup" placeholder="backup model (e.g. glm-5.1)" style="flex:1">
-    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addFailoverPair()">Add</button>
+    <input class="i" id="cpWinGlob" placeholder="model id/glob (e.g. glm-5.2 or claude-*)" style="flex:1">
+    <input class="i" id="cpWinTokens" placeholder="tokens (e.g. 1000000)" style="width:160px">
+    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addCompactWindow()">Add</button>
   </div>
-  <h3 style="margin:18px 0 4px">Failover groups</h3>
-  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">A priority ladder — each tier falls to the one below it when it's unavailable. <b>shift</b>: when the head fails, the whole ladder drops one step together. <b>cascade</b>: each request just walks down on error. Only the head (top) may be a glob (<code>*</code>).</div>
-  <div id="groupsDirtyBar"></div>
-  <div id="failoverGroups"></div>
-  <button class="t-add" style="margin-top:8px" onclick="addGroup()">+ Add failover group</button>
-  <div style="display:flex;gap:8px;align-items:center;margin-top:16px;border-top:1px solid var(--border);padding-top:12px;flex-wrap:wrap">
-    <span style="color:var(--muted);font-size:13px">Recovery retries (minutes, comma-sep — progressive backoff so a down provider isn't hammered):</span>
-    <input class="i" id="foBackoff" placeholder="e.g. 1,5,10 — blank = flat" style="width:180px">
-    <button class="save" onclick="saveBackoff()">Save retries</button>
-  </div>
-  <div id="accountPools" style="margin-top:10px"></div>
-  <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
-</div>
-
-<div class="panel" id="schedulesPanel">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-    <h3 style="margin:0">Scheduled routing (dodge peak-priced models by time of day)</h3>
-    <button class="save" onclick="saveSchedules()">Save</button>
-  </div>
-  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">During each window, requests for the model glob are rewritten to a cheaper target. Times are in the timezone set per schedule — <b>GLM peak = 14:00–18:00 at +08:00</b> (GLM-5.2 / GLM-5-Turbo cost 3× quota then). Evaluated against the system clock via UTC, so it's correct regardless of the host timezone.</div>
-  <div id="schedDirtyBar"></div>
-  <div id="schedulesList"></div>
-  <button class="t-add" style="margin-top:8px" onclick="addSchedule()">+ Add schedule</button>
 </div>
 
 <div class="panel" id="compactPanel">
@@ -228,12 +230,6 @@ const $=s=>document.getElementById(s);
 let auto=true;
 let histMode=null;               // null = live, id = viewing an archived session
 let billingByProvider={};        // providerId -> "metered" | "subscription"
-let failoverPairs={};
-let failoverGroups=[];            // editable mirror of the server's ladder list
-let groupRuntime=[];              // per-group {offset, effective} from the server (live shift state)
-let groupsDirty=false;            // true while the user has unsaved group edits (blocks refresh clobber)
-let schedules=[];                 // editable mirror of the server's schedule list (with live .active)
-let schedulesDirty=false;         // true while the user has unsaved schedule edits (blocks refresh clobber)
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
@@ -298,16 +294,16 @@ async function saveCompact(){
 
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel'),sp=$('schedulesPanel'),cp=$('compactPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),pp=$('profilesPanel'),bp=$('billingPanel'),cp=$('compactPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
+  pp.style.display=show?'block':'none';
   bp.style.display=show?'block':'none';
-  sp.style.display=show?'block':'none';
   cp.style.display=show?'block':'none';
   if(show){
+    fetch("/v1/profiles").then(r=>r.json()).then(initProfileEditor).catch(()=>{});
     fetch("/v1/compact").then(r=>r.json()).then(renderCompact).catch(()=>{});
-    refreshSchedules();
     fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const models=st.models||{},tpOver=st.tokenPrices||{};
@@ -324,7 +320,6 @@ function toggleSettings(){
       if(!rows)rows='<span style="color:var(--muted)">no model traffic yet — prices shown from the catalog once a model is used</span>';
       $('tpriceRows').innerHTML=rows;
     });
-    fetch("/v1/failover").then(r=>r.json()).then(renderFailover);
     fetch("/v1/accounts").then(r=>r.json()).then(renderAccounts).catch(()=>{});
   }
 }
@@ -378,280 +373,18 @@ async function saveTokenPrices(){
 }
 
 // ── Failover UI ───────────────────────────────────────────────────────────────
-function renderFailover(fo){
-  failoverPairs=fo.config||{};
-  let phtml='';
-  for(const[pattern,backup]of Object.entries(failoverPairs)){
-    phtml+='<div style="display:flex;align-items:center;gap:8px;margin:2px 0">'+
-      '<span style="min-width:150px;color:var(--blue)">'+escHtml(pattern)+'</span>'+
-      '<span style="color:var(--muted)">→</span>'+
-      '<span style="min-width:150px;color:var(--green)">'+escHtml(backup)+'</span>'+
-      '<button onclick="removeFailoverPair(\''+escJs(pattern)+'\')" style="background:var(--red);color:#fff;border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">×</button></div>';
-  }
-  if(!phtml)phtml='<span style="color:var(--muted)">no pairs configured</span>';
-  $('failoverPairs').innerHTML=phtml;
-
-  // Groups — keep the live shift state for status, but DON'T rehydrate the editable model
-  // (or re-render the DOM) while the user has unsaved edits: the 2s auto-refresh must not
-  // wipe what they're typing. Also never clobber the backoff field while it's focused.
-  const groups=fo.groups||[];
-  groupRuntime=groups.map(g=>({offset:g.offset||0,effective:g.effective||[]}));
-  if(!groupsDirty){
-    failoverGroups=groups.map(g=>({ladder:g.ladder.slice(),mode:g.mode}));
-    renderGroups();
-  }
-  if(document.activeElement!==$('foBackoff'))
-    $('foBackoff').value=Array.isArray(fo.backoffMs)?fo.backoffMs.map(ms=>+(ms/60000).toFixed(4)).join(','):'';
-
-  // Active reactive failovers
-  const entries=Object.entries(fo.active||{});
-  let ahtml='';
-  if(entries.length){
-    ahtml='<span style="color:var(--orange);font-weight:600">Active failovers:</span> '+
-      entries.map(([m,s])=>{
-        const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
-        return '<span style="color:var(--orange)">'+escHtml(m)+' (since '+t+')</span>';
-      }).join(' · ')+
-      ' <button onclick="resetFailover()" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">Reset all</button>';
-  }
-  $('failoverActive').innerHTML=ahtml;
-}
-async function saveFailover(){
-  const err=validateGroupsLocal();
-  if(err){alert(err);return;}
-  const r=await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},
-    body:JSON.stringify({pairs:failoverPairs,groups:failoverGroups.map(g=>({ladder:g.ladder,mode:g.mode}))})});
-  if(!r.ok){alert('Save failed: '+(await r.text()));return;}
-  groupsDirty=false;updateDirtyBar();load();refreshFailover();
-}
-async function addFailoverPair(){const p=$('foPattern').value.trim(),b=$('foBackup').value.trim();if(!p||!b)return;failoverPairs[p]=b;await saveFailover();$('foPattern').value='';$('foBackup').value='';}
-async function removeFailoverPair(p){delete failoverPairs[p];await saveFailover();}
-async function resetFailover(){await fetch("/v1/failover/reset",{method:"POST"});load();}
-// Re-render the settings-panel failover editor from the server. load() only refreshes the
-// top banner, so anything that changes server-side failover state must call this too.
-function refreshFailover(){return fetch("/v1/failover").then(r=>r.json()).then(renderFailover).catch(()=>{});}
-
-// ── Failover groups (ladder editor) ─────────────────────────────────────────────
-// The ladder is edited as a vertical stack of tiers; each "↓" between them means
-// "this tier is unavailable → fall to the one below". Edits stay local (groupsDirty)
-// until Save, so the 2s auto-refresh can't wipe them.
-function ladderChain(grp){ // compact chain — used by the top routing banner
-  const off=grp.offset||0;
-  return grp.ladder.map((t,p)=>{
-    let color='var(--muted)',deco='';
-    if(p<off){color='var(--red)';deco='text-decoration:line-through;opacity:.55';}
-    else if(p===off&&off>0){color='var(--orange)';deco='font-weight:600';}
-    return '<span style="color:'+color+';'+deco+'">'+escHtml(t)+'</span>';
-  }).join(' <span style="color:var(--text)">→</span> ');
-}
-// Derived, read-only "what happens" view — divides the single shift-ladder into the
-// scenarios the user thinks in: normal vs head-down, plus the per-request single steps.
-// Regenerated from the ladder on every render, so it stays correct as tiers are edited.
-function scenarioBlocks(grp,rt){
-  const L=grp.ladder.map(s=>(s||'').trim());
-  if(L.length<2||L.some(x=>!x)) return ''; // hide while a tier is blank mid-edit
-  const n=L.length,off=rt.offset||0,mode=grp.mode||'shift';
-  const redirects=(k)=>{const r=[];for(let p=0;p<n;p++){const to=L[Math.min(p+k,n-1)];if(to!==L[p])r.push('<span class="sr">'+escHtml(L[p])+' <b>→</b> '+escHtml(to)+'</span>');}return r.join('');};
-  let h='<div class="scen"><div class="scen-hd">Что произойдёт</div>';
-  h+='<div class="scen-row'+(off===0?' scen-live':'')+'"><span class="scen-badge">норма'+(off===0?' • сейчас':'')+'</span>'+
-     '<div class="scen-body"><span class="scen-mut">все тиры живы — каждая модель работает сама, переадресации нет</span></div></div>';
-  if(mode==='shift'){
-    h+='<div class="scen-row'+(off>=1?' scen-live':'')+'"><span class="scen-badge">'+(off>=1?('сдвиг • сейчас +'+off):'голова упала')+'</span>'+
-       '<div class="scen-body"><div class="scen-when">«'+escHtml(L[0])+'» недоступна → вся лестница уезжает на тир вниз одним движением:</div>'+redirects(1)+'</div></div>';
-    h+='<div class="scen-foot">Одиночные шаги: любой тир, упавший на конкретном запросе, уводит этот запрос на следующий вниз (те же стрелки). Если недоступны и нижние тиры — доезжает до пола «'+escHtml(L[n-1])+'».</div>';
-  } else {
-    h+='<div class="scen-row"><span class="scen-badge">cascade</span><div class="scen-body"><div class="scen-when">каждый запрос при ошибке своего тира уходит на следующий вниз (лестница целиком не сдвигается):</div>'+redirects(1)+'</div></div>';
-  }
-  return h+'</div>';
-}
-function renderGroups(){
-  let h='';
-  failoverGroups.forEach((grp,gi)=>{
-    const rt=groupRuntime[gi]||{offset:0};
-    const n=grp.ladder.length;
-    h+='<div class="grp">'+
-      '<div class="grp-hd">'+
-        '<span class="grp-title">Group '+(gi+1)+'</span>'+
-        '<select class="i grp-mode" onchange="setGroupMode('+gi+',this.value)">'+
-          '<option value="shift"'+(grp.mode==='shift'?' selected':'')+'>shift — head fails → whole ladder drops</option>'+
-          '<option value="cascade"'+(grp.mode==='cascade'?' selected':'')+'>cascade — each request walks down</option>'+
-        '</select>'+
-        '<span style="flex:1"></span>'+
-        '<button class="grp-save" onclick="saveFailover()">Save</button>'+
-        '<button class="grp-del" onclick="removeFailoverGroup('+gi+')">Delete group</button>'+
-      '</div>'+
-      '<div class="grp-hint">Priority ladder — top is tried first; each tier falls to the one below when it errors or is unavailable.</div>'+
-      '<div class="tiers">';
-    grp.ladder.forEach((t,ti)=>{
-      const isHead=ti===0,isFloor=ti===n-1;
-      let badge='';
-      if(rt.offset>0){ if(ti<rt.offset)badge='<span class="t-dead">down</span>'; else if(ti===rt.offset)badge='<span class="t-live">serving now</span>'; }
-      const tag=(isHead?'head — may be a glob':(isFloor?'floor — last resort':'backup'));
-      h+='<div class="tier">'+
-           '<span class="t-num">'+(ti+1)+'</span>'+
-           '<input class="i t-in" value="'+escHtml(t)+'" placeholder="model id (e.g. glm-5.1)" oninput="setTier('+gi+','+ti+',this.value)">'+
-           '<span class="t-tag">'+tag+' '+badge+'</span>'+
-           '<button class="t-del" onclick="removeTier('+gi+','+ti+')" title="remove tier">×</button>'+
-         '</div>';
-      if(ti<n-1) h+='<div class="t-arrow">↓</div>';
-    });
-    h+='</div>'+
-      '<button class="t-add" onclick="addTier('+gi+')">+ add tier</button>'+
-      scenarioBlocks(grp,rt)+
-      '<div class="grp-status">Status: '+(rt.offset>0
-        ? '<span class="tag sub">shift +'+rt.offset+' · “'+escHtml(grp.ladder[rt.offset-1]||'')+'” down → serving from “'+escHtml(grp.ladder[rt.offset]||'')+'”</span> <button class="wb" onclick="resetGroup('+gi+')">wind back</button>'
-        : '<span class="tag metered">normal — no failover active</span>')+'</div>'+
-    '</div>';
-  });
-  if(!failoverGroups.length) h='<div class="muted" style="font-size:13px">No failover groups. Click “+ Add failover group” below.</div>';
-  $('failoverGroups').innerHTML=h;
-}
-function markDirty(){groupsDirty=true;updateDirtyBar();}
-function updateDirtyBar(){
-  const el=$('groupsDirtyBar');if(!el)return;
-  el.innerHTML=groupsDirty
-    ? '<div style="display:flex;align-items:center;gap:10px;background:rgba(240,160,40,.12);border:1px solid var(--orange);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:13px">'+
-      '<span style="color:var(--orange);font-weight:600">● Unsaved group changes</span>'+
-      '<button class="grp-save" onclick="saveFailover()">Save</button>'+
-      '<button class="wb" onclick="discardGroups()">Discard</button></div>'
-    : '';
-}
-function discardGroups(){groupsDirty=false;updateDirtyBar();refreshFailover();}
-function setTier(gi,ti,v){failoverGroups[gi].ladder[ti]=v;markDirty();}
-function setGroupMode(gi,v){failoverGroups[gi].mode=v;markDirty();renderGroups();}
-function addTier(gi){failoverGroups[gi].ladder.push('');markDirty();renderGroups();}
-function removeTier(gi,ti){
-  if(failoverGroups[gi].ladder.length<=2){alert('A ladder needs at least 2 tiers (head + one backup).');return;}
-  failoverGroups[gi].ladder.splice(ti,1);markDirty();renderGroups();
-}
-function addGroup(){failoverGroups.push({ladder:['claude-opus-*','glm-5.1'],mode:'shift'});markDirty();renderGroups();}
-function removeFailoverGroup(gi){failoverGroups.splice(gi,1);markDirty();renderGroups();}
-// Client-side mirror of the server's rules — trim empties, need >=2 tiers, glob only in head.
-function validateGroupsLocal(){
-  for(let gi=0;gi<failoverGroups.length;gi++){
-    const lad=failoverGroups[gi].ladder.map(s=>s.trim()).filter(Boolean);
-    if(lad.length<2)return 'Group '+(gi+1)+': needs at least 2 non-empty tiers.';
-    for(let j=1;j<lad.length;j++) if(lad[j].includes('*')) return 'Group '+(gi+1)+', tier '+(j+1)+' “'+lad[j]+'”: only the head (top) may be a glob.';
-    failoverGroups[gi].ladder=lad; // normalize
-  }
-  return null;
-}
-async function resetGroup(i){await fetch("/v1/failover/reset?group="+i,{method:"POST"});load();refreshFailover();}
-async function saveBackoff(){
-  const raw=$('foBackoff').value.trim();
-  let backoffMs=null;
-  if(raw){
-    const mins=raw.split(',').map(s=>parseFloat(s.trim())).filter(n=>!isNaN(n)&&n>0);
-    if(!mins.length){alert('Enter minutes like 1,5,10 (or leave blank for a flat interval).');return;}
-    backoffMs=mins.map(m=>Math.round(m*60000));
-  }
-  const r=await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({backoffMs})});
-  if(!r.ok){alert('Backoff save failed: '+(await r.text()));return;}
-  load();refreshFailover();
-}
-
-// ── Scheduled routing (time-of-day cost control) ─────────────────────────────────
-// Each schedule rewrites a model glob to a cheaper target while any of its wall-clock
-// windows (in the schedule's own TZ) is open. Edits stay local (schedulesDirty) until
-// Save so the 2s auto-refresh can't wipe them — same pattern as the group editor.
-function renderSchedules(){
-  let h='';
-  schedules.forEach((s,si)=>{
-    h+='<div class="grp">'+
-      '<div class="grp-hd">'+
-        '<span class="grp-title">Schedule '+(si+1)+'</span>'+
-        (s.active?'<span class="t-live">active now</span>':'<span class="muted" style="font-size:12px">idle</span>')+
-        '<span style="flex:1"></span>'+
-        '<button class="grp-save" onclick="saveSchedules()">Save</button>'+
-        '<button class="grp-del" onclick="removeSchedule('+si+')">Delete</button>'+
-      '</div>'+
-      '<div class="tier" style="margin-bottom:6px;flex-wrap:wrap">'+
-        '<input class="i t-in" value="'+escHtml(s.match)+'" placeholder="model glob (e.g. glm-5.2)" oninput="setSched('+si+',\'match\',this.value)">'+
-        '<span class="t-arrow" style="border:none;padding:0;margin:0">→</span>'+
-        '<input class="i t-in" value="'+escHtml(s.to)+'" placeholder="cheaper model (e.g. glm-5.1)" oninput="setSched('+si+',\'to\',this.value)">'+
-        '<span class="t-tag">TZ</span>'+
-        '<input class="i" style="width:88px" value="'+escHtml(s.tz)+'" placeholder="+08:00" oninput="setSched('+si+',\'tz\',this.value)">'+
-      '</div>'+
-      '<div class="grp-hint">Windows (HH:MM–HH:MM, in the TZ above). While any is open, «'+escHtml(s.match||'…')+'» → «'+escHtml(s.to||'…')+'».</div>'+
-      '<div class="tiers">';
-    (s.windows||[]).forEach((w,wi)=>{
-      h+='<div class="tier">'+
-        '<span class="t-num">'+(wi+1)+'</span>'+
-        '<input class="i" style="width:82px;font-family:ui-monospace,Menlo,Consolas,monospace" value="'+escHtml(w[0])+'" placeholder="14:00" oninput="setWin('+si+','+wi+',0,this.value)">'+
-        '<span class="muted">–</span>'+
-        '<input class="i" style="width:82px;font-family:ui-monospace,Menlo,Consolas,monospace" value="'+escHtml(w[1])+'" placeholder="18:00" oninput="setWin('+si+','+wi+',1,this.value)">'+
-        '<button class="t-del" onclick="removeWin('+si+','+wi+')" title="remove window">×</button>'+
-      '</div>';
-    });
-    h+='</div>'+
-      '<button class="t-add" onclick="addWin('+si+')">+ add window</button>'+
-    '</div>';
-  });
-  if(!schedules.length) h='<div class="muted" style="font-size:13px">No schedules. Click “+ Add schedule” to route away from a peak-priced model during set hours.</div>';
-  $('schedulesList').innerHTML=h;
-}
-function markSchedDirty(){schedulesDirty=true;updateSchedDirtyBar();}
-function updateSchedDirtyBar(){
-  const el=$('schedDirtyBar');if(!el)return;
-  el.innerHTML=schedulesDirty
-    ? '<div style="display:flex;align-items:center;gap:10px;background:rgba(240,160,40,.12);border:1px solid var(--orange);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:13px">'+
-      '<span style="color:var(--orange);font-weight:600">● Unsaved schedule changes</span>'+
-      '<button class="grp-save" onclick="saveSchedules()">Save</button>'+
-      '<button class="wb" onclick="discardSchedules()">Discard</button></div>'
-    : '';
-}
-function discardSchedules(){schedulesDirty=false;updateSchedDirtyBar();refreshSchedules();}
-function setSched(si,k,v){schedules[si][k]=v;markSchedDirty();}
-function setWin(si,wi,idx,v){schedules[si].windows[wi][idx]=v;markSchedDirty();}
-function addWin(si){schedules[si].windows.push(['14:00','18:00']);markSchedDirty();renderSchedules();}
-function removeWin(si,wi){
-  if(schedules[si].windows.length<=1){alert('A schedule needs at least one window.');return;}
-  schedules[si].windows.splice(wi,1);markSchedDirty();renderSchedules();
-}
-function addSchedule(){schedules.push({match:'glm-5.2',to:'glm-5.1',tz:'+08:00',windows:[['14:00','18:00']],active:false});markSchedDirty();renderSchedules();}
-function removeSchedule(si){schedules.splice(si,1);markSchedDirty();renderSchedules();}
-async function saveSchedules(){
-  // Client-side mirror of the server rules — trim, need match+to, >=1 window of HH:MM–HH:MM.
-  const norm=[];
-  for(let i=0;i<schedules.length;i++){
-    const s=schedules[i];
-    const match=(s.match||'').trim(),to=(s.to||'').trim(),tz=(s.tz||'').trim()||'Z';
-    if(!match||!to){alert('Schedule '+(i+1)+': needs both a model glob and a target model.');return;}
-    const wins=[];
-    for(const w of (s.windows||[])){
-      const a=(w[0]||'').trim(),b=(w[1]||'').trim();
-      if(!/^\d{1,2}:\d{2}$/.test(a)||!/^\d{1,2}:\d{2}$/.test(b)){alert('Schedule '+(i+1)+': times must be HH:MM.');return;}
-      wins.push([a,b]);
-    }
-    if(!wins.length){alert('Schedule '+(i+1)+': needs at least one window.');return;}
-    norm.push({match,to,tz,windows:wins});
-  }
-  const r=await fetch("/v1/schedules",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({schedules:norm})});
-  if(!r.ok){alert('Schedule save failed: '+(await r.text()));return;}
-  schedulesDirty=false;updateSchedDirtyBar();refreshSchedules();
-}
-// Re-render the schedule editor from the server (skipped while the user has unsaved edits).
-function refreshSchedules(){
-  return fetch("/v1/schedules").then(r=>r.json()).then(d=>{
-    if(schedulesDirty)return;
-    schedules=(d.schedules||[]).map(s=>({match:s.match,to:s.to,tz:s.tz,windows:(s.windows||[]).map(w=>w.slice()),active:!!s.active}));
-    updateSchedDirtyBar();renderSchedules();
-  }).catch(()=>{});
-}
-
 async function newSession(){await fetch("/v1/sessions/reset",{method:"POST"});histMode=null;$("sessSelect").value="";load();}
 async function showHistory(){histMode=$("sessSelect").value||null;load();}
 
 // ── Load + render ─────────────────────────────────────────────────────────────
 async function load(){
   try{
-    const[stats,quotas,sessions,models,failover,sched]=await Promise.all([
+    const[stats,quotas,sessions,models,profiles]=await Promise.all([
       fetch("/v1/stats").then(r=>r.json()),
       fetch("/v1/quotas").then(r=>r.json()),
       fetch("/v1/sessions").then(r=>r.json()),
       fetch("/v1/models").then(r=>r.json()).catch(()=>({data:[]})),
-      fetch("/v1/failover").then(r=>r.json()).catch(()=>({config:{},active:{},groups:[]})),
-      fetch("/v1/schedules").then(r=>r.json()).catch(()=>({schedules:[]})),
+      fetch("/v1/profiles").then(r=>r.json()).catch(()=>null),
     ]);
     // Build providerId -> billing map from the route table, using the SERVER-computed
     // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
@@ -683,7 +416,7 @@ async function load(){
       if(arch){stats.session=arch.session;stats.models=arch.models;stats.timeline=[];}
     }
     render(stats,quotas,cfg);
-    renderRouting(failover,sched);
+    renderRouting(profiles);
     $("e").style.display="none";
   }catch(err){$("e").style.display="block";$("e").textContent="fetch error: "+err.message}
   $("r").textContent="Updated: "+new Date().toLocaleTimeString()+"  —  auto-refresh "+(auto?"ON":"OFF");
@@ -694,36 +427,247 @@ async function load(){
 // redirected (a reactive failover pair is active, or a failover group is shifted off its
 // head tier). Silent when routing is normal (the model cards already show where traffic
 // goes). Hidden while viewing an archived session (failover state is live, not historical).
-function renderRouting(fo,sched){
+// Top-level routing banner — reflects the ACTIVE PROFILE (which alias goes where) and lets the
+// operator pin/clear a profile by hand. `prof` is GET /v1/profiles: { profiles, auto,
+// defaultProfile, state, summary } where summary is routingSummary() from src/profiles.mjs:
+// { active, intended, source, shifted, changes[{alias,from,to,fromProvider,toProvider}], recoversInSec }.
+// The status banner is shown only when the active profile diverges from the default (changes
+// present); the pin control is always available. Hidden while viewing an archived session.
+function renderRouting(prof){
   if(histMode){$("routing").innerHTML="";return;}
-  const active=Object.entries((fo&&fo.active)||{});
-  const groups=((fo&&fo.groups)||[]).filter(g=>g.offset>0);
-  const activeScheds=((sched&&sched.schedules)||[]).filter(s=>s.active);
+  if(!prof||!prof.summary){$("routing").innerHTML="";return;}
+  const s=prof.summary;
   let h='';
-  // Failover redirection is an anomaly → orange warning banner.
-  if(active.length||groups.length){
-    h+='<div class="routing"><div class="hdr">⚠ Routing redirected — failover active</div>';
-    for(const g of groups){
-      h+='<div class="line">['+escHtml(g.mode)+' +'+g.offset+'] '+ladderChain(g)+
-         ' <span class="tag sub">“'+escHtml(g.ladder[g.offset-1])+'” down → now on “'+escHtml(g.ladder[g.offset])+'”</span></div>';
+
+  // Status banner, styled by WHY the active profile is active. An error-shift (anomaly) always
+  // reads as the orange failover banner even if the intended head came from a schedule/default.
+  if(s.changes&&s.changes.length){
+    let color,hdr;
+    if(s.shifted){ color='var(--orange)'; hdr='⚠ Failover active — profile “'+escHtml(s.active)+'”'; }
+    else if(s.source==='manual'){ color='var(--blue)'; hdr='📌 Profile pinned — “'+escHtml(s.active)+'” (manual)'; }
+    else if(s.source==='schedule'){ color='var(--green)'; hdr='💸 Scheduled profile — “'+escHtml(s.active)+'”'; }
+    else { color='var(--orange)'; hdr='Routing — profile “'+escHtml(s.active)+'”'; }
+    h+='<div class="routing" style="border-color:'+color+'"><div class="hdr" style="color:'+color+'">'+hdr+'</div>';
+    if(s.shifted&&s.recoversInSec!=null){
+      h+='<div class="line"><span class="tag sub">recovers in ~'+fmtDur(s.recoversInSec)+'</span></div>';
     }
-    for(const[m,s]of active){
-      const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
-      h+='<div class="line"><span style="color:var(--orange)">'+escHtml(m)+'</span> → rerouted to backup (since '+t+')</div>';
+    for(const c of s.changes){
+      const prov=(c.fromProvider||c.toProvider)?' <span class="tag sub">'+escHtml(c.fromProvider||'?')+' → '+escHtml(c.toProvider||'?')+'</span>':'';
+      h+='<div class="line"><span style="color:'+color+'">'+escHtml(c.alias)+'</span> → '+escHtml(c.to)+prov+'</div>';
     }
+    if(s.source==='manual'){ h+='<div class="line"><span class="tag sub">↓ safety armed — auto-failover still active</span></div>'; }
     h+='</div>';
   }
-  // Scheduled routing is intentional (cost control) → calm green info banner.
-  if(activeScheds.length){
-    h+='<div class="routing" style="border-color:var(--green)"><div class="hdr" style="color:var(--green)">💸 Saving quota — scheduled routing active</div>';
-    for(const s of activeScheds){
-      h+='<div class="line"><span style="color:var(--green)">'+escHtml(s.match)+'</span> → '+escHtml(s.to)+
-         ' <span class="tag sub">peak window ('+(s.windows||[]).map(w=>escHtml(w[0])+'–'+escHtml(w[1])).join(', ')+' '+escHtml(s.tz)+')</span></div>';
-    }
-    h+='</div>';
-  }
+
+  // Pin control — always shown so a profile can be switched by hand. Styled to match the
+  // session-control bar (styled .b select/buttons) instead of raw browser widgets.
+  const names=Object.keys(prof.profiles||{});
+  const pinned=(prof.state&&prof.state.pinned)||'';
+  h+='<div class="sessctl" style="margin-bottom:14px">'+
+     '<span style="color:var(--muted);font-size:13px">Profile:</span>'+
+     '<select class="b" id="pinSel">'+names.map(n=>'<option value="'+escHtml(n)+'"'+(n===pinned?' selected':'')+'>'+escHtml(n)+(n===prof.defaultProfile?' (default)':'')+'</option>').join('')+'</select>'+
+     '<button class="b" onclick="pinProfile()">Pin</button>'+
+     '<button class="b" onclick="pinProfile(null)"'+(pinned?'':' disabled style="opacity:.45;cursor:default"')+'>Clear pin</button>'+
+     (pinned
+       ?'<span class="tag" style="color:var(--blue);border-color:var(--blue)">📌 pinned</span>'
+       :'<span style="color:var(--muted);font-size:12px">auto — default + failover</span>')+
+     '</div>';
+
   $("routing").innerHTML=h;
-  return;
+}
+
+// POST the manual pin (or clear it with null). The router validates the profile name exists.
+async function pinProfile(explicit){
+  const profile = explicit===null ? null : ($("pinSel")?$("pinSel").value:null);
+  try{ await fetch("/v1/profiles/pin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({profile})}); }
+  catch(e){}
+  load();
+}
+
+// Seconds → a compact "2m 5s" / "45s" duration for the recovery ETA.
+function fmtDur(sec){ if(sec<60)return sec+'s'; const m=Math.floor(sec/60),r=sec%60; return m+'m'+(r?' '+r+'s':''); }
+
+// ── Profiles & switching-rules editor (Settings) ───────────────────────────────
+// Editable mirror of GET /v1/profiles, saved via POST /v1/profiles/config (live, no restart).
+// profCfg.profiles is an array of { name, bindings:[{alias,target}] } (⇄ the {name:{bind}} API
+// shape); steps mirror auto.steps (index 0 = head, no `when`). Populated on Settings-open only,
+// so the 2s auto-refresh never clobbers unsaved edits (profDirty guards a re-open too).
+let profCfg=null;
+let profDirty=false;
+
+function initProfileEditor(d){
+  if(profDirty) { renderProfileEditor(); return; }   // keep unsaved edits on a re-open
+  const profs=(d&&d.profiles)||{}, auto=(d&&d.auto)||{};
+  profCfg={
+    profiles:Object.keys(profs).map(name=>({name,bindings:Object.entries(profs[name].bind||{}).map(([alias,target])=>({alias,target,note:(profs[name].notes&&profs[name].notes[alias])||''}))})),
+    defaultProfile:(d&&d.defaultProfile)||'',
+    steps:(auto.steps||[]).map((s,i)=>({profile:s.profile,when:i===0?null:(s.when||'limit')})),
+    recover:auto.recover!==false,
+    schedules:(auto.schedules||[]).map(s=>({profile:s.profile,tz:s.tz||'+03:00',windows:(s.windows||[]).map(w=>[w[0],w[1]])})),
+  };
+  renderProfileEditor();
+}
+
+function peProfileNames(){ return profCfg?profCfg.profiles.map(p=>(p.name||'').trim()).filter(Boolean):[]; }
+function peOpts(val){ const names=peProfileNames(),have=names.includes(val); return (have?'':'<option value="" selected>— select —</option>')+names.map(n=>'<option'+(n===val?' selected':'')+'>'+escHtml(n)+'</option>').join(''); }
+function peDirty(){ profDirty=true; peShowMsg('',false); }
+function peShowMsg(msg,isErr){ const el=$('peMsg'); if(!el)return; el.textContent=msg; el.style.color=isErr?'var(--red)':'var(--green)'; }
+
+function renderProfileEditor(){
+  if(!profCfg){ if($('peBody'))$('peBody').innerHTML=''; return; }
+  let h='';
+  h+='<h3 style="font-size:14px;margin:4px 0 6px">Profiles</h3>';
+  profCfg.profiles.forEach((p,pi)=>{
+    h+='<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin:6px 0">';
+    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'+
+       '<input class="i" style="width:180px;font-weight:600" value="'+escHtml(p.name)+'" onchange="peSetName('+pi+',this.value)" placeholder="profile name">'+
+       '<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 8px" onclick="peDelProfile('+pi+')">× profile</button></div>';
+    if(!p.bindings.length) h+='<div style="color:var(--muted);font-size:12px;margin:2px 0 4px">no rewrites — every alias routes to its own backend (a “native” profile)</div>';
+    p.bindings.forEach((b,bi)=>{
+      h+='<div style="display:flex;align-items:center;gap:6px;margin:3px 0">'+
+         '<input class="i" style="flex:1" value="'+escHtml(b.alias)+'" onchange="peSetBind('+pi+','+bi+',\'alias\',this.value)" placeholder="alias glob (e.g. glm-5.2)">'+
+         '<span style="color:var(--muted)">→</span>'+
+         '<input class="i" style="flex:1" value="'+escHtml(b.target)+'" onchange="peSetBind('+pi+','+bi+',\'target\',this.value)" placeholder="target model (e.g. claude-sonnet-5)">'+
+         '<input class="i" style="width:170px;color:var(--muted)" value="'+escHtml(b.note||'')+'" onchange="peSetBind('+pi+','+bi+',\'note\',this.value)" placeholder="note (optional)">'+
+         '<button class="b" style="padding:2px 7px" onclick="peDelBind('+pi+','+bi+')">×</button></div>';
+    });
+    h+='<button class="t-add" style="margin-top:4px" onclick="peAddBind('+pi+')">+ binding</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddProfile()">+ Add profile</button>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Default profile</h3>';
+  h+='<select class="b" onchange="peSetDefault(this.value)">'+peOpts(profCfg.defaultProfile)+'</select>'+
+     '<span style="color:var(--muted);font-size:12px;margin-left:8px">used when nothing is pinned / scheduled / shifted</span>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Switching rules (auto chain)</h3>';
+  h+='<div style="color:var(--muted);font-size:12px;margin-bottom:6px">Ordered best→fallback. The head serves normally; each step below is entered on its error and (with recover) left when the higher provider returns.</div>';
+  profCfg.steps.forEach((s,i)=>{
+    h+='<div style="display:flex;align-items:center;gap:8px;margin:3px 0">'+
+       '<span style="color:var(--muted);width:16px;text-align:right">'+i+'</span>'+
+       '<select class="b" onchange="peSetStepProfile('+i+',this.value)">'+peOpts(s.profile)+'</select>';
+    if(i===0){ h+='<span class="tag" style="color:var(--muted)">head / default</span>'; }
+    else{ h+='<span style="color:var(--muted);font-size:12px">on</span>'+
+       '<select class="b" onchange="peSetStepWhen('+i+',this.value)">'+['limit','5xx'].map(w=>'<option'+(s.when===w?' selected':'')+'>'+w+'</option>').join('')+'</select>'; }
+    h+='<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 7px'+(i===0?';opacity:.4':'')+'" onclick="peMoveStep('+i+',-1)">↑</button>'+
+       '<button class="b" style="padding:2px 7px'+(i===profCfg.steps.length-1?';opacity:.4':'')+'" onclick="peMoveStep('+i+',1)">↓</button>'+
+       '<button class="b" style="padding:2px 7px" onclick="peDelStep('+i+')">×</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddStep()">+ Add step</button>';
+  h+='<div style="margin-top:8px"><label style="font-size:13px;color:var(--muted)"><input type="checkbox" '+(profCfg.recover?'checked':'')+' onchange="peToggleRecover(this.checked)"> recover — wind back up when the higher provider returns</label></div>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Schedules <span style="font-weight:400;color:var(--muted);font-size:12px">(optional — force a profile during a wall-clock window)</span></h3>';
+  profCfg.schedules.forEach((s,si)=>{
+    h+='<div style="border:1px solid var(--border);border-radius:6px;padding:6px 10px;margin:5px 0;display:flex;flex-wrap:wrap;align-items:center;gap:8px">'+
+       '<select class="b" onchange="peSetSched('+si+',\'profile\',this.value)">'+peOpts(s.profile)+'</select>'+
+       '<span style="color:var(--muted);font-size:12px">tz</span><input class="i" style="width:80px" value="'+escHtml(s.tz)+'" onchange="peSetSched('+si+',\'tz\',this.value)">';
+    s.windows.forEach((w,wi)=>{
+      h+='<span style="display:inline-flex;align-items:center;gap:4px"><input class="i" style="width:62px" value="'+escHtml(w[0])+'" onchange="peSetWin('+si+','+wi+',0,this.value)"><span style="color:var(--muted)">–</span><input class="i" style="width:62px" value="'+escHtml(w[1])+'" onchange="peSetWin('+si+','+wi+',1,this.value)"><button class="b" style="padding:2px 6px" onclick="peDelWin('+si+','+wi+')">×</button></span>';
+    });
+    h+='<button class="t-add" onclick="peAddWin('+si+')">+ win</button>'+
+       '<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 7px" onclick="peDelSched('+si+')">× schedule</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddSched()">+ Add schedule</button>';
+
+  if($('peBody'))$('peBody').innerHTML=h;
+}
+
+function peSetName(i,v){
+  const old=(profCfg.profiles[i].name||'');
+  const nv=(v||'').trim();               // trim so the stored name matches the (trimmed) option list
+  profCfg.profiles[i].name=nv;
+  // Propagate the rename to every reference so the switching rules / default / schedules
+  // don't dangle on the old name (which would 400 on save).
+  if(old&&old!==nv){
+    profCfg.steps.forEach(s=>{ if(s.profile===old)s.profile=nv; });
+    profCfg.schedules.forEach(s=>{ if(s.profile===old)s.profile=nv; });
+    if(profCfg.defaultProfile===old)profCfg.defaultProfile=nv;
+  }
+  peDirty(); renderProfileEditor();
+}
+function peSetBind(pi,bi,f,v){ profCfg.profiles[pi].bindings[bi][f]=v; peDirty(); }
+function peAddProfile(){ let n=1,nm='profile'; const names=peProfileNames(); while(names.includes(nm))nm='profile'+(++n); profCfg.profiles.push({name:nm,bindings:[]}); peDirty(); renderProfileEditor(); }
+function peDelProfile(i){
+  const nm=profCfg.profiles[i].name;
+  profCfg.profiles.splice(i,1);
+  // Drop references so the switching rules / schedules / default don't dangle on a deleted name
+  // (which would otherwise 400 on save).
+  profCfg.steps=profCfg.steps.filter(s=>s.profile!==nm); peFixHead();
+  profCfg.schedules=profCfg.schedules.filter(s=>s.profile!==nm);
+  if(profCfg.defaultProfile===nm)profCfg.defaultProfile='';
+  peDirty(); renderProfileEditor();
+}
+function peAddBind(pi){ profCfg.profiles[pi].bindings.push({alias:'',target:''}); peDirty(); renderProfileEditor(); }
+function peDelBind(pi,bi){ profCfg.profiles[pi].bindings.splice(bi,1); peDirty(); renderProfileEditor(); }
+function peSetDefault(v){ profCfg.defaultProfile=v; peDirty(); }
+function peFixHead(){ profCfg.steps.forEach((s,i)=>{ if(i===0)s.when=null; else if(!s.when)s.when='limit'; }); }
+function peAddStep(){ const nm=peProfileNames()[0]||''; profCfg.steps.push({profile:nm,when:profCfg.steps.length===0?null:'limit'}); peDirty(); renderProfileEditor(); }
+function peSetStepProfile(i,v){ profCfg.steps[i].profile=v; peDirty(); }
+function peSetStepWhen(i,v){ profCfg.steps[i].when=v; peDirty(); }
+function peMoveStep(i,d){ const j=i+d,s=profCfg.steps; if(j<0||j>=s.length)return; [s[i],s[j]]=[s[j],s[i]]; peFixHead(); peDirty(); renderProfileEditor(); }
+function peDelStep(i){ profCfg.steps.splice(i,1); peFixHead(); peDirty(); renderProfileEditor(); }
+function peToggleRecover(v){ profCfg.recover=v; peDirty(); }
+function peAddSched(){ const nm=peProfileNames()[0]||''; profCfg.schedules.push({profile:nm,tz:'+03:00',windows:[['14:00','18:00']]}); peDirty(); renderProfileEditor(); }
+function peDelSched(i){ profCfg.schedules.splice(i,1); peDirty(); renderProfileEditor(); }
+function peSetSched(si,f,v){ profCfg.schedules[si][f]=v; peDirty(); }
+function peAddWin(si){ profCfg.schedules[si].windows.push(['14:00','18:00']); peDirty(); renderProfileEditor(); }
+function peDelWin(si,wi){ profCfg.schedules[si].windows.splice(wi,1); peDirty(); renderProfileEditor(); }
+function peSetWin(si,wi,idx,v){ profCfg.schedules[si].windows[wi][idx]=v; peDirty(); }
+
+async function saveProfileConfig(){
+  if(!profCfg){ return; }
+  const profiles={};
+  for(const p of profCfg.profiles){
+    const name=(p.name||'').trim();
+    if(!name){ peShowMsg('every profile needs a name',true); return; }
+    if(profiles[name]){ peShowMsg('duplicate profile name: “'+name+'”',true); return; }
+    const bind={},notes={};
+    for(const b of p.bindings){
+      const a=(b.alias||'').trim(),t=(b.target||'').trim(),nt=(b.note||'').trim();
+      if(a&&t){ bind[a]=t; if(nt)notes[a]=nt; }
+      else if(a||t){ peShowMsg('binding needs both alias and target (profile “'+name+'”)',true); return; }
+    }
+    profiles[name]={bind};
+    if(Object.keys(notes).length)profiles[name].notes=notes;
+  }
+  const names=new Set(Object.keys(profiles));
+  // Switching steps: preserve order; every step must NAME A DECLARED profile (head = index 0).
+  // Validate explicitly with an inline error rather than silently dropping/renumbering a step
+  // (which would promote the wrong tier to head and strip its condition).
+  const steps=[];
+  for(let i=0;i<profCfg.steps.length;i++){
+    const p=(profCfg.steps[i].profile||'').trim();
+    if(!p){ peShowMsg('switching step '+(i+1)+' needs a profile',true); return; }
+    if(!names.has(p)){ peShowMsg('switching step '+(i+1)+' names an unknown profile “'+p+'”',true); return; }
+    steps.push(i===0?{profile:p}:{profile:p,when:profCfg.steps[i].when||'limit'});
+  }
+  // Schedules: profile must exist and every window must be fully filled (no silent drop).
+  const scheds=[];
+  for(let si=0;si<profCfg.schedules.length;si++){
+    const s=profCfg.schedules[si],p=(s.profile||'').trim();
+    if(!p||!names.has(p)){ peShowMsg('schedule '+(si+1)+' names an unknown/empty profile',true); return; }
+    const wins=[];
+    for(const w of (s.windows||[])){ const a=(w[0]||'').trim(),b=(w[1]||'').trim(); if(a&&b)wins.push([a,b]); else if(a||b){ peShowMsg('schedule '+(si+1)+' has an incomplete window',true); return; } }
+    if(!wins.length){ peShowMsg('schedule '+(si+1)+' needs at least one window',true); return; }
+    scheds.push({profile:p,tz:(s.tz||'+03:00').trim(),windows:wins});
+  }
+  if(profCfg.defaultProfile && !names.has(profCfg.defaultProfile)){ peShowMsg('default profile “'+profCfg.defaultProfile+'” is not a declared profile',true); return; }
+  const payload={profiles};
+  if(profCfg.defaultProfile) payload.defaultProfile=profCfg.defaultProfile;
+  if(steps.length){ payload.auto={steps,recover:!!profCfg.recover}; if(scheds.length)payload.auto.schedules=scheds; }
+  try{
+    const r=await fetch("/v1/profiles/config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); peShowMsg((e.error&&e.error.message)||('save failed ('+r.status+')'),true); return; }
+    profDirty=false; peShowMsg('saved ✓',false);
+    fetch("/v1/profiles").then(x=>x.json()).then(initProfileEditor).catch(()=>{});
+    load();
+  }catch(e){ peShowMsg('save failed: '+e.message,true); }
+}
+async function discardProfileConfig(){
+  profDirty=false; peShowMsg('',false);
+  fetch("/v1/profiles").then(r=>r.json()).then(initProfileEditor).catch(()=>{});
 }
 
 function render(stats,quotas,cfg){
