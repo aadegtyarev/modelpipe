@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Cost was undercounted for prompt-cached requests**: `createUsageTracker` only read
+  `usage.input_tokens`, ignoring the Anthropic-shape `cache_creation_input_tokens` /
+  `cache_read_input_tokens` fields — so an agentic session where most of the growing
+  context comes back as cache reads recorded near-zero input tokens per request (and
+  cost with it), even though the upstream provider bills those tokens too. Cache
+  creation now folds into `inputTokens` (billed at the input rate); cache reads are
+  tracked separately as `cacheReadTokens` and billed at the new optional
+  `tokenPrices.<model>.cacheRead` rate, falling back to the input rate when a model has
+  no configured cache rate (conservative — never silently drops cost, only tokenPrices
+  or PRICE_MAP a config was missing detail on for). Dashboard token totals (session,
+  per-model cards, request log, chart) now include `cacheReadTokens`.
 - **Account-pool cooldown is now progressive** (was a flat 60s): when an account in a pool
   hits a rate-limit it is parked on the SAME `failoverRecoveryBackoffMs` ladder (1→5→10 min)
   that model failover already rode — instead of re-probing a still-limited primary every 60s

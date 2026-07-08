@@ -32,21 +32,23 @@ const MAX_TIMELINE = 1000;
 
 // Model pricing per 1M tokens (USD). Only known models need an entry;
 // unknown models show "—" for price.
+// cacheRead (optional): price per 1M cache_read_input_tokens, when known — otherwise
+// the cost calc falls back to the full input rate for that model (see usageCost).
 const PRICE_MAP = {
   "claude-opus-4-8":       { input: 15,   output: 75   },
   "claude-sonnet-5":       { input: 3,    output: 15   },
   "claude-sonnet-4-6":     { input: 3,    output: 15   },
   "claude-sonnet-4-5":     { input: 3,    output: 15   },
   "claude-haiku-4-5":      { input: 0.8,  output: 4    },
-  "deepseek-v4-pro":       { input: 0.435, output: 0.87 },
+  "deepseek-v4-pro":       { input: 0.435, output: 0.87, cacheRead: 0.003625 },
   "deepseek-v4-flash":     { input: 0.14, output: 0.28 },
   "deepseek-chat":         { input: 0.14, output: 0.28 },
-  "GLM-5.2":               { input: 1.4,  output: 4.4  },
-  "glm-5.2":               { input: 1.4,  output: 4.4  },
+  "GLM-5.2":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
+  "glm-5.2":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
   "GLM-5-Turbo":           { input: 1.2,  output: 4.0  },
   "glm-5-turbo":           { input: 1.2,  output: 4.0  },
-  "GLM-5.1":               { input: 1.4,  output: 4.4  },
-  "glm-5.1":               { input: 1.4,  output: 4.4  },
+  "GLM-5.1":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
+  "glm-5.1":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
   "GLM-5":                 { input: 1.0,  output: 3.2  },
   "glm-5":                 { input: 1.0,  output: 3.2  },
   "GLM-4.7":               { input: 0.6,  output: 2.2  },
@@ -71,6 +73,15 @@ export function modelPrice(model, tokenPrices = null) {
 
 function globMatch(pattern, str) {
   return new RegExp("^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(str);
+}
+
+// cache_read_input_tokens are billed at price.cacheRead when the price entry sets it;
+// otherwise fall back to the full input rate (conservative — avoids under-counting cost
+// for models nobody has bothered to add a cacheRead rate for yet).
+function usageCost(inputTokens, cacheReadTokens, outputTokens, price) {
+  if (!price) return 0;
+  const cacheReadRate = price.cacheRead != null ? price.cacheRead : price.input;
+  return (inputTokens * price.input + (cacheReadTokens || 0) * cacheReadRate + outputTokens * price.output) / 1_000_000;
 }
 
 // PURE STATS
@@ -98,24 +109,26 @@ export class StatsCollector {
     // per-provider
     let p = this.#providers.get(pid);
     if (!p) {
-      p = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, lastRequestAt: 0 };
+      p = { requests: 0, errors: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, lastRequestAt: 0 };
       this.#providers.set(pid, p);
     }
     p.requests++;
     if (entry.status >= 400) p.errors++;
     p.inputTokens += entry.inputTokens || 0;
+    p.cacheReadTokens += entry.cacheReadTokens || 0;
     p.outputTokens += entry.outputTokens || 0;
     p.lastRequestAt = entry.ts;
 
     // per-model
     let m = this.#models.get(mid);
     if (!m) {
-      m = { providerId: pid, requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, lastRequestAt: 0 };
+      m = { providerId: pid, requests: 0, errors: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, lastRequestAt: 0 };
       this.#models.set(mid, m);
     }
     m.requests++;
     if (entry.status >= 400) m.errors++;
     m.inputTokens += entry.inputTokens || 0;
+    m.cacheReadTokens += entry.cacheReadTokens || 0;
     m.outputTokens += entry.outputTokens || 0;
     m.lastRequestAt = entry.ts;
 
@@ -144,16 +157,16 @@ export class StatsCollector {
     for (const [mid, m] of this.#models) {
       const r = recent.filter((e) => e.model === mid);
       const price = modelPrice(mid, tokenPrices);
-      const cost = price
-        ? (m.inputTokens * price.input / 1_000_000) + (m.outputTokens * price.output / 1_000_000)
-        : 0;
+      const cost = usageCost(m.inputTokens, m.cacheReadTokens, m.outputTokens, price);
       perModel[mid] = {
         providerId: m.providerId,
         priceInput: price ? price.input : null,
         priceOutput: price ? price.output : null,
+        priceCacheRead: price && price.cacheRead != null ? price.cacheRead : null,
         requests: m.requests,
         errors: m.errors,
         inputTokens: m.inputTokens,
+        cacheReadTokens: m.cacheReadTokens || 0,
         outputTokens: m.outputTokens,
         cost,
         rps: r.length > 0 ? Number((r.length / WINDOW_SEC).toFixed(2)) : 0,
@@ -165,7 +178,7 @@ export class StatsCollector {
     let sessionCost = 0, sessionTokens = 0, sessionReqs = 0;
     for (const m of Object.values(perModel)) {
       sessionCost += m.cost;
-      sessionTokens += m.inputTokens + m.outputTokens;
+      sessionTokens += m.inputTokens + m.cacheReadTokens + m.outputTokens;
       sessionReqs += m.requests;
     }
 
@@ -174,7 +187,7 @@ export class StatsCollector {
 
     const timeline = this.#timeline.slice(-200).map((e) => {
       const pr = modelPrice(e.model, tokenPrices);
-      const cost = pr ? (e.inputTokens * pr.input + e.outputTokens * pr.output) / 1_000_000 : 0;
+      const cost = usageCost(e.inputTokens || 0, e.cacheReadTokens || 0, e.outputTokens || 0, pr);
       return { ...e, cost };
     });
 
@@ -314,9 +327,22 @@ export function decompressIfNeeded(upstreamRes) {
 // `totalBuffer` accumulates ONLY for that case, bounded so a pathological body can't OOM.
 const JSON_FALLBACK_CAP = 10 * 1024 * 1024;
 
+// Anthropic-shape usage splits input into three buckets: fresh `input_tokens`,
+// `cache_creation_input_tokens` (written to cache, billed at the input rate), and
+// `cache_read_input_tokens` (served from cache, billed at the cheaper cacheRead rate —
+// see modelPrice). Folding creation into inputTokens and keeping cacheReadTokens
+// separate is what lets the cost calc price each bucket correctly.
+function extractUsage(usage) {
+  return {
+    inputTokens: (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0),
+    cacheReadTokens: usage.cache_read_input_tokens || 0,
+  };
+}
+
 export function createUsageTracker(stats, { providerId, model, startTime }) {
   let buffer = "";
   let inputTokens = 0;
+  let cacheReadTokens = 0;
   let outputTokens = 0;
   let totalBuffer = "";
   let started = false;
@@ -352,7 +378,9 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
         try {
           const data = JSON.parse(dataStr);
           if (eventType === "message_start" && data.message && data.message.usage) {
-            inputTokens += data.message.usage.input_tokens || 0;
+            const u = extractUsage(data.message.usage);
+            inputTokens += u.inputTokens;
+            cacheReadTokens += u.cacheReadTokens;
           } else if (eventType === "message_delta" && data.usage) {
             outputTokens += data.usage.output_tokens || 0;
           }
@@ -365,13 +393,15 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
 
     flush(callback) {
       // If the SSE parser didn't catch tokens, try fallback parsing
-      if (inputTokens === 0 && outputTokens === 0) {
+      if (inputTokens === 0 && cacheReadTokens === 0 && outputTokens === 0) {
         if (totalBuffer.trim().startsWith("{")) {
           // Non-streaming JSON response
           try {
             const json = JSON.parse(totalBuffer.trim());
             if (json.usage) {
-              inputTokens = json.usage.input_tokens || 0;
+              const u = extractUsage(json.usage);
+              inputTokens = u.inputTokens;
+              cacheReadTokens = u.cacheReadTokens;
               outputTokens = json.usage.output_tokens || 0;
             }
           } catch { /* not parseable */ }
@@ -392,7 +422,9 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
               try {
                 const data = JSON.parse(dataStr);
                 if (eventType === "message_start" && data.message && data.message.usage) {
-                  inputTokens += data.message.usage.input_tokens || 0;
+                  const u = extractUsage(data.message.usage);
+                  inputTokens += u.inputTokens;
+                  cacheReadTokens += u.cacheReadTokens;
                 } else if (eventType === "message_delta" && data.usage) {
                   outputTokens += data.usage.output_tokens || 0;
                 }
@@ -407,6 +439,7 @@ export function createUsageTracker(stats, { providerId, model, startTime }) {
           model,
           durationMs: Date.now() - startTime,
           inputTokens,
+          cacheReadTokens,
           outputTokens,
           status: 200,
         });
