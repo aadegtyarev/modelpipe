@@ -38,13 +38,9 @@ const {
   bodyHasImageBlock,
   isImageUnsupported400,
   isFailoverTrigger,
-  pickFailoverModel,
   pickVisionRoute,
   validateConfig,
   listConfig,
-  ladderPosition,
-  effectiveLadderModel,
-  resolveGroup,
   isFallbackAuth,
   clientHasAuth,
   pickAccountIndex,
@@ -53,8 +49,6 @@ const {
   parseTzOffset,
   parseHHMM,
   inWindow,
-  resolveSchedule,
-  validateSchedules,
 } = await import("../src/router.mjs");
 
 let pass = 0;
@@ -401,31 +395,36 @@ async function main() {
   check("validateConfig accepts vision:false",
     validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", vision: false, auth: { header: "x-api-key", keyEnv: "K" } }] }).routes[0].vision, false);
 
-  // ── failover config validation ─────────────────────────────────────────────
-  check("validateConfig accepts valid failover config",
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "a-*": "b" } }).failover["a-*"], "b");
-  let foEmptyKeyThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "": "b" } });
-  } catch { foEmptyKeyThrew = true; }
-  check("validateConfig rejects empty failover key", foEmptyKeyThrew, true);
-  let foEmptyValThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: { "a-*": "" } });
-  } catch { foEmptyValThrew = true; }
-  check("validateConfig rejects empty failover value", foEmptyValThrew, true);
-  let foBadTypeThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failover: "not-an-object" });
-  } catch { foBadTypeThrew = true; }
-  check("validateConfig rejects non-object failover", foBadTypeThrew, true);
+  // ── profiles / auto config validation + legacy rejection ────────────────────
+  const R = [{ match: "glm-*", base_url: "https://z.example", auth: { header: "Authorization", scheme: "Bearer", keyEnv: "K" } },
+             { match: "claude-*", base_url: "https://a.example", auth: "passthrough" }];
+  const mkc = (extra) => ({ routes: R, ...extra });
+  const rej = (extra) => { try { validateConfig(mkc(extra)); return false; } catch { return true; } };
+  check("validateConfig accepts profiles + auto",
+    validateConfig(mkc({ profiles: { native: { bind: {} }, sonnet: { bind: { "glm-5.2": "claude-sonnet-5" } } },
+      auto: { steps: [{ profile: "native" }, { profile: "sonnet", when: "limit" }] } })).profiles.sonnet.bind["glm-5.2"], "claude-sonnet-5");
+  check("validateConfig rejects legacy failover", rej({ failover: { "glm-*": "x" } }), true);
+  check("validateConfig rejects legacy failoverGroups", rej({ failoverGroups: [{ ladder: ["a", "b"] }] }), true);
+  check("validateConfig rejects legacy schedules", rej({ schedules: [] }), true);
+  check("validateConfig rejects unknown step profile", rej({ profiles: { native: { bind: {} } }, auto: { steps: [{ profile: "ghost" }] } }), true);
+  check("validateConfig rejects when on head step", rej({ profiles: { a: { bind: {} } }, auto: { steps: [{ profile: "a", when: "limit" }] } }), true);
+  check("validateConfig rejects bad when value", rej({ profiles: { a: { bind: {} }, b: { bind: {} } }, auto: { steps: [{ profile: "a" }, { profile: "b", when: "sometimes" }] } }), true);
+  check("validateConfig rejects unknown defaultProfile", rej({ profiles: { a: { bind: {} } }, defaultProfile: "ghost" }), true);
+  check("validateConfig rejects non-string bind target", rej({ profiles: { a: { bind: { "glm-*": 5 } } } }), true);
+  check("validateConfig rejects a shadowed binding (broad glob before specific)", rej({ profiles: { a: { bind: { "glm-*": "x", "glm-5.2": "y" } } } }), true);
+  check("validateConfig accepts specific-before-broad bindings",
+    validateConfig(mkc({ profiles: { a: { bind: { "glm-5.2": "y", "glm-*": "x" } } } })).profiles.a.bind["glm-5.2"], "y");
+  check("validateConfig accepts per-binding notes",
+    validateConfig(mkc({ profiles: { a: { bind: { "glm-5.2": "x" }, notes: { "glm-5.2": "paid reserve" } } } })).profiles.a.notes["glm-5.2"], "paid reserve");
+  check("validateConfig rejects non-string note", rej({ profiles: { a: { bind: { "glm-5.2": "x" }, notes: { "glm-5.2": 7 } } } }), true);
+  check("validateConfig rejects unknown schedule profile", rej({ profiles: { a: { bind: {} } }, auto: { steps: [{ profile: "a" }], schedules: [{ profile: "ghost", tz: "Z", windows: [["1:00", "2:00"]] }] } }), true);
+  check("validateConfig accepts auto.schedules",
+    validateConfig(mkc({ profiles: { a: { bind: {} }, b: { bind: {} } }, auto: { steps: [{ profile: "a" }], schedules: [{ profile: "b", tz: "+03:00", windows: [["14:00", "18:00"]] }] } })).auto.schedules.length, 1);
   let foBadCooldownThrew = false;
-  try {
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failoverRecoveryIntervalMs: 500 });
-  } catch { foBadCooldownThrew = true; }
+  try { validateConfig(mkc({ failoverRecoveryIntervalMs: 500 })); } catch { foBadCooldownThrew = true; }
   check("validateConfig rejects failoverRecoveryIntervalMs < 1000", foBadCooldownThrew, true);
   check("validateConfig accepts failoverRecoveryIntervalMs",
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], failoverRecoveryIntervalMs: 5000 }).failoverRecoveryIntervalMs, 5000);
+    validateConfig(mkc({ failoverRecoveryIntervalMs: 5000 })).failoverRecoveryIntervalMs, 5000);
 
   // ── isFailoverTrigger (pure, no network) ───────────────────────────────────
   const rateLimitBody429 = Buffer.from('{"error":{"message":"rate limit exceeded"}}');
@@ -461,15 +460,7 @@ async function main() {
   check("isFailoverTrigger: 500 + 'quota exceeded' triggers",
     isFailoverTrigger(500, Buffer.from('{"error":{"message":"quota exceeded"}}')), true);
 
-  // ── pickFailoverModel (pure) ───────────────────────────────────────────────
-  check("pickFailoverModel matches by glob", pickFailoverModel({ "claude-*": "glm-5.1" }, "claude-opus-4-8"), "glm-5.1");
-  check("pickFailoverModel no match returns null", pickFailoverModel({ "claude-*": "glm-5.1" }, "deepseek-chat"), null);
-  check("pickFailoverModel null config ⇒ null", pickFailoverModel(null, "any"), null);
-  check("pickFailoverModel empty string model ⇒ null", pickFailoverModel({ "a-*": "b" }, ""), null);
-  check("pickFailoverModel exact match", pickFailoverModel({ "glm-5.1": "deepseek-v4-pro" }, "glm-5.1"), "deepseek-v4-pro");
-  check("pickFailoverModel first match wins", pickFailoverModel({ "claude-*": "glm-5.1", "claude-opus-*": "deepseek" }, "claude-opus-4-8"), "glm-5.1");
-
-  // ── scheduled routing: pure helpers ────────────────────────────────────────
+  // ── time-window pure helpers ────────────────────────────────────────────────
   check("parseTzOffset +08:00", parseTzOffset("+08:00"), 480);
   check("parseTzOffset +08 (no minutes)", parseTzOffset("+08"), 480);
   check("parseTzOffset -0530", parseTzOffset("-0530"), -330);
@@ -487,64 +478,6 @@ async function main() {
   check("inWindow wraps midnight @01:00", inWindow(1 * 60, 22 * 60, 2 * 60), true);
   check("inWindow wraps midnight @12:00 outside", inWindow(12 * 60, 22 * 60, 2 * 60), false);
   check("inWindow empty (from==to)", inWindow(9 * 60, 9 * 60, 9 * 60), false);
-
-  // GLM peak = 14:00–18:00 UTC+8 == 06:00–10:00 UTC.
-  const SCHED = [
-    { match: "glm-5.2", to: "glm-5.1", tz: "+08:00", windows: [["14:00", "18:00"]] },
-    { match: "glm-5-turbo", to: "glm-4.5-air", tz: "+08:00", windows: [["14:00", "18:00"]] },
-  ];
-  const peakMs = Date.parse("2026-07-06T07:00:00Z"); // 15:00 UTC+8 → peak
-  const offMs = Date.parse("2026-07-06T12:00:00Z");  // 20:00 UTC+8 → off-peak
-  const edgeStart = Date.parse("2026-07-06T06:00:00Z"); // exactly 14:00 UTC+8 → peak (inclusive)
-  const edgeEnd = Date.parse("2026-07-06T10:00:00Z");   // exactly 18:00 UTC+8 → off (exclusive)
-  check("resolveSchedule peak glm-5.2 → glm-5.1", resolveSchedule(SCHED, "glm-5.2", peakMs), "glm-5.1");
-  check("resolveSchedule peak glm-5-turbo → glm-4.5-air", resolveSchedule(SCHED, "glm-5-turbo", peakMs), "glm-4.5-air");
-  check("resolveSchedule off-peak ⇒ null", resolveSchedule(SCHED, "glm-5.2", offMs), null);
-  check("resolveSchedule non-matching model ⇒ null", resolveSchedule(SCHED, "glm-5.1", peakMs), null);
-  check("resolveSchedule window start inclusive", resolveSchedule(SCHED, "glm-5.2", edgeStart), "glm-5.1");
-  check("resolveSchedule window end exclusive", resolveSchedule(SCHED, "glm-5.2", edgeEnd), null);
-  check("resolveSchedule to==model is a no-op", resolveSchedule([{ match: "glm-5.2", to: "glm-5.2", tz: "+08:00", windows: [["14:00", "18:00"]] }], "glm-5.2", peakMs), null);
-  check("resolveSchedule empty list ⇒ null", resolveSchedule([], "glm-5.2", peakMs), null);
-  check("resolveSchedule glob match", resolveSchedule([{ match: "glm-5.*", to: "glm-4.5", tz: "Z", windows: [["00:00", "23:59"]] }], "glm-5.2", peakMs), "glm-4.5");
-
-  // validateSchedules — same rules whether from the file or the dashboard POST.
-  check("validateSchedules normalizes tz null → Z", validateSchedules([{ match: "a", to: "b", windows: [["1:00", "2:00"]] }])[0].tz, "Z");
-  let vsThrew;
-  vsThrew = false; try { validateSchedules("nope"); } catch { vsThrew = true; }
-  check("validateSchedules rejects non-array", vsThrew, true);
-  vsThrew = false; try { validateSchedules([{ match: "", to: "b", tz: "Z", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
-  check("validateSchedules rejects empty match", vsThrew, true);
-  vsThrew = false; try { validateSchedules([{ match: "a", to: "", tz: "Z", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
-  check("validateSchedules rejects empty to", vsThrew, true);
-  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "bad", windows: [["1:00", "2:00"]] }]); } catch { vsThrew = true; }
-  check("validateSchedules rejects bad tz", vsThrew, true);
-  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "Z", windows: [] }]); } catch { vsThrew = true; }
-  check("validateSchedules rejects empty windows", vsThrew, true);
-  vsThrew = false; try { validateSchedules([{ match: "a", to: "b", tz: "Z", windows: [["25:00", "2:00"]] }]); } catch { vsThrew = true; }
-  check("validateSchedules rejects bad time", vsThrew, true);
-  check("validateConfig accepts valid schedules",
-    validateConfig({ routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }], schedules: SCHED }).schedules.length, 2);
-
-  // ── failover GROUPS: pure helpers ──────────────────────────────────────────
-  const LADDER = ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"];
-  check("ladderPosition head glob matches", ladderPosition(LADDER, "claude-opus-4-8"), 0);
-  check("ladderPosition concrete tier matches", ladderPosition(LADDER, "glm-5.1"), 1);
-  check("ladderPosition last tier matches", ladderPosition(LADDER, "deepseek-v4-pro"), 2);
-  check("ladderPosition no match ⇒ -1", ladderPosition(LADDER, "gpt-x"), -1);
-  check("ladderPosition empty model ⇒ -1", ladderPosition(LADDER, ""), -1);
-  check("effectiveLadderModel offset 0 = self", effectiveLadderModel(LADDER, 0, 0), "claude-opus-*");
-  check("effectiveLadderModel offset 1 shifts head→glm", effectiveLadderModel(LADDER, 1, 0), "glm-5.1");
-  check("effectiveLadderModel offset 1 shifts glm→deepseek", effectiveLadderModel(LADDER, 1, 1), "deepseek-v4-pro");
-  check("effectiveLadderModel clamps at last tier", effectiveLadderModel(LADDER, 5, 2), "deepseek-v4-pro");
-  const groups = [{ ladder: LADDER, mode: "shift" }];
-  const gs0 = [{ offset: 0 }];
-  const gs1 = [{ offset: 1 }];
-  check("resolveGroup offset 0: opus serves itself", resolveGroup(groups, gs0, "claude-opus-4-8").effectiveModel, "claude-opus-*");
-  check("resolveGroup offset 1: opus → glm", resolveGroup(groups, gs1, "claude-opus-4-8").effectiveModel, "glm-5.1");
-  check("resolveGroup offset 1: glm → deepseek (whole ladder shifts)", resolveGroup(groups, gs1, "glm-5.1").effectiveModel, "deepseek-v4-pro");
-  check("resolveGroup returns position", resolveGroup(groups, gs0, "glm-5.1").position, 1);
-  check("resolveGroup no ladder match ⇒ null", resolveGroup(groups, gs0, "gpt-x"), null);
-  check("resolveGroup no groups ⇒ null", resolveGroup(undefined, gs0, "glm-5.1"), null);
 
   // ── fallback auth (pure) ────────────────────────────────────────────────────
   check("isFallbackAuth true when flagged", isFallbackAuth({ auth: { header: "x-api-key", keyEnv: "K", fallback: true } }), true);
@@ -593,23 +526,6 @@ async function main() {
   check("rejects strategy without accounts", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", auth: { header: "h", keyEnv: "K" }, strategy: "failover" }] }), true);
   check("rejects bad strategy", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x", auth: { header: "h", keyEnv: "K" } }, { label: "y", auth: { header: "h", keyEnv: "K2" } }], strategy: "spread" }] }), true);
   check("rejects bad account base_url", acctThrow({ routes: [{ match: "g-*", base_url: "https://g.example", accounts: [{ label: "x", base_url: "not a url", auth: { header: "h", keyEnv: "K" } }, { label: "y", auth: { header: "h", keyEnv: "K2" } }] }] }), true);
-
-  // ── validateConfig: failoverGroups ─────────────────────────────────────────
-  const baseRoute = { routes: [{ match: "a-*", base_url: "https://a.example", auth: { header: "x-api-key", keyEnv: "K" } }] };
-  check("validateConfig accepts valid failoverGroups",
-    validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1", "c-1"], mode: "shift" }] }).failoverGroups[0].mode, "shift");
-  let grpNotArrThrew = false;
-  try { validateConfig({ ...baseRoute, failoverGroups: {} }); } catch { grpNotArrThrew = true; }
-  check("validateConfig rejects non-array failoverGroups", grpNotArrThrew, true);
-  let grpShortThrew = false;
-  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*"] }] }); } catch { grpShortThrew = true; }
-  check("validateConfig rejects ladder < 2 tiers", grpShortThrew, true);
-  let grpGlobTargetThrew = false;
-  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-*"] }] }); } catch { grpGlobTargetThrew = true; }
-  check("validateConfig rejects glob in a lower (target) tier", grpGlobTargetThrew, true);
-  let grpBadModeThrew = false;
-  try { validateConfig({ ...baseRoute, failoverGroups: [{ ladder: ["a-*", "b-1"], mode: "wat" }] }); } catch { grpBadModeThrew = true; }
-  check("validateConfig rejects bad group mode", grpBadModeThrew, true);
 
   // ── listConfig: the safe `--list` discovery summary (no network, no secrets) ─
   const listSample = {
@@ -970,277 +886,130 @@ async function main() {
     await close(bStub.server);
   }
 
-  // ── failover e2e (reactive reroute + pre-route + chain + depth guard) ──────
-  // Stub A (primary for claude-*), Stub B (backup glm-5.1), Stub C (backup for glm-5.1).
-  const foA = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
-  const foB = makeFlexStub(200); // backup: returns success
-  const foC = makeFlexStub(200); // chain backup
-  const foAPort = await listen(foA.server);
-  const foBPort = await listen(foB.server);
-  const foCPort = await listen(foC.server);
-
-  process.env.TEST_FO_KEY = "FO-SECRET-999";
-  process.env.MODEL_ROUTER_LOG = "1";
-  const foLogCapture = [];
-  const foRealStderrWrite = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk, ...rest) => { foLogCapture.push(String(chunk)); return foRealStderrWrite(chunk, ...rest); };
-
-  const failoverConfig = {
-    listen: { host: "127.0.0.1", port: 0 },
-    failover: { "claude-*": "glm-5.1", "glm-5.1": "deepseek-v4-pro" },
-    failoverRecoveryIntervalMs: 30000,
-    routes: [
-      { match: "claude-*", base_url: `http://127.0.0.1:${foAPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-      { match: "glm-5.1", base_url: `http://127.0.0.1:${foBPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-      { match: "deepseek-*", base_url: `http://127.0.0.1:${foCPort}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-    ],
-  };
-  const foRouter = createRouter(failoverConfig);
-  const foPort = await listen(foRouter);
-
-  try {
-    // F1. 429 from primary → failover to backup, client gets backup's 200.
-    foA.setStatus(429);
-    foA.setBody('{"error":{"message":"rate limit exceeded"}}');
-    foB.setStatus(200);
-    const f1 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F1-BODY" }] });
-    check("F1 failover: primary A received the call", foA.received.length, 1);
-    check("F1 failover: backup B received the rerouted call", foB.received.length, 1);
-    check("F1 failover: client gets B's 200", f1.status, 200);
-    check("F1 failover: B got the rewritten model id", JSON.parse(foB.received[0].body).model, "glm-5.1");
-    check("F1 failover: B got the body intact", JSON.parse(foB.received[0].body).messages[0].content, "F1-BODY");
-    check("F1 failover: B got the backend key", foB.received[0].headers["x-api-key"], "FO-SECRET-999");
-
-    // F2. Pre-route: second request skips the failed primary, goes straight to backup.
-    const aBefore2 = foA.received.length;
-    const bBefore2 = foB.received.length;
-    const f2 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F2-BODY" }] });
-    check("F2 pre-route: A was NOT hit (skip failed primary)", foA.received.length, aBefore2);
-    check("F2 pre-route: B served it directly", foB.received.length, bBefore2 + 1);
-    check("F2 pre-route: client gets B's 200", f2.status, 200);
-
-    // F3. 529 from primary → always triggers failover (status-only trigger).
-    foC.setStatus(200);
-    // For F3 we need a fresh failover state — clear it first.
-    foRouter._modelpipe.failoverState.clear();
-    foC.received.length = 0;
-    foA.setStatus(529);
-    foA.setBody("{}");
-    foB.setStatus(200);
-    const aBefore3 = foA.received.length;
-    const bBefore3 = foB.received.length;
-    const f3 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F3" }] });
-    check("F3: 529 triggers failover", f3.status, 200);
-    check("F3: A was hit (529)", foA.received.length, aBefore3 + 1);
-    check("F3: B served the reroute", foB.received.length, bBefore3 + 1);
-
-    // F4. Ambiguous 503 (no rate-limit message) → NOT failed over, error relayed verbatim.
-    foRouter._modelpipe.failoverState.clear();
-    foA.setStatus(503);
-    foA.setBody('{"error":{"message":"internal server error"}}');
-    const aBefore4 = foA.received.length;
-    const bBefore4 = foB.received.length;
-    const f4 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F4" }] });
-    check("F4 ambiguous 503: NOT failed over", f4.status, 503);
-    check("F4 ambiguous 503: error relayed verbatim", f4.body.includes("internal server error"), true);
-    check("F4 ambiguous 503: A hit once", foA.received.length, aBefore4 + 1);
-    check("F4 ambiguous 503: B NOT touched", foB.received.length, bBefore4);
-
-    // F5. Chain failover: A 429 → B 429 → C 200. Depth = 2 hops.
-    foRouter._modelpipe.failoverState.clear();
-    foA.setStatus(429);
-    foA.setBody('{"error":{"message":"rate limit exceeded"}}');
-    foB.setStatus(429);
-    foB.setBody('{"error":{"message":"rate limit exceeded"}}');
-    foC.setStatus(200);
-    const aBefore5 = foA.received.length;
-    const bBefore5 = foB.received.length;
-    const cBefore5 = foC.received.length;
-    const f5 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F5" }] });
-    check("F5 chain: A was hit (first hop)", foA.received.length, aBefore5 + 1);
-    check("F5 chain: B was hit (second hop)", foB.received.length, bBefore5 + 1);
-    check("F5 chain: C served the final response", foC.received.length, cBefore5 + 1);
-    check("F5 chain: client gets C's 200", f5.status, 200);
-    check("F5 chain: C got the rewritten model", JSON.parse(foC.received[foC.received.length - 1].body).model, "deepseek-v4-pro");
-
-    // F6. Non-rate-limit 400 is NOT failed over — relayed as-is.
-    foRouter._modelpipe.failoverState.clear();
-    foA.setStatus(400);
-    foA.setBody('{"error":{"message":"messages: roles must alternate"}}');
-    const aBefore6 = foA.received.length;
-    const bBefore6 = foB.received.length;
-    const f6 = await request(foPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F6" }] });
-    check("F6: 400 NOT failed over", f6.status, 400);
-    check("F6: error relayed verbatim", f6.body.includes("roles must alternate"), true);
-    check("F6: A hit once", foA.received.length, aBefore6 + 1);
-    check("F6: B NOT touched", foB.received.length, bBefore6);
-
-    // F7. log safety for failover: model+status logged, NO keys/secrets/body.
-    const foLogText = foLogCapture.join("");
-    check("F-log: names failover model -> backup", foLogText.includes("claude-opus-4-8 -> glm-5.1"), true);
-    check("F-log: leaks NO backend key", foLogText.includes("FO-SECRET-999"), false);
-    check("F-log: leaks NO body sentinel", foLogText.includes("F1-BODY") || foLogText.includes("F2-BODY"), false);
-  } finally {
-    process.stderr.write = foRealStderrWrite;
-    delete process.env.TEST_FO_KEY;
-    delete process.env.MODEL_ROUTER_LOG;
-    // ── F8-F10: fresh stubs + router for clean state ───────────────────────
-    process.env.TEST_FO_KEY = "FO-SECRET-999";
-    const foA2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
-    const foB2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
-    const foC2 = makeFlexStub(429, '{"error":{"message":"rate limit exceeded"}}');
-    const foA2Port = await listen(foA2.server);
-    const foB2Port = await listen(foB2.server);
-    const foC2Port = await listen(foC2.server);
-
-    const fo2Config = {
-      listen: { host: "127.0.0.1", port: 0 },
-      failover: { "claude-*": "glm-5.1", "glm-5.1": "deepseek-v4-pro" },
-      failoverRecoveryIntervalMs: 1000,
-      routes: [
-        { match: "claude-*", base_url: `http://127.0.0.1:${foA2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-        { match: "glm-5.1", base_url: `http://127.0.0.1:${foB2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-        { match: "deepseek-*", base_url: `http://127.0.0.1:${foC2Port}`, auth: { header: "x-api-key", keyEnv: "TEST_FO_KEY" } },
-      ],
-    };
-    const fo2Router = createRouter(fo2Config);
-    const fo2Port = await listen(fo2Router);
-
-    try {
-      // F8. Depth guard: chain A→B→C all 429, deepseek has no pair → relay C's 429.
-      const f8 = await request(fo2Port, { model: "claude-opus-4-8", messages: [{ role: "user", content: "F8" }] });
-      check("F8 depth guard: A was hit (hop 0)", foA2.received.length, 1);
-      check("F8 depth guard: B was hit (hop 1)", foB2.received.length, 1);
-      check("F8 depth guard: C was hit (hop 2, no backup)", foC2.received.length, 1);
-      check("F8 depth guard: client gets C's 429 relayed", f8.status, 429);
-
-      // F9. Model with route but no failover pair: 503 → relay error as-is.
-      foC2.setStatus(503);
-      foC2.setBody('{"error":{"message":"rate limit exceeded"}}');
-      const cBefore9 = foC2.received.length;
-      const f9 = await request(fo2Port, { model: "deepseek-v4-pro", messages: [{ role: "user", content: "F9" }] });
-      check("F9 no-backup: C was hit once", foC2.received.length, cBefore9 + 1);
-      check("F9 no-backup: error relayed verbatim", f9.status, 503);
-
-      // F10. Recovery ping: probe succeeds → failoverState cleared.
-      fo2Router._modelpipe.failoverState.set("claude-opus-4-8", { enteredAt: 1 }); // ancient timestamp
-      foA2.setStatus(200); // primary healthy
-      const pinger = fo2Router._modelpipe.failoverPinger;
-      if (pinger) {
-        await pinger.poll();
-        check("F10 recovery ping: failoverState cleared after probe",
-          fo2Router._modelpipe.failoverState.has("claude-opus-4-8"), false);
-      }
-    } finally {
-      delete process.env.TEST_FO_KEY;
-      await close(fo2Router);
-      await close(foA2.server);
-      await close(foB2.server);
-      await close(foC2.server);
-    }
-
-    await close(foRouter);
-    await close(foA.server);
-    await close(foB.server);
-    await close(foC.server);
-  }
-
-  // ── failover GROUP shift e2e (the whole ladder moves down together) ────────
+  // ── profile routing e2e (reactive shift, pre-route, cascade, pin, safety, recovery) ──
   {
-    process.env.TEST_GRP_KEY = "GRP-SECRET";
-    const grpA = makeFlexStub(200); // claude-* backend (head)
-    const grpB = makeFlexStub(200); // glm-5.1 backend
-    const grpC = makeFlexStub(200); // deepseek backend
-    const grpAPort = await listen(grpA.server);
-    const grpBPort = await listen(grpB.server);
-    const grpCPort = await listen(grpC.server);
-    const grpConfig = {
+    process.env.TEST_PF_KEY = "PF-SECRET-999";
+    process.env.MODEL_ROUTER_LOG = "1";
+    const pfLog = [];
+    const pfRealWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => { pfLog.push(String(chunk)); return pfRealWrite(chunk, ...rest); };
+
+    const zStub = makeFlexStub(200);    // glm backend (the "native" default)
+    const sonStub = makeFlexStub(200);  // claude-sonnet backend (the "sonnet" safety step)
+    const zPort = await listen(zStub.server);
+    const sonPort = await listen(sonStub.server);
+    const pfConfig = {
       listen: { host: "127.0.0.1", port: 0 },
-      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
-      failoverRecoveryIntervalMs: 1000,
+      dashboard: true,
+      failoverRecoveryIntervalMs: 30000, // long, so the BACKGROUND pinger never fires mid-test
+      profiles: {
+        native: { bind: {} },
+        sonnet: { bind: { "glm-5.2": "claude-sonnet-5" } },
+        econ: { bind: { "glm-5.2": "claude-sonnet-5" } }, // manual-only (NOT in auto.steps)
+      },
+      defaultProfile: "native",
+      auto: { steps: [{ profile: "native" }, { profile: "sonnet", when: "limit" }], recover: true },
       routes: [
-        { match: "claude-*", base_url: `http://127.0.0.1:${grpAPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
-        { match: "glm-5.1", base_url: `http://127.0.0.1:${grpBPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
-        { match: "deepseek-*", base_url: `http://127.0.0.1:${grpCPort}`, auth: { header: "x-api-key", keyEnv: "TEST_GRP_KEY" } },
+        { match: "glm-*", base_url: `http://127.0.0.1:${zPort}`, auth: { header: "x-api-key", keyEnv: "TEST_PF_KEY" } },
+        { match: "claude-*", base_url: `http://127.0.0.1:${sonPort}`, auth: { header: "x-api-key", keyEnv: "TEST_PF_KEY" } },
       ],
     };
-    const grpRouter = createRouter(grpConfig);
-    const grpPort = await listen(grpRouter);
+    const pfRouter = createRouter(pfConfig);
+    const pfPort = await listen(pfRouter);
+    const ps = pfRouter._modelpipe.profileState;
     try {
-      // G0. Healthy head at offset 0 must forward the ORIGINAL concrete model id, NOT the
-      //     ladder's glob head ("claude-opus-*"). Guards the glob-head rewrite bug.
-      grpA.setStatus(200);
-      const g0 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G0" }] });
-      check("G0 group: healthy head serves itself", g0.status, 200);
-      check("G0 group: forwards the REAL model id (not the glob)", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
-      check("G0 group: offset still 0", grpRouter._modelpipe.groupState[0].offset, 0);
-      grpA.received.length = 0;
+      // P0. default profile: glm-5.2 routes to its own z backend, no rewrite.
+      zStub.setStatus(200);
+      const p0 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P0" }] });
+      check("P0 default: z backend served glm-5.2", zStub.received.length, 1);
+      check("P0 default: model id unchanged", JSON.parse(zStub.received[0].body).model, "glm-5.2");
+      check("P0 default: client gets 200", p0.status, 200);
+      check("P0 default: offset 0", ps.offset, 0);
 
-      // G1. Head (opus) 429 → reactive shift to glm; offset becomes 1.
-      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
-      grpB.setStatus(200);
-      const g1 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G1" }] });
-      check("G1 group: head A hit", grpA.received.length, 1);
-      check("G1 group: head A got the real model id (not glob)", JSON.parse(grpA.received[0].body).model, "claude-opus-4-8");
-      check("G1 group: glm B served the reroute", grpB.received.length, 1);
-      check("G1 group: client gets 200", g1.status, 200);
-      check("G1 group: B got rewritten model", JSON.parse(grpB.received[0].body).model, "glm-5.1");
-      check("G1 group: offset shifted to 1", grpRouter._modelpipe.groupState[0].offset, 1);
+      // P1. z 429 → reactive shift to the "sonnet" step → claude backend serves it. offset → 1.
+      zStub.setStatus(429); zStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      sonStub.setStatus(200);
+      const zBefore1 = zStub.received.length;
+      const p1 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P1-BODY" }] });
+      check("P1 shift: z hit (the failing head)", zStub.received.length, zBefore1 + 1);
+      check("P1 shift: claude backend served the reroute", sonStub.received.length, 1);
+      check("P1 shift: client gets 200", p1.status, 200);
+      check("P1 shift: alias rewritten to claude-sonnet-5", JSON.parse(sonStub.received[0].body).model, "claude-sonnet-5");
+      check("P1 shift: backend got its key", sonStub.received[0].headers["x-api-key"], "PF-SECRET-999");
+      check("P1 shift: offset -> 1", ps.offset, 1);
 
-      // G2. THE KEY FEATURE: glm's OWN traffic now pre-routes to deepseek (whole ladder
-      //     shifted), even though glm itself never failed.
-      const cBefore = grpC.received.length;
-      const bBefore = grpB.received.length;
-      grpC.setStatus(200);
-      const g2 = await request(grpPort, { model: "glm-5.1", messages: [{ role: "user", content: "G2" }] });
-      check("G2 group: glm traffic shifted to deepseek", grpC.received.length, cBefore + 1);
-      check("G2 group: glm backend B NOT hit for glm traffic", grpB.received.length, bBefore);
-      check("G2 group: deepseek got rewritten model", JSON.parse(grpC.received[grpC.received.length - 1].body).model, "deepseek-v4-pro");
-      check("G2 group: client gets 200", g2.status, 200);
+      // P2. Pre-route while shifted: glm-5.2 goes straight to claude, z NOT hit.
+      const zBefore2 = zStub.received.length;
+      const sonBefore2 = sonStub.received.length;
+      const p2 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P2" }] });
+      check("P2 pre-route: z skipped while shifted", zStub.received.length, zBefore2);
+      check("P2 pre-route: claude served directly", sonStub.received.length, sonBefore2 + 1);
+      check("P2 pre-route: client gets 200", p2.status, 200);
 
-      // G3. opus pre-routes to glm during shift (head A skipped).
-      const aBefore3 = grpA.received.length;
-      const bBefore3 = grpB.received.length;
-      const g3 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G3" }] });
-      check("G3 group: head A skipped (pre-route)", grpA.received.length, aBefore3);
-      check("G3 group: glm B served opus", grpB.received.length, bBefore3 + 1);
-      check("G3 group: client gets 200", g3.status, 200);
+      // P3. Cascade end: at the last step, a further limit has nowhere lower → relayed.
+      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      const p3 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P3" }] });
+      check("P3 cascade end: last step's 429 relayed", p3.status, 429);
+      check("P3 cascade end: offset stays 1", ps.offset, 1);
+      sonStub.setStatus(200);
 
-      // G4. The synthetic pinger must NOT probe a GLOB head (ladder[offset-1]="claude-opus-*"):
-      //     a glob has no concrete id to ping with, so the pinger skips it and offset stays.
-      //     (Recovery for a glob/passthrough head is the live-request path in G4b.)
-      grpA.setStatus(200);
-      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // ancient → cooldown elapsed
-      const pinger = grpRouter._modelpipe.failoverPinger;
-      await pinger.poll();
-      check("G4 group: pinger does NOT wind back a glob head (offset stays 1)", grpRouter._modelpipe.groupState[0].offset, 1);
+      // P4. Recovery via the background pinger: z healthy + cooldown elapsed → wind up to 0.
+      zStub.setStatus(200);
+      ps.shiftedAt = 1; // ancient → cooldown elapsed
+      await pfRouter._modelpipe.profilePinger.poll();
+      check("P4 recovery: pinger wound offset back to 0", ps.offset, 0);
 
-      // G4b. LIVE-REQUEST recovery (the passthrough/glob-head path the pinger can't probe):
-      //      force a shift, then a head request after cooldown probes the real head and
-      //      winds back on success — no synthetic ping involved.
-      grpA.setStatus(429); grpA.setBody('{"error":{"message":"rate limit exceeded"}}');
-      await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-shift" }] });
-      check("G4b: shifted to offset 1", grpRouter._modelpipe.groupState[0].offset, 1);
-      grpA.setStatus(200); // head recovered
-      grpRouter._modelpipe.groupState[0].shiftedAt = 1; // cooldown elapsed
-      const aBefore4b = grpA.received.length;
-      const g4b = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G4b-probe" }] });
-      check("G4b: live head probe hit the real head A", grpA.received.length, aBefore4b + 1);
-      check("G4b: probe forwarded the real model id", JSON.parse(grpA.received[grpA.received.length - 1].body).model, "claude-opus-4-8");
-      check("G4b: client got 200", g4b.status, 200);
-      check("G4b: offset wound back to 0 by the live request", grpRouter._modelpipe.groupState[0].offset, 0);
+      // P5. Manual pin (dashboard): pin "sonnet" → glm-5.2 routes to claude even though z is healthy.
+      const zBefore5 = zStub.received.length;
+      const pin = await postJson(pfPort, "/v1/profiles/pin", { profile: "sonnet" });
+      check("P5 pin: endpoint ok", pin.status, 200);
+      const sonBefore5 = sonStub.received.length;
+      await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P5" }] });
+      check("P5 pin: z NOT hit (pinned to sonnet)", zStub.received.length, zBefore5);
+      check("P5 pin: claude served the pinned route", sonStub.received.length, sonBefore5 + 1);
+      check("P5 pin: state.pinned = sonnet", ps.pinned, "sonnet");
 
-      // G5. After recovery, opus serves itself again.
-      const aBefore5 = grpA.received.length;
-      const g5 = await request(grpPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "G5" }] });
-      check("G5 group: head A serves itself after recovery", grpA.received.length, aBefore5 + 1);
-      check("G5 group: client gets 200", g5.status, 200);
+      // P6. Safety armed: pin the manual-only "econ" (glm-5.2→claude), then claude 429 → the
+      //     pin CLEARS and the resolver falls back to default (native → z), which serves it.
+      await postJson(pfPort, "/v1/profiles/pin", { profile: "econ" });
+      check("P6 setup: pinned econ", ps.pinned, "econ");
+      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      zStub.setStatus(200);
+      const zBefore6 = zStub.received.length;
+      const p6 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P6" }] });
+      check("P6 safety: manual pin cleared on failover", ps.pinned, null);
+      check("P6 safety: fell back to default → z served", zStub.received.length, zBefore6 + 1);
+      check("P6 safety: client gets 200", p6.status, 200);
+      sonStub.setStatus(200);
+
+      // P7. GET /v1/profiles surfaces the banner summary (active + alias→target changes).
+      await postJson(pfPort, "/v1/profiles/pin", { profile: "sonnet" });
+      const view = JSON.parse((await get(pfPort, "/v1/profiles")).body);
+      check("P7 view: lists declared profiles", Object.keys(view.profiles).sort().join(","), "econ,native,sonnet");
+      check("P7 view: reports active profile", view.summary.active, "sonnet");
+      check("P7 view: reports source manual", view.summary.source, "manual");
+      check("P7 view: change line alias", view.summary.changes[0].alias, "glm-5.2");
+      check("P7 view: change line target", view.summary.changes[0].to, "claude-sonnet-5");
+
+      // P8. POST /v1/profiles/pin {profile:null} clears the pin; unknown profile → 400.
+      const clr = await postJson(pfPort, "/v1/profiles/pin", { profile: null });
+      check("P8 clear: ok", clr.status, 200);
+      check("P8 clear: pinned null", ps.pinned, null);
+      const badPin = await postJson(pfPort, "/v1/profiles/pin", { profile: "ghost" });
+      check("P8 clear: unknown profile → 400", badPin.status, 400);
+
+      // P-log: names alias -> target, leaks NO key or body.
+      const logText = pfLog.join("");
+      check("P-log: names alias -> target", logText.includes("glm-5.2 -> claude-sonnet-5"), true);
+      check("P-log: leaks NO backend key", logText.includes("PF-SECRET-999"), false);
+      check("P-log: leaks NO body sentinel", logText.includes("P1-BODY"), false);
     } finally {
-      delete process.env.TEST_GRP_KEY;
-      await close(grpRouter);
-      await close(grpA.server);
-      await close(grpB.server);
-      await close(grpC.server);
+      process.stderr.write = pfRealWrite;
+      delete process.env.TEST_PF_KEY;
+      delete process.env.MODEL_ROUTER_LOG;
+      await close(pfRouter);
+      await close(zStub.server);
+      await close(sonStub.server);
     }
   }
 
@@ -1282,78 +1051,70 @@ async function main() {
     }
   }
 
-  // ── group-reset endpoint (wind a stuck offset back without a restart) ──────
+  // ── /v1/profiles/reset endpoint (clear a stuck shift + pin without a restart) ──
   {
-    process.env.GR_KEY = "x";
-    const grStub = makeFlexStub(200);
-    const grPort = await listen(grStub.server);
-    const grRouter = createRouter({
+    process.env.PR_KEY = "x";
+    const prStub = makeFlexStub(200);
+    const prPort = await listen(prStub.server);
+    const prRouter = createRouter({
       listen: { host: "127.0.0.1", port: 0 },
       dashboard: true,
-      failoverGroups: [{ ladder: ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], mode: "shift" }],
+      profiles: { native: { bind: {} }, sonnet: { bind: { "glm-5.2": "claude-sonnet-5" } } },
+      auto: { steps: [{ profile: "native" }, { profile: "sonnet", when: "limit" }] },
       routes: [
-        { match: "claude-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
-        { match: "glm-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
-        { match: "deepseek-*", base_url: `http://127.0.0.1:${grPort}`, auth: { header: "x-api-key", keyEnv: "GR_KEY" } },
+        { match: "glm-*", base_url: `http://127.0.0.1:${prPort}`, auth: { header: "x-api-key", keyEnv: "PR_KEY" } },
+        { match: "claude-*", base_url: `http://127.0.0.1:${prPort}`, auth: { header: "x-api-key", keyEnv: "PR_KEY" } },
       ],
     });
-    const grRouterPort = await listen(grRouter);
+    const prRouterPort = await listen(prRouter);
+    const prPs = prRouter._modelpipe.profileState;
     try {
-      // Simulate a stuck double-shift.
-      grRouter._modelpipe.groupState[0].offset = 2;
-      const r1 = await postPath(grRouterPort, "/v1/failover/reset?group=0");
-      check("group reset: endpoint matched despite query string", r1.status, 200);
-      check("group reset: offset wound back to 0", grRouter._modelpipe.groupState[0].offset, 0);
-      check("group reset: reported cleared", JSON.parse(r1.body).cleared, 1);
-      // Unknown group → 400.
-      const r2 = await postPath(grRouterPort, "/v1/failover/reset?group=9");
-      check("group reset: unknown group → 400", r2.status, 400);
+      // Simulate a stuck shift + a manual pin, then reset both.
+      prPs.offset = 1; prPs.pinned = "sonnet";
+      const r = await postPath(prRouterPort, "/v1/profiles/reset");
+      check("profile reset: endpoint ok", r.status, 200);
+      check("profile reset: offset cleared", prPs.offset, 0);
+      check("profile reset: pin cleared", prPs.pinned, null);
     } finally {
-      delete process.env.GR_KEY;
-      await close(grRouter);
-      await close(grStub.server);
+      delete process.env.PR_KEY;
+      await close(prRouter);
+      await close(prStub.server);
     }
   }
 
-  // ── scheduled routing e2e (in-window pre-route rewrite + GET/POST /v1/schedules) ──
+  // ── scheduled profile e2e (an open window selects a profile as the intended head) ──
   {
     process.env.SC_KEY = "SC-KEY";
-    const scStub = makeFlexStub(200);
-    const scPort = await listen(scStub.server);
+    const scZ = makeFlexStub(200);   // glm backend (the "native" default)
+    const scC = makeFlexStub(200);   // claude backend (the scheduled "budget" profile's target)
+    const scZPort = await listen(scZ.server);
+    const scCPort = await listen(scC.server);
     const scRouter = createRouter({
       listen: { host: "127.0.0.1", port: 0 },
       dashboard: true,
-      // Always-open window (whole day, UTC) so the rewrite is deterministic regardless
+      profiles: { native: { bind: {} }, budget: { bind: { "glm-5.2": "claude-sonnet-5" } } },
+      defaultProfile: "native",
+      // Always-open window (whole day, UTC) so the selection is deterministic regardless
       // of when the test runs.
-      schedules: [{ match: "glm-5.2", to: "glm-5.1", tz: "Z", windows: [["00:00", "23:59"]] }],
+      auto: { steps: [{ profile: "native" }], schedules: [{ profile: "budget", tz: "Z", windows: [["00:00", "23:59"]] }] },
       routes: [
-        { match: "glm-*", base_url: `http://127.0.0.1:${scPort}`, auth: { header: "x-api-key", keyEnv: "SC_KEY" } },
+        { match: "glm-*", base_url: `http://127.0.0.1:${scZPort}`, auth: { header: "x-api-key", keyEnv: "SC_KEY" } },
+        { match: "claude-*", base_url: `http://127.0.0.1:${scCPort}`, auth: { header: "x-api-key", keyEnv: "SC_KEY" } },
       ],
     });
     const scRouterPort = await listen(scRouter);
     try {
       await requestH(scRouterPort, { model: "glm-5.2", messages: [] });
-      check("schedule e2e: glm-5.2 rewritten to glm-5.1 in-window", JSON.parse(scStub.received[0].body).model, "glm-5.1");
-
-      const g = JSON.parse((await get(scRouterPort, "/v1/schedules")).body);
-      check("GET /v1/schedules returns the schedule", g.schedules.length, 1);
-      check("GET /v1/schedules marks it active now", g.schedules[0].active, true);
-
-      // POST replaces the list (authoritative), GET reflects it, and the new mapping routes.
-      const p = await postJson(scRouterPort, "/v1/schedules", { schedules: [{ match: "glm-5.2", to: "glm-4.5", tz: "Z", windows: [["00:00", "23:59"]] }] });
-      check("POST /v1/schedules ok", p.status, 200);
-      const g2 = JSON.parse((await get(scRouterPort, "/v1/schedules")).body);
-      check("POST replaced schedule target", g2.schedules[0].to, "glm-4.5");
-      await requestH(scRouterPort, { model: "glm-5.2", messages: [] });
-      check("schedule e2e: POST-updated mapping takes effect", JSON.parse(scStub.received[scStub.received.length - 1].body).model, "glm-4.5");
-
-      // Invalid POST rejected the SAME way the file is (bad time).
-      const bad = await postJson(scRouterPort, "/v1/schedules", { schedules: [{ match: "x", to: "y", tz: "Z", windows: [["25:00", "2:00"]] }] });
-      check("POST /v1/schedules rejects bad time → 400", bad.status, 400);
+      check("schedule e2e: in-window profile routes glm-5.2 → claude", JSON.parse(scC.received[scC.received.length - 1].body).model, "claude-sonnet-5");
+      check("schedule e2e: z backend NOT hit in-window", scZ.received.length, 0);
+      const view = JSON.parse((await get(scRouterPort, "/v1/profiles")).body);
+      check("schedule e2e: GET /v1/profiles reports source schedule", view.summary.source, "schedule");
+      check("schedule e2e: active is the scheduled profile", view.summary.active, "budget");
     } finally {
       delete process.env.SC_KEY;
       await close(scRouter);
-      await close(scStub.server);
+      await close(scZ.server);
+      await close(scC.server);
     }
   }
 

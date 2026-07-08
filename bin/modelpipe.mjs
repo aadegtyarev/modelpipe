@@ -43,7 +43,7 @@ function loadEnvFile(filePath) {
   return set;
 }
 
-const USAGE = "usage: modelpipe <config.json> [--port N] [--env-file <path>] | modelpipe <config.json> --list | modelpipe init [--dir <path>]";
+const USAGE = "usage: modelpipe <config.json> [--port N] [--env-file <path>] | modelpipe <config.json> --list | modelpipe init [--dir <path>] | modelpipe migrate [config.json] [--overrides <path>] [--dry-run] [--out <path>]";
 
 function fail(message) {
   process.stderr.write(`modelpipe: ${message}\n${USAGE}\n`);
@@ -103,6 +103,16 @@ function main() {
       .then((m) => m.runSetup(process.argv.slice(3)))
       .then((code) => process.exit(code || 0))
       .catch((err) => fail(`setup failed: ${err.message}`));
+    return;
+  }
+
+  // `modelpipe migrate [config.json] [--overrides <path>] [--dry-run] [--out <path>]` —
+  // one-shot legacy(failover/schedules)+live-overrides → routing profiles. Backs up in place.
+  if (sub === "migrate") {
+    import("../src/migrate.mjs")
+      .then((m) => m.runMigrate(process.argv.slice(3)))
+      .then((code) => process.exit(code || 0))
+      .catch((err) => fail(`migrate failed: ${err.message}`));
     return;
   }
 

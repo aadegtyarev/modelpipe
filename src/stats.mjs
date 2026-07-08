@@ -56,6 +56,14 @@ const PRICE_MAP = {
   "google/gemini-2.5-flash-lite": { input: 0.1, output: 0.4 },
   "google/gemini-2.5-flash": { input: 0.3, output: 1.5 },
   "google/gemini-2.5-pro":  { input: 2.5, output: 10  },
+  // OpenRouter Qwen coder family (vendor/model ids). Prices per 1M tokens (verified 2026-07-08).
+  "qwen/qwen3-coder-next":  { input: 0.11, output: 0.8,  cacheRead: 0.07  },
+  "qwen/qwen3-coder":       { input: 0.22, output: 1.8   },
+  "qwen/qwen3-coder-flash": { input: 0.195, output: 0.975, cacheRead: 0.039 },
+  "qwen/qwen3-coder-plus":  { input: 0.65, output: 3.25, cacheRead: 0.13  },
+  "qwen/qwen3-coder-30b-a3b-instruct": { input: 0.07, output: 0.27 },
+  // OpenRouter MiniMax (agentic).
+  "minimax/minimax-m3":     { input: 0.3,  output: 1.2,  cacheRead: 0.06  },
 };
 
 // Direct API token prices — overridable via config.tokenPrices.

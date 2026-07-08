@@ -248,7 +248,9 @@ async function main() {
       listen: { host: "127.0.0.1", port: 0 },
       concurrency: { "glm-5.2": 1 },
       concurrencyQueueTimeoutMs: 1000, // the validated floor — short enough to keep the test quick
-      failover: { "glm-5.2": "deepseek-v4-pro" },
+      // A queue-timeout synthetic 429 steps the profile ladder: native → backup (glm-5.2 → deepseek-v4-pro).
+      profiles: { native: { bind: {} }, backup: { bind: { "glm-5.2": "deepseek-v4-pro" } } },
+      auto: { steps: [{ profile: "native" }, { profile: "backup", when: "limit" }] },
       routes: [
         { match: "glm-*", base_url: `http://127.0.0.1:${pPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } },
         { match: "deepseek-*", base_url: `http://127.0.0.1:${bPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } },

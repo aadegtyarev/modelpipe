@@ -33,16 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computed `providerId` from the route URL, so per-account dashboard cards showed zero
   tokens while all usage piled under the URL-derived id. `proxyToRoute` now takes the
   account label through from `dispatch`/rotation, matching the error path.
+- **Missing metered prices → $0 cost**: OpenRouter models absent from the price catalog
+  (e.g. `qwen/qwen3-coder-next`) resolved to a null price, so their per-response cost showed
+  `$0.000`. Added the Qwen coder family + `minimax/minimax-m3` to the built-in catalog (any
+  other model is still overridable via `tokenPrices`).
 
 ### Added
-- **`effective` downshift signal** on `GET /v1/failover` (issue #18): a ready-to-consume,
-  machine-readable view of what the **head slot** resolves to right now — `{ believed, head,
-  window, shifted, recoversInSec, accountCooldown }` — so an external consumer (statusline, an
-  out-of-harness compaction trigger, the dashboard) reads one field instead of re-deriving
-  `effective[offset]` and keeping its own model→window table. `window` comes from the same
-  `resolveWindow`/`effectiveWindow` the router uses (min'd with any learned ceiling), never the
-  client's size. Healthy head (offset 0) reports `head === believed`, `shifted:false`,
-  `recoversInSec:null`; `null` when no failover group is configured.
+- **Routing profiles** (`profiles` + `auto`, see [docs/profiles.md](docs/profiles.md)): a single
+  concept replacing `failover`, `failoverGroups`, `schedules`, and dashboard model-overrides. A
+  client sends a stable alias (e.g. `glm-5.2`); the **active profile** decides what it resolves
+  to. The active profile is chosen by **manual pin > error-shift > schedule > default**; a manual
+  pin never silences the safety net (a failover error clears the pin and the auto chain steps on).
+  The dashboard banner shows the active profile and **which alias went where** (`alias → target`,
+  provider→provider), with an inline pin/clear control. A **Profiles & routing editor** in the
+  dashboard settings creates/edits profiles (alias→target bindings), the default, the switching
+  chain (`auto.steps` with per-step `limit`/`5xx` conditions + `recover`), and schedules — saved
+  via `POST /v1/profiles/config`, validated and **hot-applied without a restart** (persisted as an
+  authoritative override, like `compact`/`concurrency`). `modelpipe migrate` rewrites an old config
+  (merging the live `~/.modelpipe/overrides.json`) into profiles, traffic-preserving.
 - **Concurrency limiter** (`concurrency` config + `GET`/`POST /v1/concurrency`): some providers
   cap **simultaneous** requests per subscription/key (e.g. the z.ai GLM Coding Plan allows only
   a few glm-5.2 in flight at once). Firing the N+1th just earns a limit-429, which failover then

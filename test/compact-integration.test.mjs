@@ -49,7 +49,10 @@ await (async () => {
       { match: "big-model", base_url: `http://127.0.0.1:${pBig}`, auth: "passthrough" },
       { match: "small-model", base_url: `http://127.0.0.1:${pSmall}`, auth: "passthrough" },
     ],
-    failover: { "big-model": "small-model" },
+    // Profile ladder: the "small" step rebinds big-model → small-model, so a 529 on the
+    // 1M-window primary downshifts to the 200-token backup (exercising the compact trim).
+    profiles: { primary: { bind: {} }, small: { bind: { "big-model": "small-model" } } },
+    auto: { steps: [{ profile: "primary" }, { profile: "small", when: "limit" }] },
     compact: { enabled: true, safetyPct: 0.95, windowDefault: 1000000, window: { "big-model": 1000000, "small-model": 200 }, maxOverflowRetries: 2 },
   }, { log: () => {} });
   const port = await listen(router);
