@@ -30,6 +30,7 @@ async function run() {
   check("modelPrice unknown model ⇒ null", modelPrice("no-such-model"), null);
   check("modelPrice exact override wins", modelPrice("glm-5.2", { "glm-5.2": { input: 9, output: 9 } }).input, 9);
   check("modelPrice glob override matches", modelPrice("claude-opus-4-8", { "claude-opus-*": { input: 1, output: 2 } }).output, 2);
+  check("modelPrice built-in cacheRead rate", modelPrice("glm-5.2").cacheRead, 0.26);
 
   // ── providerIdFromUrl ─────────────────────────────────────────────────────────
   check("providerId anthropic", providerIdFromUrl("https://api.anthropic.com"), "anthropic");
@@ -48,6 +49,19 @@ async function run() {
   // deepseek-chat = 0.14 in / 0.28 out per 1M → 0.42 for 1M+1M.
   check("snapshot computes real cost", Number(snap.session.cost.toFixed(2)), 0.42);
   check("snapshot marks errors", (() => { sc.record({ providerId: "deepseek", model: "deepseek-chat", status: 500 }); return sc.snapshot().models["deepseek-chat"].errors; })(), 1);
+
+  // ── cache_read_input_tokens billed at the cheaper cacheRead rate, not the input rate ─
+  const scCache = new StatsCollector();
+  scCache.record({ providerId: "glm", model: "glm-5.2", inputTokens: 0, cacheReadTokens: 1_000_000, outputTokens: 0, status: 200 });
+  const cacheSnap = scCache.snapshot();
+  check("cacheReadTokens tracked separately", cacheSnap.models["glm-5.2"].cacheReadTokens, 1_000_000);
+  // glm-5.2 cacheRead = $0.26/1M, not the $1.4/1M input rate.
+  check("cacheReadTokens billed at cacheRead rate", Number(cacheSnap.models["glm-5.2"].cost.toFixed(2)), 0.26);
+  check("session tokens include cacheReadTokens", cacheSnap.session.tokens, 1_000_000);
+  // A model with no configured cacheRead rate falls back to the input rate (conservative).
+  const scNoCacheRate = new StatsCollector();
+  scNoCacheRate.record({ providerId: "deepseek", model: "deepseek-chat", inputTokens: 0, cacheReadTokens: 1_000_000, outputTokens: 0, status: 200 });
+  check("cacheRead falls back to input rate when unset", Number(scNoCacheRate.snapshot().models["deepseek-chat"].cost.toFixed(2)), 0.14);
 
   // ── live-session persistence (resume across restart) ───────────────────────────
   sc.saveState();
@@ -77,6 +91,17 @@ async function run() {
   check("SSE tracker extracts input_tokens", rec[0].inputTokens, 123);
   check("SSE tracker extracts output_tokens", rec[0].outputTokens, 45);
   check("SSE tracker tags status 200", rec[0].status, 200);
+
+  // ── SSE usage tracker: cache_creation folds into inputTokens, cache_read stays separate ─
+  const recCache = [];
+  const trCache = createUsageTracker({ record: (e) => recCache.push(e) }, { providerId: "openrouter", model: "z-ai/glm-5.2", startTime: Date.now() });
+  const drainedCache = drain(trCache);
+  trCache.write('event: message_start\ndata: {"message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":90000}}}\n\n');
+  trCache.write('event: message_delta\ndata: {"usage":{"output_tokens":45}}\n\n');
+  trCache.end();
+  await drainedCache;
+  check("cache_creation folds into inputTokens", recCache[0].inputTokens, 30);
+  check("cache_read_input_tokens tracked separately", recCache[0].cacheReadTokens, 90000);
 
   // ── non-streaming JSON fallback ─────────────────────────────────────────────────
   const rec2 = [];

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# claude-multi — run Claude Code through the local modelpipe router
+# (systemd user service modelpipe.service on 127.0.0.1:8787).
+#
+# Per-slot model mapping (the rewrite happens HERE, client-side — Claude Code
+# emits these ids; modelpipe only routes on the id and swaps the backend key,
+# the body is never transformed):
+#
+#   opus slot   → native claude-opus-* id (untouched) → modelpipe route claude-*
+#                 → Anthropic via passthrough (forwards this client's own auth)
+#   sonnet slot → glm-5.2                            → modelpipe route glm-* → z.ai
+#   haiku slot  → deepseek-v4-pro                    → modelpipe route deepseek-* → DeepSeek
+#
+# Backend keys (ZAI_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY) live in
+# ~/appimages/modelpipe/.env and are read by the router process, NOT here — so
+# this wrapper holds no secrets.
+#
+# Vision fallback: if a backend rejects an image-bearing request with an
+# image-unsupported 400, modelpipe reroutes the same request to the OpenRouter
+# google/gemini-2.5-flash-lite route. CAVEAT: modelpipe does not rewrite the body,
+# so the rerouted request keeps its original model id — direct google/* calls
+# always work; a rerouted glm/deepseek image request may not. See README.
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="glm-5.2"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-pro"
+# opus slot deliberately unset — Claude Code's native claude-opus-* id is what we
+# want on the wire so it matches the claude-* passthrough route.
+
+export CLAUDE_CONFIG_DIR="$HOME/.claude-personal"
+exec claude "$@"

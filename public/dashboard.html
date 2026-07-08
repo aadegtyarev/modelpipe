@@ -78,6 +78,51 @@ canvas{display:block;width:100%;height:200px}
 
 .refresh{color:var(--muted);font-size:13px;margin-top:14px;cursor:pointer}
 .refresh:hover{color:var(--text)}
+
+/* Routing / failover banner */
+.routing{background:var(--card-bg);border:1px solid var(--orange);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:14px}
+.routing .hdr{color:var(--orange);font-weight:600;margin-bottom:4px}
+.routing .line{padding:2px 0}
+
+/* Failover group editor */
+.grp{border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:10px 0;background:var(--card-bg)}
+.grp-hd{display:flex;align-items:center;gap:10px;margin-bottom:4px;flex-wrap:wrap}
+.grp-title{font-weight:600}
+.grp-mode{width:auto;min-width:210px}
+.grp-hint{color:var(--muted);font-size:12px;margin-bottom:10px}
+.tiers{display:flex;flex-direction:column}
+.tier{display:flex;align-items:center;gap:10px}
+.t-num{width:22px;height:22px;flex:0 0 22px;border-radius:50%;background:var(--border);color:var(--text);font-size:12px;display:flex;align-items:center;justify-content:center}
+.t-in{flex:1;max-width:340px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.t-tag{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.t-del{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;width:24px;height:24px;cursor:pointer;font-size:14px;line-height:1}
+.t-del:hover{color:#fff;background:var(--red);border-color:var(--red)}
+.t-arrow{color:var(--text);font-size:13px;font-weight:600;margin:2px 0 2px 6px;padding-left:8px;border-left:2px solid var(--muted);min-height:18px;display:flex;align-items:center;gap:6px}
+.t-arrow span{opacity:.7;font-weight:400;font-size:12px}
+.t-add{background:transparent;color:var(--blue);border:1px dashed var(--border);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+.t-add:hover{border-color:var(--blue)}
+.grp-save{background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer}
+.grp-del{background:transparent;color:var(--red);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}
+.grp-del:hover{background:var(--red);color:#fff;border-color:var(--red)}
+.grp-status{margin-top:10px;font-size:13px;color:var(--muted)}
+.wb{background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer}
+.t-dead{color:var(--red);font-weight:600}
+.t-live{color:var(--orange);font-weight:600}
+.muted{color:var(--muted)}
+
+/* Scenario ("what happens") view under each ladder */
+.scen{margin-top:12px;border-top:1px dashed var(--border);padding-top:10px}
+.scen-hd{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.scen-row{display:flex;gap:10px;align-items:flex-start;padding:6px 8px;border-radius:6px;margin:4px 0}
+.scen-live{background:rgba(240,160,40,.10);border:1px solid var(--orange)}
+.scen-badge{flex:0 0 auto;font-size:11px;padding:2px 9px;border-radius:10px;background:var(--border);color:var(--text);white-space:nowrap;margin-top:1px}
+.scen-live .scen-badge{background:var(--orange);color:#fff}
+.scen-body{font-size:13px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.scen-when{color:var(--text)}
+.scen-mut{color:var(--muted)}
+.sr{display:inline-block;margin-right:14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--text)}
+.sr b{color:var(--orange);font-weight:700}
+.scen-foot{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.45}
 </style>
 </head>
 <body>
@@ -86,11 +131,29 @@ canvas{display:block;width:100%;height:200px}
 <div class="error" id="e"></div>
 
 <div class="session" id="session"></div>
+<div id="routing"></div>
 <div class="sessctl" id="sessctl">
   <button class="b" id="btnReset" onclick="newSession()">New session</button>
   <span style="font-size:13px;color:var(--muted)">History:</span>
   <select class="b" id="sessSelect" onchange="showHistory()"><option value="">live</option></select>
   <button class="b" onclick="toggleSettings()" style="color:var(--muted);margin-left:auto">⚙ Settings</button>
+</div>
+
+<div class="panel" id="failoverPanel">
+  <h3 style="margin:0 0 6px">Account pools</h3>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Multiple keys for the same provider — the router rotates to the next on a rate-limit/quota error, <b>below</b> the routing profiles. Failover <i>between</i> providers is now handled by <b>profiles</b>: see the routing banner at the top (pin/clear a profile there) and docs/profiles.md.</div>
+  <div id="accountPools" style="margin-top:10px"></div>
+</div>
+
+<div class="panel" id="profilesPanel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+    <h3 style="margin:0">Profiles &amp; switching rules</h3>
+    <button class="save" onclick="saveProfileConfig()">Save profiles &amp; rules</button>
+    <button class="b" onclick="discardProfileConfig()">Discard</button>
+    <span id="peMsg" style="font-size:12px"></span>
+  </div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:10px">A <b>profile</b> is a named set of alias→target rewrites ("which model goes where"). The active profile is chosen by <b>pin &gt; error-shift &gt; schedule &gt; default</b> (pin/clear at the top banner). Changes apply live — no restart.</div>
+  <div id="peBody"></div>
 </div>
 
 <div class="panel" id="tokenPricesPanel">
@@ -101,20 +164,25 @@ canvas{display:block;width:100%;height:200px}
   <div id="tpriceRows"></div>
 </div>
 
-<div class="panel" id="failoverPanel">
+<div class="panel" id="compactPanel">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-    <h3 style="margin:0">Failover pairs (model glob → backup)</h3>
-    <button class="save" onclick="saveFailover()">Save</button>
+    <h3 style="margin:0">Context fitting (trim to fit a smaller window on failover downshift)</h3>
+    <label style="font-size:13px;color:var(--muted)"><input type="checkbox" id="cpEnabled"> enabled</label>
+    <button class="save" onclick="saveCompact()">Save</button>
   </div>
-  <div id="failoverPairs"></div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Safety net, not steady-state compaction (that's the harness's job). When a request is routed to a model whose context window is <b>smaller</b> than the client's — a failover downshift (e.g. 1M → 256K) where the grown conversation no longer fits — the older turns are mechanically dropped to a stable checkpoint (tool_use/tool_result pairs kept intact) so it fits. If a backend still rejects a request as too long, the real window is <b>learned</b> and the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path.</div>
+  <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)">
+    <label>safety % of window <input class="i" id="cpSafetyPct" size="4"></label>
+    <label>default window (tokens) <input class="i" id="cpWindowDefault" size="9"></label>
+    <label>overflow retries <input class="i" id="cpMaxRetries" size="3"></label>
+  </div>
+  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens) — order specific ids before broad globs</h3>
+  <div id="cpWindowRows"></div>
   <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-    <input class="i" id="foPattern" placeholder="model glob (e.g. claude-opus-*)" style="flex:1">
-    <input class="i" id="foBackup" placeholder="backup model (e.g. glm-5.1)" style="flex:1">
-    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addFailoverPair()">Add</button>
+    <input class="i" id="cpWinGlob" placeholder="model id/glob (e.g. glm-5.2 or claude-*)" style="flex:1">
+    <input class="i" id="cpWinTokens" placeholder="tokens (e.g. 1000000)" style="width:160px">
+    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addCompactWindow()">Add</button>
   </div>
-  <div id="failoverGroups" style="margin-top:10px"></div>
-  <div id="accountPools" style="margin-top:10px"></div>
-  <div id="failoverActive" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px"></div>
 </div>
 
 <div class="panel" id="billingPanel">
@@ -141,7 +209,6 @@ const $=s=>document.getElementById(s);
 let auto=true;
 let histMode=null;               // null = live, id = viewing an archived session
 let billingByProvider={};        // providerId -> "metered" | "subscription"
-let failoverPairs={};
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
@@ -162,14 +229,60 @@ const CONSOLE={
 };
 const colors={};
 
+// ── Context compaction ───────────────────────────────────────────────────────
+let compactWindow={};                // editable mirror of compact.window (glob → tokens)
+const cpPct=v=>v!=null?Math.round(v*1000)/10:'';   // 0.95 → 95
+function renderCompact(d){
+  const c=(d&&d.compact)||{};
+  compactWindow={...(c.window||{})};
+  $('cpEnabled').checked=!!c.enabled;
+  $('cpSafetyPct').value=cpPct(c.safetyPct);
+  $('cpWindowDefault').value=c.windowDefault!=null?c.windowDefault:'';
+  $('cpMaxRetries').value=c.maxOverflowRetries!=null?c.maxOverflowRetries:'';
+  renderCompactWindows();
+}
+function renderCompactWindows(){
+  let h='';
+  for(const[g,t]of Object.entries(compactWindow)){
+    h+='<div style="display:flex;gap:6px;align-items:center;margin:2px 0">'+
+      '<span style="min-width:200px;color:var(--muted)">'+escHtml(g)+'</span>'+
+      '<input class="i" data-g="'+escHtml(g)+'" value="'+t+'" size="10" onchange="compactWindow[this.dataset.g]=+this.value">'+
+      '<button style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px" onclick="removeCompactWindow(\''+escHtml(g)+'\')">×</button></div>';
+  }
+  if(!h)h='<div class="muted" style="font-size:13px">No per-model overrides — all models use the default window.</div>';
+  $('cpWindowRows').innerHTML=h;
+}
+function addCompactWindow(){
+  const g=$('cpWinGlob').value.trim(),t=+$('cpWinTokens').value;
+  if(!g||!(t>0)){alert('Enter a model glob and a positive token count.');return;}
+  compactWindow[g]=t;$('cpWinGlob').value='';$('cpWinTokens').value='';renderCompactWindows();
+}
+function removeCompactWindow(g){delete compactWindow[g];renderCompactWindows();}
+async function saveCompact(){
+  const body={
+    enabled:$('cpEnabled').checked,
+    safetyPct:(+$('cpSafetyPct').value)/100,
+    windowDefault:+$('cpWindowDefault').value,
+    maxOverflowRetries:+$('cpMaxRetries').value,
+    window:compactWindow,
+  };
+  const r=await fetch("/v1/compact",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('Compaction save failed: '+(e.error||r.status));return;}
+  renderCompact(await r.json());
+}
+
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),bp=$('billingPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),pp=$('profilesPanel'),bp=$('billingPanel'),cp=$('compactPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
+  pp.style.display=show?'block':'none';
   bp.style.display=show?'block':'none';
+  cp.style.display=show?'block':'none';
   if(show){
+    fetch("/v1/profiles").then(r=>r.json()).then(initProfileEditor).catch(()=>{});
+    fetch("/v1/compact").then(r=>r.json()).then(renderCompact).catch(()=>{});
     fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const models=st.models||{},tpOver=st.tokenPrices||{};
@@ -186,7 +299,6 @@ function toggleSettings(){
       if(!rows)rows='<span style="color:var(--muted)">no model traffic yet — prices shown from the catalog once a model is used</span>';
       $('tpriceRows').innerHTML=rows;
     });
-    fetch("/v1/failover").then(r=>r.json()).then(renderFailover);
     fetch("/v1/accounts").then(r=>r.json()).then(renderAccounts).catch(()=>{});
   }
 }
@@ -240,68 +352,18 @@ async function saveTokenPrices(){
 }
 
 // ── Failover UI ───────────────────────────────────────────────────────────────
-function renderFailover(fo){
-  failoverPairs=fo.config||{};
-  let phtml='';
-  for(const[pattern,backup]of Object.entries(failoverPairs)){
-    phtml+='<div style="display:flex;align-items:center;gap:8px;margin:2px 0">'+
-      '<span style="min-width:150px;color:var(--blue)">'+escHtml(pattern)+'</span>'+
-      '<span style="color:var(--muted)">→</span>'+
-      '<span style="min-width:150px;color:var(--green)">'+escHtml(backup)+'</span>'+
-      '<button onclick="removeFailoverPair(\''+escJs(pattern)+'\')" style="background:var(--red);color:#fff;border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">×</button></div>';
-  }
-  if(!phtml)phtml='<span style="color:var(--muted)">no pairs configured</span>';
-  $('failoverPairs').innerHTML=phtml;
-
-  // Groups (config-file only; shown read-only with current shift state)
-  const groups=fo.groups||[];
-  let ghtml='';
-  if(groups.length){
-    ghtml='<h3>Failover groups (config file — '+groups.length+')</h3>';
-    groups.forEach((grp,i)=>{
-      const shifted=grp.offset>0;
-      ghtml+='<div style="margin:3px 0">'+
-        '<span style="color:var(--muted)">['+grp.mode+']</span> '+
-        grp.ladder.map((t,p)=>{
-          const eff=grp.effective[p];
-          const active=eff!==t;
-          return '<span style="color:'+(active?'var(--orange)':'var(--muted)')+'">'+escHtml(t)+(active?' →'+escHtml(eff):'')+'</span>';
-        }).join(' <span style="color:var(--border)">|</span> ')+
-        (shifted?' <span class="tag sub">shifted +'+grp.offset+'</span>':' <span class="tag metered">normal</span>')+
-        '</div>';
-    });
-  }
-  $('failoverGroups').innerHTML=ghtml;
-
-  // Active reactive failovers
-  const entries=Object.entries(fo.active||{});
-  let ahtml='';
-  if(entries.length){
-    ahtml='<span style="color:var(--orange);font-weight:600">Active failovers:</span> '+
-      entries.map(([m,s])=>{
-        const t=new Date(s.enteredAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
-        return '<span style="color:var(--orange)">'+escHtml(m)+' (since '+t+')</span>';
-      }).join(' · ')+
-      ' <button onclick="resetFailover()" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">Reset all</button>';
-  }
-  $('failoverActive').innerHTML=ahtml;
-}
-async function saveFailover(){await fetch("/v1/failover",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pairs:failoverPairs})});load();}
-async function addFailoverPair(){const p=$('foPattern').value.trim(),b=$('foBackup').value.trim();if(!p||!b)return;failoverPairs[p]=b;await saveFailover();$('foPattern').value='';$('foBackup').value='';}
-async function removeFailoverPair(p){delete failoverPairs[p];await saveFailover();}
-async function resetFailover(){await fetch("/v1/failover/reset",{method:"POST"});load();}
-
 async function newSession(){await fetch("/v1/sessions/reset",{method:"POST"});histMode=null;$("sessSelect").value="";load();}
 async function showHistory(){histMode=$("sessSelect").value||null;load();}
 
 // ── Load + render ─────────────────────────────────────────────────────────────
 async function load(){
   try{
-    const[stats,quotas,sessions,models]=await Promise.all([
+    const[stats,quotas,sessions,models,profiles]=await Promise.all([
       fetch("/v1/stats").then(r=>r.json()),
       fetch("/v1/quotas").then(r=>r.json()),
       fetch("/v1/sessions").then(r=>r.json()),
       fetch("/v1/models").then(r=>r.json()).catch(()=>({data:[]})),
+      fetch("/v1/profiles").then(r=>r.json()).catch(()=>null),
     ]);
     // Build providerId -> billing map from the route table, using the SERVER-computed
     // provider id (same one stats.mjs keys on) — no fragile host-substring re-derivation.
@@ -333,10 +395,257 @@ async function load(){
       if(arch){stats.session=arch.session;stats.models=arch.models;stats.timeline=[];}
     }
     render(stats,quotas,cfg);
+    renderRouting(profiles);
     $("e").style.display="none";
   }catch(err){$("e").style.display="block";$("e").textContent="fetch error: "+err.message}
   $("r").textContent="Updated: "+new Date().toLocaleTimeString()+"  —  auto-refresh "+(auto?"ON":"OFF");
   if(auto)setTimeout(load,2000);
+}
+
+// Top-level routing banner: shows — without opening Settings — when traffic is being
+// redirected (a reactive failover pair is active, or a failover group is shifted off its
+// head tier). Silent when routing is normal (the model cards already show where traffic
+// goes). Hidden while viewing an archived session (failover state is live, not historical).
+// Top-level routing banner — reflects the ACTIVE PROFILE (which alias goes where) and lets the
+// operator pin/clear a profile by hand. `prof` is GET /v1/profiles: { profiles, auto,
+// defaultProfile, state, summary } where summary is routingSummary() from src/profiles.mjs:
+// { active, intended, source, shifted, changes[{alias,from,to,fromProvider,toProvider}], recoversInSec }.
+// The status banner is shown only when the active profile diverges from the default (changes
+// present); the pin control is always available. Hidden while viewing an archived session.
+function renderRouting(prof){
+  if(histMode){$("routing").innerHTML="";return;}
+  if(!prof||!prof.summary){$("routing").innerHTML="";return;}
+  const s=prof.summary;
+  let h='';
+
+  // Status banner, styled by WHY the active profile is active. An error-shift (anomaly) always
+  // reads as the orange failover banner even if the intended head came from a schedule/default.
+  if(s.changes&&s.changes.length){
+    let color,hdr;
+    if(s.shifted){ color='var(--orange)'; hdr='⚠ Failover active — profile “'+escHtml(s.active)+'”'; }
+    else if(s.source==='manual'){ color='var(--blue)'; hdr='📌 Profile pinned — “'+escHtml(s.active)+'” (manual)'; }
+    else if(s.source==='schedule'){ color='var(--green)'; hdr='💸 Scheduled profile — “'+escHtml(s.active)+'”'; }
+    else { color='var(--orange)'; hdr='Routing — profile “'+escHtml(s.active)+'”'; }
+    h+='<div class="routing" style="border-color:'+color+'"><div class="hdr" style="color:'+color+'">'+hdr+'</div>';
+    if(s.shifted&&s.recoversInSec!=null){
+      h+='<div class="line"><span class="tag sub">recovers in ~'+fmtDur(s.recoversInSec)+'</span></div>';
+    }
+    for(const c of s.changes){
+      const prov=(c.fromProvider||c.toProvider)?' <span class="tag sub">'+escHtml(c.fromProvider||'?')+' → '+escHtml(c.toProvider||'?')+'</span>':'';
+      h+='<div class="line"><span style="color:'+color+'">'+escHtml(c.alias)+'</span> → '+escHtml(c.to)+prov+'</div>';
+    }
+    if(s.source==='manual'){ h+='<div class="line"><span class="tag sub">↓ safety armed — auto-failover still active</span></div>'; }
+    h+='</div>';
+  }
+
+  // Pin control — always shown so a profile can be switched by hand. Styled to match the
+  // session-control bar (styled .b select/buttons) instead of raw browser widgets.
+  const names=Object.keys(prof.profiles||{});
+  const pinned=(prof.state&&prof.state.pinned)||'';
+  h+='<div class="sessctl" style="margin-bottom:14px">'+
+     '<span style="color:var(--muted);font-size:13px">Profile:</span>'+
+     '<select class="b" id="pinSel">'+names.map(n=>'<option value="'+escHtml(n)+'"'+(n===pinned?' selected':'')+'>'+escHtml(n)+(n===prof.defaultProfile?' (default)':'')+'</option>').join('')+'</select>'+
+     '<button class="b" onclick="pinProfile()">Pin</button>'+
+     '<button class="b" onclick="pinProfile(null)"'+(pinned?'':' disabled style="opacity:.45;cursor:default"')+'>Clear pin</button>'+
+     (pinned
+       ?'<span class="tag" style="color:var(--blue);border-color:var(--blue)">📌 pinned</span>'
+       :'<span style="color:var(--muted);font-size:12px">auto — default + failover</span>')+
+     '</div>';
+
+  $("routing").innerHTML=h;
+}
+
+// POST the manual pin (or clear it with null). The router validates the profile name exists.
+async function pinProfile(explicit){
+  const profile = explicit===null ? null : ($("pinSel")?$("pinSel").value:null);
+  try{ await fetch("/v1/profiles/pin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({profile})}); }
+  catch(e){}
+  load();
+}
+
+// Seconds → a compact "2m 5s" / "45s" duration for the recovery ETA.
+function fmtDur(sec){ if(sec<60)return sec+'s'; const m=Math.floor(sec/60),r=sec%60; return m+'m'+(r?' '+r+'s':''); }
+
+// ── Profiles & switching-rules editor (Settings) ───────────────────────────────
+// Editable mirror of GET /v1/profiles, saved via POST /v1/profiles/config (live, no restart).
+// profCfg.profiles is an array of { name, bindings:[{alias,target}] } (⇄ the {name:{bind}} API
+// shape); steps mirror auto.steps (index 0 = head, no `when`). Populated on Settings-open only,
+// so the 2s auto-refresh never clobbers unsaved edits (profDirty guards a re-open too).
+let profCfg=null;
+let profDirty=false;
+
+function initProfileEditor(d){
+  if(profDirty) { renderProfileEditor(); return; }   // keep unsaved edits on a re-open
+  const profs=(d&&d.profiles)||{}, auto=(d&&d.auto)||{};
+  profCfg={
+    profiles:Object.keys(profs).map(name=>({name,bindings:Object.entries(profs[name].bind||{}).map(([alias,target])=>({alias,target,note:(profs[name].notes&&profs[name].notes[alias])||''}))})),
+    defaultProfile:(d&&d.defaultProfile)||'',
+    steps:(auto.steps||[]).map((s,i)=>({profile:s.profile,when:i===0?null:(s.when||'limit')})),
+    recover:auto.recover!==false,
+    schedules:(auto.schedules||[]).map(s=>({profile:s.profile,tz:s.tz||'+03:00',windows:(s.windows||[]).map(w=>[w[0],w[1]])})),
+  };
+  renderProfileEditor();
+}
+
+function peProfileNames(){ return profCfg?profCfg.profiles.map(p=>(p.name||'').trim()).filter(Boolean):[]; }
+function peOpts(val){ const names=peProfileNames(),have=names.includes(val); return (have?'':'<option value="" selected>— select —</option>')+names.map(n=>'<option'+(n===val?' selected':'')+'>'+escHtml(n)+'</option>').join(''); }
+function peDirty(){ profDirty=true; peShowMsg('',false); }
+function peShowMsg(msg,isErr){ const el=$('peMsg'); if(!el)return; el.textContent=msg; el.style.color=isErr?'var(--red)':'var(--green)'; }
+
+function renderProfileEditor(){
+  if(!profCfg){ if($('peBody'))$('peBody').innerHTML=''; return; }
+  let h='';
+  h+='<h3 style="font-size:14px;margin:4px 0 6px">Profiles</h3>';
+  profCfg.profiles.forEach((p,pi)=>{
+    h+='<div style="border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin:6px 0">';
+    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'+
+       '<input class="i" style="width:180px;font-weight:600" value="'+escHtml(p.name)+'" onchange="peSetName('+pi+',this.value)" placeholder="profile name">'+
+       '<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 8px" onclick="peDelProfile('+pi+')">× profile</button></div>';
+    if(!p.bindings.length) h+='<div style="color:var(--muted);font-size:12px;margin:2px 0 4px">no rewrites — every alias routes to its own backend (a “native” profile)</div>';
+    p.bindings.forEach((b,bi)=>{
+      h+='<div style="display:flex;align-items:center;gap:6px;margin:3px 0">'+
+         '<input class="i" style="flex:1" value="'+escHtml(b.alias)+'" onchange="peSetBind('+pi+','+bi+',\'alias\',this.value)" placeholder="alias glob (e.g. glm-5.2)">'+
+         '<span style="color:var(--muted)">→</span>'+
+         '<input class="i" style="flex:1" value="'+escHtml(b.target)+'" onchange="peSetBind('+pi+','+bi+',\'target\',this.value)" placeholder="target model (e.g. claude-sonnet-5)">'+
+         '<input class="i" style="width:170px;color:var(--muted)" value="'+escHtml(b.note||'')+'" onchange="peSetBind('+pi+','+bi+',\'note\',this.value)" placeholder="note (optional)">'+
+         '<button class="b" style="padding:2px 7px" onclick="peDelBind('+pi+','+bi+')">×</button></div>';
+    });
+    h+='<button class="t-add" style="margin-top:4px" onclick="peAddBind('+pi+')">+ binding</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddProfile()">+ Add profile</button>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Default profile</h3>';
+  h+='<select class="b" onchange="peSetDefault(this.value)">'+peOpts(profCfg.defaultProfile)+'</select>'+
+     '<span style="color:var(--muted);font-size:12px;margin-left:8px">used when nothing is pinned / scheduled / shifted</span>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Switching rules (auto chain)</h3>';
+  h+='<div style="color:var(--muted);font-size:12px;margin-bottom:6px">Ordered best→fallback. The head serves normally; each step below is entered on its error and (with recover) left when the higher provider returns.</div>';
+  profCfg.steps.forEach((s,i)=>{
+    h+='<div style="display:flex;align-items:center;gap:8px;margin:3px 0">'+
+       '<span style="color:var(--muted);width:16px;text-align:right">'+i+'</span>'+
+       '<select class="b" onchange="peSetStepProfile('+i+',this.value)">'+peOpts(s.profile)+'</select>';
+    if(i===0){ h+='<span class="tag" style="color:var(--muted)">head / default</span>'; }
+    else{ h+='<span style="color:var(--muted);font-size:12px">on</span>'+
+       '<select class="b" onchange="peSetStepWhen('+i+',this.value)">'+['limit','5xx'].map(w=>'<option'+(s.when===w?' selected':'')+'>'+w+'</option>').join('')+'</select>'; }
+    h+='<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 7px'+(i===0?';opacity:.4':'')+'" onclick="peMoveStep('+i+',-1)">↑</button>'+
+       '<button class="b" style="padding:2px 7px'+(i===profCfg.steps.length-1?';opacity:.4':'')+'" onclick="peMoveStep('+i+',1)">↓</button>'+
+       '<button class="b" style="padding:2px 7px" onclick="peDelStep('+i+')">×</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddStep()">+ Add step</button>';
+  h+='<div style="margin-top:8px"><label style="font-size:13px;color:var(--muted)"><input type="checkbox" '+(profCfg.recover?'checked':'')+' onchange="peToggleRecover(this.checked)"> recover — wind back up when the higher provider returns</label></div>';
+
+  h+='<h3 style="font-size:14px;margin:14px 0 6px">Schedules <span style="font-weight:400;color:var(--muted);font-size:12px">(optional — force a profile during a wall-clock window)</span></h3>';
+  profCfg.schedules.forEach((s,si)=>{
+    h+='<div style="border:1px solid var(--border);border-radius:6px;padding:6px 10px;margin:5px 0;display:flex;flex-wrap:wrap;align-items:center;gap:8px">'+
+       '<select class="b" onchange="peSetSched('+si+',\'profile\',this.value)">'+peOpts(s.profile)+'</select>'+
+       '<span style="color:var(--muted);font-size:12px">tz</span><input class="i" style="width:80px" value="'+escHtml(s.tz)+'" onchange="peSetSched('+si+',\'tz\',this.value)">';
+    s.windows.forEach((w,wi)=>{
+      h+='<span style="display:inline-flex;align-items:center;gap:4px"><input class="i" style="width:62px" value="'+escHtml(w[0])+'" onchange="peSetWin('+si+','+wi+',0,this.value)"><span style="color:var(--muted)">–</span><input class="i" style="width:62px" value="'+escHtml(w[1])+'" onchange="peSetWin('+si+','+wi+',1,this.value)"><button class="b" style="padding:2px 6px" onclick="peDelWin('+si+','+wi+')">×</button></span>';
+    });
+    h+='<button class="t-add" onclick="peAddWin('+si+')">+ win</button>'+
+       '<span style="flex:1"></span>'+
+       '<button class="b" style="padding:2px 7px" onclick="peDelSched('+si+')">× schedule</button></div>';
+  });
+  h+='<button class="t-add" onclick="peAddSched()">+ Add schedule</button>';
+
+  if($('peBody'))$('peBody').innerHTML=h;
+}
+
+function peSetName(i,v){
+  const old=(profCfg.profiles[i].name||'');
+  profCfg.profiles[i].name=v;
+  // Propagate the rename to every reference so the switching rules / default / schedules
+  // don't dangle on the old name (which would 400 on save).
+  if(old&&old!==v){
+    profCfg.steps.forEach(s=>{ if(s.profile===old)s.profile=v; });
+    profCfg.schedules.forEach(s=>{ if(s.profile===old)s.profile=v; });
+    if(profCfg.defaultProfile===old)profCfg.defaultProfile=v;
+  }
+  peDirty(); renderProfileEditor();
+}
+function peSetBind(pi,bi,f,v){ profCfg.profiles[pi].bindings[bi][f]=v; peDirty(); }
+function peAddProfile(){ let n=1,nm='profile'; const names=peProfileNames(); while(names.includes(nm))nm='profile'+(++n); profCfg.profiles.push({name:nm,bindings:[]}); peDirty(); renderProfileEditor(); }
+function peDelProfile(i){
+  const nm=profCfg.profiles[i].name;
+  profCfg.profiles.splice(i,1);
+  // Drop references so the switching rules / schedules / default don't dangle on a deleted name
+  // (which would otherwise 400 on save).
+  profCfg.steps=profCfg.steps.filter(s=>s.profile!==nm); peFixHead();
+  profCfg.schedules=profCfg.schedules.filter(s=>s.profile!==nm);
+  if(profCfg.defaultProfile===nm)profCfg.defaultProfile='';
+  peDirty(); renderProfileEditor();
+}
+function peAddBind(pi){ profCfg.profiles[pi].bindings.push({alias:'',target:''}); peDirty(); renderProfileEditor(); }
+function peDelBind(pi,bi){ profCfg.profiles[pi].bindings.splice(bi,1); peDirty(); renderProfileEditor(); }
+function peSetDefault(v){ profCfg.defaultProfile=v; peDirty(); }
+function peFixHead(){ profCfg.steps.forEach((s,i)=>{ if(i===0)s.when=null; else if(!s.when)s.when='limit'; }); }
+function peAddStep(){ const nm=peProfileNames()[0]||''; profCfg.steps.push({profile:nm,when:profCfg.steps.length===0?null:'limit'}); peDirty(); renderProfileEditor(); }
+function peSetStepProfile(i,v){ profCfg.steps[i].profile=v; peDirty(); }
+function peSetStepWhen(i,v){ profCfg.steps[i].when=v; peDirty(); }
+function peMoveStep(i,d){ const j=i+d,s=profCfg.steps; if(j<0||j>=s.length)return; [s[i],s[j]]=[s[j],s[i]]; peFixHead(); peDirty(); renderProfileEditor(); }
+function peDelStep(i){ profCfg.steps.splice(i,1); peFixHead(); peDirty(); renderProfileEditor(); }
+function peToggleRecover(v){ profCfg.recover=v; peDirty(); }
+function peAddSched(){ const nm=peProfileNames()[0]||''; profCfg.schedules.push({profile:nm,tz:'+03:00',windows:[['14:00','18:00']]}); peDirty(); renderProfileEditor(); }
+function peDelSched(i){ profCfg.schedules.splice(i,1); peDirty(); renderProfileEditor(); }
+function peSetSched(si,f,v){ profCfg.schedules[si][f]=v; peDirty(); }
+function peAddWin(si){ profCfg.schedules[si].windows.push(['14:00','18:00']); peDirty(); renderProfileEditor(); }
+function peDelWin(si,wi){ profCfg.schedules[si].windows.splice(wi,1); peDirty(); renderProfileEditor(); }
+function peSetWin(si,wi,idx,v){ profCfg.schedules[si].windows[wi][idx]=v; peDirty(); }
+
+async function saveProfileConfig(){
+  if(!profCfg){ return; }
+  const profiles={};
+  for(const p of profCfg.profiles){
+    const name=(p.name||'').trim();
+    if(!name){ peShowMsg('every profile needs a name',true); return; }
+    if(profiles[name]){ peShowMsg('duplicate profile name: “'+name+'”',true); return; }
+    const bind={},notes={};
+    for(const b of p.bindings){
+      const a=(b.alias||'').trim(),t=(b.target||'').trim(),nt=(b.note||'').trim();
+      if(a&&t){ bind[a]=t; if(nt)notes[a]=nt; }
+      else if(a||t){ peShowMsg('binding needs both alias and target (profile “'+name+'”)',true); return; }
+    }
+    profiles[name]={bind};
+    if(Object.keys(notes).length)profiles[name].notes=notes;
+  }
+  const names=new Set(Object.keys(profiles));
+  // Switching steps: preserve order; every step must NAME A DECLARED profile (head = index 0).
+  // Validate explicitly with an inline error rather than silently dropping/renumbering a step
+  // (which would promote the wrong tier to head and strip its condition).
+  const steps=[];
+  for(let i=0;i<profCfg.steps.length;i++){
+    const p=(profCfg.steps[i].profile||'').trim();
+    if(!p){ peShowMsg('switching step '+(i+1)+' needs a profile',true); return; }
+    if(!names.has(p)){ peShowMsg('switching step '+(i+1)+' names an unknown profile “'+p+'”',true); return; }
+    steps.push(i===0?{profile:p}:{profile:p,when:profCfg.steps[i].when||'limit'});
+  }
+  // Schedules: profile must exist and every window must be fully filled (no silent drop).
+  const scheds=[];
+  for(let si=0;si<profCfg.schedules.length;si++){
+    const s=profCfg.schedules[si],p=(s.profile||'').trim();
+    if(!p||!names.has(p)){ peShowMsg('schedule '+(si+1)+' names an unknown/empty profile',true); return; }
+    const wins=[];
+    for(const w of (s.windows||[])){ const a=(w[0]||'').trim(),b=(w[1]||'').trim(); if(a&&b)wins.push([a,b]); else if(a||b){ peShowMsg('schedule '+(si+1)+' has an incomplete window',true); return; } }
+    if(!wins.length){ peShowMsg('schedule '+(si+1)+' needs at least one window',true); return; }
+    scheds.push({profile:p,tz:(s.tz||'+03:00').trim(),windows:wins});
+  }
+  if(profCfg.defaultProfile && !names.has(profCfg.defaultProfile)){ peShowMsg('default profile “'+profCfg.defaultProfile+'” is not a declared profile',true); return; }
+  const payload={profiles};
+  if(profCfg.defaultProfile) payload.defaultProfile=profCfg.defaultProfile;
+  if(steps.length){ payload.auto={steps,recover:!!profCfg.recover}; if(scheds.length)payload.auto.schedules=scheds; }
+  try{
+    const r=await fetch("/v1/profiles/config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); peShowMsg((e.error&&e.error.message)||('save failed ('+r.status+')'),true); return; }
+    profDirty=false; peShowMsg('saved ✓',false);
+    fetch("/v1/profiles").then(x=>x.json()).then(initProfileEditor).catch(()=>{});
+    load();
+  }catch(e){ peShowMsg('save failed: '+e.message,true); }
+}
+async function discardProfileConfig(){
+  profDirty=false; peShowMsg('',false);
+  fetch("/v1/profiles").then(r=>r.json()).then(initProfileEditor).catch(()=>{});
 }
 
 function render(stats,quotas,cfg){
@@ -347,7 +656,7 @@ function render(stats,quotas,cfg){
   // total tokens, requests, start time. No "effective" proration fantik.
   let meteredCost=0,tokens=0,reqs=0;
   for(const[mid,m]of Object.entries(models)){
-    tokens+=(m.inputTokens||0)+(m.outputTokens||0);
+    tokens+=(m.inputTokens||0)+(m.cacheReadTokens||0)+(m.outputTokens||0);
     reqs+=m.requests||0;
     if(isMetered(m.providerId))meteredCost+=m.cost||0;
   }
@@ -359,22 +668,27 @@ function render(stats,quotas,cfg){
     (s.startedAt?'<div class="stat">'+new Date(s.startedAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",hour12:false})+'<span class="lbl">started</span></div>':'');
 
   // Model cards
-  const sorted=Object.entries(models).sort((a,b)=>((b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens)));
+  const inTot=m=>(m.inputTokens||0)+(m.cacheReadTokens||0);
+  const sorted=Object.entries(models).sort((a,b)=>((inTot(b[1])+b[1].outputTokens)-(inTot(a[1])+a[1].outputTokens)));
   let mhtml='';
   for(const[mid,m]of sorted){
     const online=m.lastRequestAt>Date.now()-300000;
     const metered=isMetered(m.providerId);
-    const tot=(m.inputTokens+m.outputTokens)||1;
+    const inSum=inTot(m);
+    const tot=(inSum+m.outputTokens)||1;
+    // Red dot ONLY when the model is fully failing — traffic sent, zero successful responses.
+    const allFail=m.requests>0&&(m.requests-(m.errors||0))===0;
+    const dotColor=allFail?'var(--red)':(online?'var(--green)':'var(--muted)');
     mhtml+='<div class="card">'+
-      '<div class="head"><span class="name" style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'● ':'○ ')+escHtml(mid)+'</span>'+
+      '<div class="head"><span class="name" style="color:'+dotColor+'" title="'+(allFail?'all requests failing':(online?'active':'idle'))+'">'+(online||allFail?'● ':'○ ')+escHtml(mid)+'</span>'+
         '<span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span></div>'+
       '<div class="provider">'+escHtml(m.providerId)+'</div>'+
       '<div class="price">'+(metered?pricestr(m.priceInput,m.priceOutput):'subscription — cost not metered')+'</div>'+
       '<div class="bar-wrap"><div class="bar">'+
-        '<div class="in" style="width:'+(m.inputTokens/tot*100)+'%"></div>'+
+        '<div class="in" style="width:'+(inSum/tot*100)+'%"></div>'+
         '<div class="out" style="width:'+(m.outputTokens/tot*100)+'%"></div></div></div>'+
       '<div class="metrics">'+
-        '<span><span class="val">'+fmt(m.inputTokens+m.outputTokens)+'</span> <span class="unit">tok</span></span>'+
+        '<span><span class="val">'+fmt(tot)+'</span> <span class="unit">tok</span></span>'+
         '<span><span class="val">'+(metered?usd(m.cost):'—')+'</span></span>'+
         '<span><span class="val">'+fmt(m.requests)+'</span> <span class="unit">req</span></span></div>'+
       '</div>';
@@ -394,13 +708,17 @@ function render(stats,quotas,cfg){
     const metered=isMetered(c.pid);
     const cost=sm.reduce((a,m)=>a+(m.cost||0),0);
     const treq=sm.reduce((a,m)=>a+(m.requests||0),0);
-    const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.outputTokens||0),0);
+    const terr=sm.reduce((a,m)=>a+(m.errors||0),0);
+    const ttok=sm.reduce((a,m)=>a+(m.inputTokens||0)+(m.cacheReadTokens||0)+(m.outputTokens||0),0);
     const online=sm.some(m=>m.lastRequestAt>Date.now()-300000);
+    // Red dot ONLY when this provider is fully failing — traffic sent, zero successful responses.
+    const allFail=treq>0&&(treq-terr)===0;
+    const dotColor=allFail?'var(--red)':(online?'var(--green)':'var(--muted)');
     const canon=c.canon||c.pid; // for a pooled account, the underlying provider (glm/anthropic/…)
     const labelled=canon!==c.pid; // this card IS an individual account label
     const consoleUrl=CONSOLE[canon];
     qhtml+='<div class="qcard"><div class="qhead">'+
-      '<span style="color:'+(online?'var(--green)':'var(--muted)')+'">'+(online?'●':'○')+'</span> '+escHtml(c.pid)+
+      '<span style="color:'+dotColor+'" title="'+(allFail?'all requests failing':(online?'active':'idle'))+'">'+(online||allFail?'●':'○')+'</span> '+escHtml(c.pid)+
       (labelled?' <span class="tag" style="color:var(--blue);border-color:var(--blue)">'+escHtml(canon)+'</span>':'')+
       ' <span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span>'+
       (consoleUrl?' <a href="'+consoleUrl+'" target="_blank" rel="noopener" title="open provider console" style="margin-left:auto;font-size:12px">console ↗</a>':'')+
@@ -431,7 +749,7 @@ function render(stats,quotas,cfg){
     lhtml+='<div class="row'+(e.status>=400?' er':'')+'">'+
       '<span class="t">'+timeStr+'</span>'+
       '<span class="m">'+escHtml(e.model||'?')+'</span>'+
-      '<span class="tok">'+fmt(e.inputTokens)+' in / '+fmt(e.outputTokens)+' out</span>'+
+      '<span class="tok">'+fmt((e.inputTokens||0)+(e.cacheReadTokens||0))+' in / '+fmt(e.outputTokens)+' out</span>'+
       '<span class="cost">'+(metered?usd(e.cost):'—')+'</span>'+
       '<span class="ms">'+fmt(e.durationMs)+'ms</span></div>';
   }
@@ -449,7 +767,7 @@ function drawChart(timeline){
   for(const e of timeline){
     const bin=Math.floor((e.ts-start)/binMs),key=e.model||'?';
     if(!series[key])series[key]=new Array(bins).fill(0);
-    if(bin<bins)series[key][bin]+=(e.inputTokens||0)+(e.outputTokens||0);
+    if(bin<bins)series[key][bin]+=(e.inputTokens||0)+(e.cacheReadTokens||0)+(e.outputTokens||0);
   }
   Object.values(series).forEach(sr=>{for(let i=1;i<sr.length;i++)sr[i]+=sr[i-1]});
   const pad={l:40,r:10,t:8,b:20},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;

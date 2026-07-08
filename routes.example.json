@@ -1,59 +1,88 @@
 {
-  "_doc": "Worked example route-table for modelpipe (src/router.mjs). Copy it, set the env vars it names, then start the router and point your Anthropic-format client at it: `modelpipe routes.json` then `export ANTHROPIC_BASE_URL=http://127.0.0.1:8787`. The router keys on each request body's `model` and forwards to the FIRST route whose `match` glob matches (so order specific routes before broad ones). Keys are referenced by env-var NAME only — NEVER put a key value in this file. Provider endpoints/auth come from providers.json (verified 2026-06-30).",
+  "_doc": "Worked example route-table for modelpipe (src/router.mjs). Copy it, set the env vars it names, then start the router and point your Anthropic-format client at it: `modelpipe routes.json` then `export ANTHROPIC_BASE_URL=http://127.0.0.1:8787`. The router keys on each request body's `model` and forwards to the FIRST route whose `match` glob matches (so order specific routes before broad ones). Keys are referenced by env-var NAME only — NEVER put a key value in this file. Provider endpoints/auth come from providers.json. ROUTING PROFILES (see docs/profiles.md) replace the old failover/failoverGroups/schedules — run `modelpipe migrate` on an old config.",
   "_route_shape": {
     "match": "REQUIRED string — glob over the model id; only `*` is a wildcard (e.g. claude-* / deepseek-* / google/*)",
     "base_url": "REQUIRED string — the backend origin (optionally with a base path, e.g. /anthropic); the client's /v1/messages path is appended",
-    "auth": "REQUIRED — EITHER the string \"passthrough\" (forward the client's own auth header unchanged — for a subscription/OAuth session with no backend key) OR an object { header, keyEnv, scheme?, fallback? }: the header name to send the backend key under, the NAME of the env var holding the key (read at request time, never logged), an OPTIONAL scheme prefix (\"Bearer\" yields `Authorization: Bearer <key>`; omit for a raw value like `x-api-key: <key>`), and OPTIONAL fallback:true (forward the client's OWN token when it sent one, inject keyEnv only when it didn't — 'the token that flies wins'). NOTE: a subscription OAuth token (sk-ant-oat…) is short-lived/auto-refreshed — prefer \"passthrough\" for it; use fallback with a long-lived API key.",
-    "billing": "OPTIONAL \"metered\" | \"subscription\". How the dashboard reports money for this backend. \"metered\" = pay-as-you-go, real per-token $ shown (DeepSeek, OpenRouter). \"subscription\" = a flat plan (GLM Coding Plan, an Anthropic subscription) where per-token $ is meaningless — the dashboard shows tokens + a \"flat plan\" label, never a fabricated cost. DEFAULT: passthrough ⇒ subscription, key-swap ⇒ metered.",
-    "accounts": "OPTIONAL array of multiple accounts/keys for the SAME model — the router rotates to the next when one hits its limit (429/529/quota/credit). Each is { label, auth, base_url? }: a label (its own dashboard card + per-label stats), its own auth (same shape as route auth), and an optional base_url override. When present, route-level auth is OPTIONAL. Key/backend-level rotation — the model id is NOT rewritten. Cooldown recovery via failoverRecoveryIntervalMs; GET /v1/accounts + POST /v1/accounts/reset for state. Opt-in per route.",
-    "strategy": "OPTIONAL \"failover\" (default) | \"round-robin\" — only with accounts. failover drains account #1 and moves to #2 on a limit (snaps back on recovery); round-robin spreads requests across accounts to stretch total quota.",
-    "forImages": "OPTIONAL true on exactly ONE route — marks it the vision fallback target. When a backend rejects an image-bearing request with an image-unsupported 400, modelpipe reroutes the request to this route.",
-    "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects (e.g. an OpenRouter vendor/model id like google/gemini-2.5-flash-lite). On reroute, ONLY the body's `model` is rewritten to this; the rest of the body (the image bytes) is untouched. Fail-closed: a forImages route with no forImagesModel is a config error at startup.",
-    "vision": "OPTIONAL boolean, default true. false ⇒ this route's backend has no vision capability. An image-bearing request matched by this route goes STRAIGHT to the forImages target (with the forImagesModel rewrite), never sent to this backend first. Use it for a backend that does NOT 400 on an image (a 200 soft-refusal, or its own server-side image tool) — the reactive catch-400 fallback cannot detect those. Text-only turns route normally. Inert with no forImages route configured."
+    "auth": "REQUIRED — EITHER the string \"passthrough\" (forward the client's own auth header unchanged) OR an object { header, keyEnv, scheme?, fallback? }: the header name, the NAME of the env var holding the key (read at request time, never logged), an OPTIONAL scheme prefix (\"Bearer\" ⇒ `Authorization: Bearer <key>`), and OPTIONAL fallback:true (forward the client's OWN token when present, inject keyEnv only when it didn't).",
+    "billing": "OPTIONAL \"metered\" | \"subscription\". How the dashboard reports money. \"metered\" = pay-as-you-go, real per-token $ (DeepSeek, OpenRouter). \"subscription\" = a flat plan (GLM Coding Plan, an Anthropic subscription) — tokens + a \"flat plan\" label, never a fabricated cost. DEFAULT: passthrough ⇒ subscription, GLM/z.ai ⇒ subscription, other key-swap ⇒ metered.",
+    "accounts": "OPTIONAL array of multiple accounts/keys for the SAME model — the router rotates to the next when one hits its limit (429/529/quota/credit). Each is { label, auth, base_url? }. Key/backend-level rotation — the model id is NOT rewritten, and it sits BELOW profiles (a profile step only fires once the whole pool is drained). Cooldown recovery via failoverRecoveryIntervalMs.",
+    "strategy": "OPTIONAL \"failover\" (default) | \"round-robin\" — only with accounts. failover drains account #1 then #2 on a limit; round-robin spreads requests to stretch total quota.",
+    "forImages": "OPTIONAL true on exactly ONE route — the vision fallback target. An image-bearing request rejected with an image-unsupported 400 is rerouted here.",
+    "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects; on reroute ONLY body.model is rewritten to this.",
+    "vision": "OPTIONAL boolean, default true. false ⇒ this backend has no vision; an image-bearing request matched here goes STRAIGHT to the forImages target."
   },
   "_config_shape": {
     "listen": "OPTIONAL { host, port } — default 127.0.0.1:8787",
-    "dashboard": "OPTIONAL boolean, default false — enables the /dashboard monitoring page, /v1/stats, /v1/quotas, /v1/sessions, and per-model usage tracking (zero-buffer, never impacts latency). The live session + dashboard-set overrides persist under ~/.modelpipe/ across restarts.",
-    "tokenPrices": "OPTIONAL object { modelGlob: { input, output } } — per-model metered API prices in $ per 1M tokens; keys may use * globs; falls back to the built-in catalog. Editable at runtime (⚙ → token prices) and persisted.",
-    "failover": "OPTIONAL object { modelGlob: backupModelId } — per-model backup on a retryable error (see _failover_doc).",
-    "failoverGroups": "OPTIONAL array of ordered ladders (see _failoverGroups_doc) — coordinated 'shift the whole ladder' failover.",
-    "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB) — request body size cap; requests exceeding it get a 413",
-    "proxyUrl": "OPTIONAL string — surfaced in `modelpipe --list` output for a client setup dialog"
+    "dashboard": "OPTIONAL boolean, default false — enables /dashboard, /v1/stats, /v1/profiles, and per-model usage tracking. Live state (the active profile pin/offset) persists under ~/.modelpipe/ across restarts.",
+    "tokenPrices": "OPTIONAL object { modelGlob: { input, output, cacheRead? } } — per-model metered API prices in $ per 1M tokens; keys may use * globs; falls back to the built-in catalog. Editable at runtime and persisted.",
+    "profiles": "REQUIRED (for routing profiles) object { name: { bind: { aliasGlob: targetModelId } } } — each profile is a NAMED SNAPSHOT of alias→target bindings ('which model goes where'). A client sends a stable alias (e.g. glm-5.2); the ACTIVE profile rewrites it to a concrete target BEFORE route matching. An empty bind = no rewrite (every alias routes to its own backend). First matching alias glob wins. See _profiles_doc and docs/profiles.md.",
+    "defaultProfile": "OPTIONAL string — the base profile when nothing else selects; defaults to auto.steps[0].profile.",
+    "auto": "OPTIONAL object { steps, recover?, schedules? } — the automatic selection. steps is the ORDERED chain that steps automatically (best→fallback); membership in steps = automatic, absence = manual-only. See _auto_doc.",
+    "compact": "OPTIONAL object — context FITTING safety net for a failover downshift to a smaller-window backup, ON BY DEFAULT (see docs/compaction.md). window maps model ids/globs to context size, FIRST MATCH WINS.",
+    "concurrency": "OPTIONAL object { modelGlob: maxConcurrent } — max simultaneous in-flight requests per (provider, model). First match wins.",
+    "maxBodyBytes": "OPTIONAL number, default 26214400 (25 MB).",
+    "failoverRecoveryIntervalMs": "OPTIONAL number, default 60000 — min ms between recovery probes (a profile winding back up / an account cooldown). Must be >= 1000."
   },
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "dashboard": false,
-  "failover": {
-    "claude-opus-*": "glm-5.1",
-    "glm-5.1": "deepseek-v4-pro"
+  "compact": {
+    "enabled": true,
+    "safetyPct": 0.95,
+    "windowDefault": 200000,
+    "window": { "glm-5.2": 1000000, "glm-*": 200000, "claude-sonnet-*": 1000000, "minimax/*": 1000000, "deepseek-*": 1000000 },
+    "maxOverflowRetries": 2
   },
-  "_failover_doc": "OPTIONAL object. Maps model globs to backup model ids. When a primary model returns a rate-limit (429), overloaded (529), or temporary-unavailable 5xx error, the router rewrites the body model and reroutes to the backup. Chain depth-guarded at 5 hops. A background pinger probes primaries and clears failover on recovery. NOTE: a model that also rides a failoverGroups ladder is handled by the GROUP, not this pair map.",
-  "failoverGroups": [
-    { "ladder": ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], "mode": "shift" }
-  ],
-  "_failoverGroups_doc": "OPTIONAL array of ordered ladders — a shared priority chain multiple models ride together. mode:\"shift\" (default): when the HEAD tier fails (e.g. Anthropic down), the WHOLE ladder shifts down one — opus→glm AND glm's own traffic→deepseek at the same time — and winds back when the head recovers. mode:\"cascade\": walk the ladder per-request on error (no coordinated shift). The head (index 0) may be a glob; every lower tier is a rewrite target and MUST be a concrete model id. Groups take precedence over `failover` pairs. Remove this block if you only want per-model pairs.",
+  "profiles": {
+    "native":        { "bind": {} },
+    "glm-on-sonnet": { "bind": { "glm-5.2": "claude-sonnet-5" } },
+    "econ-opus":     { "bind": { "claude-opus-*": "glm-5.2", "glm-5.2": "claude-sonnet-5" } },
+    "budget":        { "bind": { "glm-5.2": "minimax/minimax-m3" } }
+  },
+  "defaultProfile": "native",
+  "auto": {
+    "steps": [
+      { "profile": "native" },
+      { "profile": "glm-on-sonnet", "when": "limit" }
+    ],
+    "recover": true,
+    "schedules": [
+      { "profile": "budget", "tz": "+03:00", "windows": [["14:00", "18:00"]] }
+    ]
+  },
+  "_profiles_doc": "A PROFILE is a named world of alias→target bindings. The client always sends a stable alias; the ACTIVE profile decides what it resolves to. EXAMPLE ABOVE: normally `native` (glm-5.2 → z.ai). `glm-on-sonnet` re-points glm-5.2 to your Anthropic reserve — it is BOTH the auto safety step AND hand-pinnable. `econ-opus` is manual-only (not in auto.steps): a cost combo you pin by hand. `budget` runs on a schedule during peak GLM-billing hours. Targets must resolve to a `routes` entry.",
+  "_auto_doc": "auto.steps is the ordered automatic chain, best→fallback. steps[0] is the head/default (no `when`). Each later step carries `when` — the error class that steps DOWN to it: \"limit\" (429/529/quota/overload; default when omitted) or \"5xx\". A step-down only re-points aliases whose bind DIFFERS from the step above (an alias on a healthy independent provider is untouched). Priority of the active profile: manual pin > error-shift > open schedule window > defaultProfile. SAFETY IS ALWAYS ARMED: a failover error under a manual pin CLEARS the pin and the cascade proceeds. auto.recover:true winds the pointer back up once the higher step's backend recovers. auto.schedules set the intended profile during a wall-clock window (tz = fixed UTC offset like \"+03:00\"/\"Z\"; windows = [\"HH:MM\",\"HH:MM\"] pairs, end exclusive, from>to wraps midnight).",
   "failoverRecoveryIntervalMs": 60000,
-  "_failoverRecoveryIntervalMs_doc": "OPTIONAL number, default 60000. Minimum ms between recovery pings to a failed-over primary (and between group re-probe/wind-back). Must be >= 1000.",
   "routes": [
     {
       "match": "claude-*",
       "base_url": "https://api.anthropic.com",
       "auth": "passthrough",
       "billing": "subscription",
-      "_note": "Anthropic route: claude-* ids land at api.anthropic.com with the client's own auth (OAuth/subscription). billing:subscription ⇒ the dashboard shows tokens + real rate-limit headers, never a fabricated $ cost. Change auth to { header: x-api-key, keyEnv: ANTHROPIC_API_KEY } (and billing:metered) if using a pay-as-you-go API key instead."
+      "_note": "Anthropic route (your sonnet reserve): claude-* lands at api.anthropic.com with the client's own OAuth/subscription auth. The `glm-on-sonnet` profile rewrites glm-5.2 → claude-sonnet-5, which matches HERE. Change auth to { header: x-api-key, keyEnv: ANTHROPIC_API_KEY } (billing:metered) for a pay-as-you-go key."
     },
     {
       "match": "glm-*",
       "base_url": "https://api.z.ai/api/anthropic",
       "billing": "subscription",
-      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY" },
-      "_note": "GLM route: e.g. set ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.2 and sonnet calls land here. ZAI_API_KEY is the Coding Plan token from z.ai console. billing:subscription ⇒ the Coding Plan is flat, so the dashboard shows tokens + a link to the z.ai console for the real quota, never a per-token $ estimate."
+      "strategy": "failover",
+      "accounts": [
+        { "label": "zai-1", "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY_1" } },
+        { "label": "zai-2", "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "ZAI_API_KEY_2" } }
+      ],
+      "_note": "GLM route with TWO z.ai Coding Plan subscriptions. accounts rotate zai-1 → zai-2 on a limit (BELOW profiles). Only when BOTH are drained does the auto chain step `native → glm-on-sonnet`, insuring glm-5.2 onto your paid Anthropic reserve. billing:subscription ⇒ the dashboard shows tokens + a link to the z.ai console, never a per-token $ estimate."
+    },
+    {
+      "match": "minimax/*",
+      "base_url": "https://openrouter.ai/api",
+      "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" },
+      "_note": "OpenRouter route for the `budget` profile (glm-5.2 → minimax/minimax-m3). Pay-as-you-go ⇒ billing defaults to metered; the dashboard shows real per-response $."
     },
     {
       "match": "deepseek-*",
       "base_url": "https://api.deepseek.com/anthropic",
       "vision": false,
       "auth": { "header": "x-api-key", "keyEnv": "DEEPSEEK_API_KEY" },
-      "_note": "DeepSeek route: pay-as-you-go, so billing defaults to metered — the dashboard shows real per-response $ from token counts × price, plus the live account balance. vision:false — DeepSeek soft-refuses images with a 200, so image-bearing requests are pre-routed straight to the forImages target without hitting DeepSeek first. DEEPSEEK_API_KEY is from platform.deepseek.com."
+      "_note": "DeepSeek route: pay-as-you-go (metered). vision:false — DeepSeek soft-refuses images with a 200, so image-bearing requests are pre-routed to the forImages target without hitting it first."
     },
     {
       "match": "google/*",
@@ -61,7 +90,7 @@
       "forImages": true,
       "forImagesModel": "google/gemini-2.5-flash-lite",
       "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" },
-      "_note": "Vision fallback: marks this route as the forImages target. When any backend rejects an image, the request is rerouted here with body.model rewritten to forImagesModel. Also catches direct google/* calls."
+      "_note": "Vision fallback target: when any backend rejects an image, the request is rerouted here with body.model rewritten to forImagesModel."
     }
   ]
 }

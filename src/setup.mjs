@@ -142,9 +142,40 @@ export async function runSetup(argv = []) {
     const port = Number(await ask("Listen port", "8787")) || 8787;
     const dashboard = await yesno("Enable the dashboard (/dashboard)?", true);
 
+    // Optional automatic failover, expressed as ROUTING PROFILES (docs/profiles.md): the ladder
+    // becomes a chain of profiles — `native` (head serves itself) then one step per backup that
+    // re-points the head alias down to the next model. On a rate-limit/quota error the active
+    // profile steps down; `recover` winds it back up when the head provider returns. Only the
+    // head (first) may be a glob.
+    let profiles, autoSteps, failoverRecoveryBackoffMs;
+    const ladderCandidates = chosen.filter((c) => c.route.match !== "*/*").map((c) => c.p.defaultModel).filter(Boolean);
+    if (ladderCandidates.length >= 2 && await yesno("Set up automatic failover (reroute to a backup model when a provider is down)?", true)) {
+      const suggestion = ladderCandidates.join(" ");
+      const raw = await ask("  failover ladder, top→bottom (head first; only the head may be a glob)", suggestion);
+      const ladder = raw.split(/\s+/).filter(Boolean);
+      if (ladder.length >= 2) {
+        const head = ladder[0];
+        profiles = { native: { bind: {} } };
+        autoSteps = [{ profile: "native" }];
+        for (let i = 1; i < ladder.length; i++) {
+          const name = `failover-${i}`;
+          profiles[name] = { bind: { [head]: ladder[i] } };
+          autoSteps.push({ profile: name, when: "limit" });
+        }
+        const mins = await ask("  recovery retries in minutes (progressive backoff, comma-sep — so we don't hammer)", "1,5,10");
+        const arr = mins.split(",").map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0).map((m) => Math.round(m * 60000));
+        if (arr.length) failoverRecoveryBackoffMs = arr;
+      } else {
+        process.stdout.write("  (skipped — a ladder needs at least 2 model ids)\n");
+      }
+      process.stdout.write("\n");
+    }
+
     // Order specific globs before the OpenRouter */* catch-all (first match wins).
     const routes = chosen.map((c) => c.route).sort((a, b) => (a.match === "*/*" ? 1 : 0) - (b.match === "*/*" ? 1 : 0));
     const config = { listen: { host: "127.0.0.1", port }, dashboard, routes };
+    if (profiles) { config.profiles = profiles; config.defaultProfile = "native"; config.auto = { steps: autoSteps, recover: true }; }
+    if (failoverRecoveryBackoffMs) config.failoverRecoveryBackoffMs = failoverRecoveryBackoffMs;
     validateConfig(config); // fail loudly before writing anything
 
     fs.writeFileSync(routesPath, JSON.stringify(config, null, 2) + "\n", "utf8");

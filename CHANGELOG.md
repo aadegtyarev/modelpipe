@@ -11,8 +11,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GLM billing honesty**: the z.ai GLM Anthropic endpoint is the Coding Plan (a flat
   subscription), but a key-swap route defaulted to `metered` — so GLM usage showed a
   fabricated per-token $. `routeBilling` now defaults z.ai/GLM to `subscription`.
+- **Account-pool stats under the right label** (issue #15): the success (streaming) path
+  computed `providerId` from the route URL, so per-account dashboard cards showed zero
+  tokens while all usage piled under the URL-derived id. `proxyToRoute` now takes the
+  account label through from `dispatch`/rotation, matching the error path.
+- **Missing metered prices → $0 cost**: OpenRouter models absent from the price catalog
+  (e.g. `qwen/qwen3-coder-next`) resolved to a null price, so their per-response cost showed
+  `$0.000`. Added the Qwen coder family + `minimax/minimax-m3` to the built-in catalog (any
+  other model is still overridable via `tokenPrices`).
 
 ### Added
+- **Routing profiles** (`profiles` + `auto`, see [docs/profiles.md](docs/profiles.md)): a single
+  concept replacing `failover`, `failoverGroups`, `schedules`, and dashboard model-overrides. A
+  client sends a stable alias (e.g. `glm-5.2`); the **active profile** decides what it resolves
+  to. The active profile is chosen by **manual pin > error-shift > schedule > default**; a manual
+  pin never silences the safety net (a failover error clears the pin and the auto chain steps on).
+  The dashboard banner shows the active profile and **which alias went where** (`alias → target`,
+  provider→provider), with an inline pin/clear control. A **Profiles & routing editor** in the
+  dashboard settings creates/edits profiles (alias→target bindings), the default, the switching
+  chain (`auto.steps` with per-step `limit`/`5xx` conditions + `recover`), and schedules — saved
+  via `POST /v1/profiles/config`, validated and **hot-applied without a restart** (persisted as an
+  authoritative override, like `compact`/`concurrency`). `modelpipe migrate` rewrites an old config
+  (merging the live `~/.modelpipe/overrides.json`) into profiles, traffic-preserving.
+- **Context fitting** (`compact` config + ⚙ Settings → *Context fitting*, **on by default**):
+  a safety net for the **failover downshift** — when a request running against a 1M-window
+  model fails over to a smaller-window backup (e.g. 256K), the grown conversation no longer
+  fits and the backup would reject it. The client can't prevent this (it still thinks it's on
+  the 1M model); only the proxy knows it rerouted. On a hop to a smaller-window model, the
+  request is mechanically trimmed to fit — dropping older turns to a **stable checkpoint** with
+  `tool_use`/`tool_result` pairs kept intact (never a dangling-pair 400). If a backend still
+  rejects a request as too long, the real window is **learned** (parsed from the error, else
+  ~90% of what was sent) and persisted per model, then the request is hard-trimmed and retried
+  (`maxOverflowRetries`). No summarizer, no per-session state, zero added latency on the normal
+  path. Steady-state compaction is left to the harness (Claude Code's native auto-compact).
+  Per-model windows via `compact.window`.
+- **Scheduled routing** (`schedules` config + ⚙ Settings → *Scheduled routing*): proactively
+  rewrite a model glob to a cheaper target during set wall-clock windows — e.g. dodge z.ai's
+  peak-hours quota multiplier (GLM-5.2 / GLM-5-Turbo cost 3× during 14:00–18:00 UTC+8) by
+  dropping to a no-multiplier tier for those hours and staying on the flat Coding Plan.
+  Windows are expressed in a fixed UTC offset and evaluated against the system clock via the
+  UTC epoch (correct regardless of the host timezone). Editable in the dashboard and persisted
+  (`GET`/`POST /v1/schedules`); a calm green banner shows when a schedule is saving quota.
 - **Per-provider console links** in the dashboard (Anthropic / z.ai / DeepSeek / OpenRouter),
   not just z.ai.
 - **Billing override in Settings** (`POST /v1/billing`, persisted): flip any provider between
