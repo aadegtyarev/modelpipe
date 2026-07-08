@@ -1,0 +1,48 @@
+name: release
+
+# Cut a release by pushing a version tag that matches package.json, e.g.:
+#   npm version 0.9.0 -m 'release %s'   # bumps package.json + tags v0.9.0
+#   git push && git push --tags
+# The tag build runs the full suite, packs the dependency-free tarball (npm pack —
+# exactly the files in package.json "files"), and publishes it as a GitHub Release
+# asset. The deploy host installs THAT artifact (scripts/deploy.sh) — never a git clone.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write # create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test
+        run: npm test
+
+      - name: Verify tag matches package.json version
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg (run 'npm version $tag')"
+            exit 1
+          fi
+
+      - name: Pack tarball
+        run: |
+          npm pack
+          echo "TGZ=$(ls modelpipe-*.tgz)" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TGZ }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
