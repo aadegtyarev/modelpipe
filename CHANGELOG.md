@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-08
+
 ### Added
 - **Client identity in the routing trace**: the dashboard log now has a **Client** column —
   the caller's user-agent product token plus a short fingerprint of its auth token
