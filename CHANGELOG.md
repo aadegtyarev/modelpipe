@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-08
+
 ### Fixed
 - **Cost was undercounted for prompt-cached requests**: `createUsageTracker` only read
   `usage.input_tokens`, ignoring the Anthropic-shape `cache_creation_input_tokens` /
