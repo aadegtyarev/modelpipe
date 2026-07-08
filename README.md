@@ -50,8 +50,9 @@ for the providers you picked). Any other client: setting `ANTHROPIC_BASE_URL` is
 
 - **Model routing** — first route whose `match` glob hits `body.model` wins; per-backend key
   swap. Keys live in env vars, never in the config, never logged.
-- **[Failover](docs/failover.md)** — reroute a rate-limited model to a backup model, cascade a
-  whole tier ladder, or rotate between **multiple accounts/keys** for one model.
+- **[Routing profiles](docs/profiles.md)** — one active profile decides where each alias goes;
+  **pin** it, **schedule** it, or let it **step to a backup** on a rate-limit (the auto chain),
+  plus rotate between **multiple accounts/keys** for one model.
 - **Fallback auth** — forward the client's own token when it sends one, else inject the proxy's
   key. ([configuration.md#auth](docs/configuration.md#auth))
 - **Vision fallback** — reroute image-bearing requests a backend can't handle to a vision model.
@@ -64,7 +65,7 @@ for the providers you picked). Any other client: setting `ANTHROPIC_BASE_URL` is
 - **[Configuration](docs/configuration.md)** — routes, auth, fields, `.env`, `--list`, systemd,
   security.
 - **[Claude Code setup](docs/claude-code.md)** — the alias env recipe and the restart caveat.
-- **[Failover & account pools](docs/failover.md)** — pairs, group shift, multi-key rotation.
+- **[Routing profiles](docs/profiles.md)** — profiles, the auto switching chain (pin / schedule / on-error step), and account pools.
 - **[Dashboard](docs/dashboard.md)** — what it shows, honesty rule, endpoints, persistence.
 - **[`routes.example.json`](routes.example.json)** — the runnable, field-by-field config example.
 - **[`providers.json`](providers.json)** — known backends (Anthropic, DeepSeek, z.ai GLM, OpenRouter).
@@ -83,7 +84,7 @@ npm test
 
 Stub upstream servers on localhost (no network, no real keys) exercise the router through its
 real HTTP path: routing, auth swap, streamed passthrough, fail-closed behaviour, vision
-fallback, failover, account pools, and log safety.
+fallback, profile routing, account pools, and log safety.
 
 ## License
 
