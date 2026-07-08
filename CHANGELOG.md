@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-08
+
 ### Added
 - **Request routing trace** in the dashboard log: each row now shows **what the client sent →
   what we routed it to `[provider]` → what the provider echoed back** (`message_start.message.model`
