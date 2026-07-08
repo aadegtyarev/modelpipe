@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Client identity in the routing trace**: the dashboard log now has a **Client** column —
+  the caller's user-agent product token plus a short fingerprint of its auth token
+  (`user-agent·<6hex>`), so you can see **which** client sent each request and tell apps /
+  sessions / keys apart. The fingerprint is a sha256 slice — the token itself is never stored
+  or logged.
+
+### Changed
+- **Trace `returned` model is now always shown** (was: only on a mismatch). Dim when the
+  provider returned exactly what we routed to (confirmed faithful), **orange** when it differs
+  (a provider-side redirect). Empty only means the provider reported no model (e.g. an error) —
+  no longer ambiguous with "captured but matched".
+
 ## [0.10.0] - 2026-07-08
 
 ### Added

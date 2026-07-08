@@ -71,6 +71,7 @@ canvas{display:block;width:100%;height:200px}
 .log .row{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
 .log .row.er{color:var(--red)}
 .log .row .t{min-width:75px}
+.log .row .who{min-width:118px;max-width:160px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .log .row .m{flex:1;min-width:140px}
 .log .row .tok{min-width:120px;text-align:right}
 .log .row .cost{min-width:64px;text-align:right}
@@ -761,7 +762,7 @@ function render(stats,quotas,cfg){
 
   // Request log — cost column only for metered models (blank for flat-plan).
   let lhtml='<div class="row" style="color:var(--muted);font-weight:600">'+
-    '<span class="t">Time</span><span class="m">client → routed [provider] → returned</span><span class="tok">Tokens in / out</span><span class="cost">Cost</span><span class="ms">Duration</span></div>';
+    '<span class="t">Time</span><span class="who">Client</span><span class="m">sent → routed [provider] → returned</span><span class="tok">Tokens in / out</span><span class="cost">Cost</span><span class="ms">Duration</span></div>';
   const tl=stats.timeline||[];
   for(let i=tl.length-1;i>=Math.max(0,tl.length-50);i--){
     const e=tl[i];
@@ -770,6 +771,7 @@ function render(stats,quotas,cfg){
     const timeStr=new Date(e.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
     lhtml+='<div class="row'+(e.status>=400?' er':'')+'">'+
       '<span class="t">'+timeStr+'</span>'+
+      '<span class="who" title="'+escHtml(e.client||'')+'">'+escHtml(e.client||'—')+'</span>'+
       '<span class="m" title="'+escHtml(traceTitle(e,pid))+'">'+traceCell(e,pid)+'</span>'+
       '<span class="tok">'+fmt((e.inputTokens||0)+(e.cacheReadTokens||0))+' in / '+fmt(e.outputTokens)+' out</span>'+
       '<span class="cost">'+(metered?usd(e.cost):'—')+'</span>'+
@@ -779,9 +781,10 @@ function render(stats,quotas,cfg){
 }
 
 // Request routing trace for one log row: what the CLIENT sent → what we ROUTED it to
-// [provider] → what the provider ECHOED BACK. The client alias is shown only when it was
-// rewritten (a profile substitution); the returned model only when it DIFFERS from what we
-// asked (a provider-side redirect) — shown in orange so mismatches pop. Normal rows stay clean.
+// [provider] → what the provider ECHOED BACK. The client alias prefix shows only when a profile
+// rewrote it (a substitution). The returned model is shown ALWAYS when the provider reported one
+// — dim when it matches what we asked (confirmed faithful), ORANGE when it differs (a provider-
+// side redirect) so mismatches pop. Empty returned = the provider didn't report a model (error).
 function traceCell(e,pid){
   const routed=e.model||'?', client=e.clientModel, prov=e.providerModel;
   const arrow=' <span style="color:var(--muted)">→</span> ';
@@ -789,11 +792,12 @@ function traceCell(e,pid){
   if(client && client!==routed) h+='<span style="color:var(--muted)">'+escHtml(client)+'</span>'+arrow;
   h+=escHtml(routed);
   if(pid) h+=' <span class="tag sub" style="opacity:.75">'+escHtml(pid)+'</span>';
-  if(prov && prov!==routed) h+=' <span style="color:var(--orange)">→ '+escHtml(prov)+'</span>';
+  if(prov) h+=' <span style="color:'+(prov!==routed?'var(--orange)':'var(--muted)')+'">→ '+escHtml(prov)+'</span>';
   return h;
 }
 function traceTitle(e,pid){
-  return 'client sent: '+(e.clientModel||e.model||'?')
+  return 'client (who): '+(e.client||'—')
+    +'\nsent model: '+(e.clientModel||e.model||'?')
     +'\nrouted to: '+(e.model||'?')+(pid?' ['+pid+']':'')
     +'\nprovider returned: '+(e.providerModel||'(not reported)');
 }

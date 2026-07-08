@@ -347,7 +347,7 @@ function extractUsage(usage) {
   };
 }
 
-export function createUsageTracker(stats, { providerId, model, clientModel, startTime }) {
+export function createUsageTracker(stats, { providerId, model, clientModel, client, startTime }) {
   let buffer = "";
   let inputTokens = 0;
   let cacheReadTokens = 0;
@@ -453,6 +453,7 @@ export function createUsageTracker(stats, { providerId, model, clientModel, star
         stats.record({
           providerId,
           model,
+          client,                      // WHO sent it (user-agent·auth-fingerprint)
           clientModel,                 // what the client sent (alias, pre-profile)
           providerModel,               // what the provider echoed back (post any provider redirect)
           durationMs: Date.now() - startTime,

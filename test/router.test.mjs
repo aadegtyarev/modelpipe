@@ -31,6 +31,7 @@ const {
   pickRoute,
   listModels,
   globToRegExp,
+  clientLabel,
   modelFromBody,
   rewriteModelInBody,
   resolveAuthHeader,
@@ -400,6 +401,15 @@ async function main() {
              { match: "claude-*", base_url: "https://a.example", auth: "passthrough" }];
   const mkc = (extra) => ({ routes: R, ...extra });
   const rej = (extra) => { try { validateConfig(mkc(extra)); return false; } catch { return true; } };
+  // ── clientLabel: the "who sent it" trace label (user-agent · auth fingerprint) ──
+  check("clientLabel: no headers ⇒ unknown", clientLabel(null), "unknown");
+  check("clientLabel: empty headers ⇒ unknown", clientLabel({}), "unknown");
+  check("clientLabel: user-agent product token only", clientLabel({ "user-agent": "claude-cli/1.0.83 (external, cli)" }), "claude-cli/1.0.83");
+  check("clientLabel: no ua, only auth ⇒ 6-hex fingerprint", /^[0-9a-f]{6}$/.test(clientLabel({ authorization: "Bearer sk-tok" })), true);
+  check("clientLabel: ua · fingerprint, and stable", clientLabel({ "user-agent": "cli/1", "x-api-key": "K" }), clientLabel({ "user-agent": "cli/1", "x-api-key": "K" }));
+  check("clientLabel: never leaks the token", clientLabel({ "user-agent": "cli/1", "x-api-key": "supersecret" }).includes("supersecret"), false);
+  check("clientLabel: different keys ⇒ different labels", clientLabel({ "x-api-key": "A" }) === clientLabel({ "x-api-key": "B" }), false);
+
   check("validateConfig accepts profiles + auto",
     validateConfig(mkc({ profiles: { native: { bind: {} }, sonnet: { bind: { "glm-5.2": "claude-sonnet-5" } } },
       auto: { steps: [{ profile: "native" }, { profile: "sonnet", when: "limit" }] } })).profiles.sonnet.bind["glm-5.2"], "claude-sonnet-5");

@@ -42,6 +42,7 @@ import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
@@ -137,6 +138,18 @@ class RouterError extends Error {
 export function globToRegExp(glob) {
   const escaped = String(glob).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
+}
+
+// A safe "who sent this" label for the dashboard trace: the client's user-agent product token
+// (e.g. "claude-cli/1.0.83") plus a short, stable fingerprint of its auth token (6 hex of a
+// sha256) so different sessions/keys/apps are distinguishable WITHOUT ever storing or logging
+// the secret. Never includes the token itself. "unknown" when neither header is present.
+export function clientLabel(headers) {
+  if (!headers || typeof headers !== "object") return "unknown";
+  const ua = String(headers["user-agent"] || "").trim().split(/\s+/)[0] || "";
+  const auth = headers["authorization"] || headers["x-api-key"] || "";
+  const key = auth ? crypto.createHash("sha256").update(String(auth)).digest("hex").slice(0, 6) : "";
+  return [ua, key].filter(Boolean).join("·") || "unknown"; // ua·key
 }
 
 // The first route whose `match` glob matches the model id; null when the model is
@@ -856,7 +869,7 @@ const REROUTE_BUFFER_CAP = 64 * 1024;
 function pipeResponse(upstreamRes, res, ctx = null) {
   const onUpstreamFail = () => {
     if (ctx && ctx.stats) {
-      ctx.stats.record({ providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, durationMs: Date.now() - ctx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
+      ctx.stats.record({ providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, client: ctx.client, durationMs: Date.now() - ctx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
     }
     if (res.headersSent) res.destroy();
     else sendError(res, 502, "upstream response error");
@@ -875,6 +888,7 @@ function pipeResponse(upstreamRes, res, ctx = null) {
       providerId: ctx.providerId,
       model: ctx.model,
       clientModel: ctx.clientModel,
+      client: ctx.client,
       startTime: ctx.startTime,
     });
     res.writeHead(upstreamRes.statusCode || 502, headers);
@@ -1160,7 +1174,7 @@ function makeResponseHandler(ctx) {
       windBackProbe(); // a non-candidate response to a recovery probe = head is back
       resetAccountBackoff(); // a clean answer means this account's cooldown ladder resets
       pipeResponse(upstreamRes, ctx.res, ctx.statsCtx
-        ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, startTime: ctx.statsCtx.startTime }
+        ? { stats: ctx.statsCtx.stats, providerId: ctx.providerId, model: ctx.model, clientModel: ctx.clientModel, client: ctx.client, startTime: ctx.statsCtx.startTime }
         : null);
       return;
     }
@@ -1397,6 +1411,7 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
   // The alias the CLIENT sent + sized its context against (before any profile rewrite) — the
   // reference id for the downshift safety net and the stable key the profile ladder steps on.
   const clientModel = model;
+  const client = clientLabel(req.headers); // "who" — user-agent·auth-fingerprint, for the trace log
 
   // PROFILE RESOLUTION: the active profile (manual pin > error-shift > schedule > default)
   // rewrites the incoming alias to its concrete backend target BEFORE routing/vision. When
@@ -1443,7 +1458,7 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
   // Build the base ctx for makeResponseHandler — the shared context threaded through every
   // hop (vision reroute, profile failover reroute, account rotation). providerId/account/route
   // are set per hop by dispatch().
-  const baseCtx = { res, req, body, log, model, clientModel, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, profileState, profileEffIndex, profileProbe, accountPools, limiter, failoverHopCount: 0 };
+  const baseCtx = { res, req, body, log, model, clientModel, client, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, profileState, profileEffIndex, profileProbe, accountPools, limiter, failoverHopCount: 0 };
 
   // Pre-route an image-bearing request straight to the vision target, skipping the
   // non-vision backend call, when the matched route is known non-vision — EITHER:
