@@ -27,7 +27,7 @@ Or install persistently (clone into `~/modelpipe`, then run the wizard):
 curl -fsSL https://raw.githubusercontent.com/aadegtyarev/modelpipe/main/install.sh | bash
 ```
 
-## By hand
+## By hand (dev / quick try)
 
 ```sh
 git clone https://github.com/aadegtyarev/modelpipe.git && cd modelpipe
@@ -35,6 +35,24 @@ cp routes.example.json routes.json     # map model ids → backends (or run: nod
 cp .env.example .env                   # fill in the keys your routes use
 node bin/modelpipe.mjs routes.json     # runs until Ctrl-C; auto-loads .env next to the config
 ```
+
+> A git clone is for development or a quick try. For an always-on host, don't run from a clone —
+> install a **released artifact** instead (below), so the deploy never drifts from `main` or eats
+> an accidental commit.
+
+## Deploy (always-on host)
+
+Releases are cut by tag (`npm version … && git push --tags`), which builds a dependency-free
+tarball and publishes it as a GitHub Release. The host installs that artifact — not a checkout —
+with config kept **outside** the artifact so upgrades never touch it:
+
+```sh
+scripts/deploy.sh            # install the latest release as a systemd --user service
+scripts/deploy.sh v0.9.0     # a specific version; rollback = re-run with an older tag
+```
+
+`routes.json` / `.env` live in `~/appimages/modelpipe-deploy/config/` and routing state in
+`~/.modelpipe` — both preserved across upgrades. Full flow in **[docs/deploy.md](docs/deploy.md)**.
 
 Then point your client at it:
 
@@ -63,6 +81,7 @@ for the providers you picked). Any other client: setting `ANTHROPIC_BASE_URL` is
 
 - **[Configuration](docs/configuration.md)** — routes, auth, fields, `.env`, `--list`, systemd,
   security.
+- **[Deploy](docs/deploy.md)** — release-by-tag + artifact install on an always-on host.
 - **[Claude Code setup](docs/claude-code.md)** — the alias env recipe and the restart caveat.
 - **[Failover & account pools](docs/failover.md)** — pairs, group shift, multi-key rotation.
 - **[Dashboard](docs/dashboard.md)** — what it shows, honesty rule, endpoints, persistence.
