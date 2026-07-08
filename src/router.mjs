@@ -541,6 +541,17 @@ export function validateConfig(config) {
         if (typeof target !== "string" || target.length === 0) throw new Error(`${at}.bind["${alias}"]: target must be a non-empty model id`);
         try { globToRegExp(alias); } catch (e) { throw new Error(`${at}.bind: alias "${alias}" is not a valid glob: ${e.message}`); }
       }
+      // Shadowing guard: resolveAlias is first-match, so an EARLIER glob that already matches a
+      // LATER alias key makes the later binding unreachable — a silent footgun. Reject it (order
+      // specific aliases before broad globs). Only a glob can shadow; literal keys are unique.
+      const aliasKeys = Object.keys(bind);
+      for (let bi = 1; bi < aliasKeys.length; bi++) {
+        for (let bj = 0; bj < bi; bj++) {
+          if (aliasKeys[bj].includes("*") && globToRegExp(aliasKeys[bj]).test(aliasKeys[bi])) {
+            throw new Error(`${at}.bind: "${aliasKeys[bi]}" is unreachable — the earlier glob "${aliasKeys[bj]}" already matches it (order specific aliases before broad globs)`);
+          }
+        }
+      }
       // notes: OPTIONAL per-binding comments { aliasGlob: string } — display-only (the resolver
       // reads only `bind`), surfaced in the dashboard editor next to each pair.
       if (prof.notes !== undefined) {

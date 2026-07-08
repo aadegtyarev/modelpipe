@@ -555,13 +555,14 @@ function renderProfileEditor(){
 
 function peSetName(i,v){
   const old=(profCfg.profiles[i].name||'');
-  profCfg.profiles[i].name=v;
+  const nv=(v||'').trim();               // trim so the stored name matches the (trimmed) option list
+  profCfg.profiles[i].name=nv;
   // Propagate the rename to every reference so the switching rules / default / schedules
   // don't dangle on the old name (which would 400 on save).
-  if(old&&old!==v){
-    profCfg.steps.forEach(s=>{ if(s.profile===old)s.profile=v; });
-    profCfg.schedules.forEach(s=>{ if(s.profile===old)s.profile=v; });
-    if(profCfg.defaultProfile===old)profCfg.defaultProfile=v;
+  if(old&&old!==nv){
+    profCfg.steps.forEach(s=>{ if(s.profile===old)s.profile=nv; });
+    profCfg.schedules.forEach(s=>{ if(s.profile===old)s.profile=nv; });
+    if(profCfg.defaultProfile===old)profCfg.defaultProfile=nv;
   }
   peDirty(); renderProfileEditor();
 }

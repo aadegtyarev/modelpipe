@@ -411,6 +411,12 @@ async function main() {
   check("validateConfig rejects bad when value", rej({ profiles: { a: { bind: {} }, b: { bind: {} } }, auto: { steps: [{ profile: "a" }, { profile: "b", when: "sometimes" }] } }), true);
   check("validateConfig rejects unknown defaultProfile", rej({ profiles: { a: { bind: {} } }, defaultProfile: "ghost" }), true);
   check("validateConfig rejects non-string bind target", rej({ profiles: { a: { bind: { "glm-*": 5 } } } }), true);
+  check("validateConfig rejects a shadowed binding (broad glob before specific)", rej({ profiles: { a: { bind: { "glm-*": "x", "glm-5.2": "y" } } } }), true);
+  check("validateConfig accepts specific-before-broad bindings",
+    validateConfig(mkc({ profiles: { a: { bind: { "glm-5.2": "y", "glm-*": "x" } } } })).profiles.a.bind["glm-5.2"], "y");
+  check("validateConfig accepts per-binding notes",
+    validateConfig(mkc({ profiles: { a: { bind: { "glm-5.2": "x" }, notes: { "glm-5.2": "paid reserve" } } } })).profiles.a.notes["glm-5.2"], "paid reserve");
+  check("validateConfig rejects non-string note", rej({ profiles: { a: { bind: { "glm-5.2": "x" }, notes: { "glm-5.2": 7 } } } }), true);
   check("validateConfig rejects unknown schedule profile", rej({ profiles: { a: { bind: {} } }, auto: { steps: [{ profile: "a" }], schedules: [{ profile: "ghost", tz: "Z", windows: [["1:00", "2:00"]] }] } }), true);
   check("validateConfig accepts auto.schedules",
     validateConfig(mkc({ profiles: { a: { bind: {} }, b: { bind: {} } }, auto: { steps: [{ profile: "a" }], schedules: [{ profile: "b", tz: "+03:00", windows: [["14:00", "18:00"]] }] } })).auto.schedules.length, 1);
