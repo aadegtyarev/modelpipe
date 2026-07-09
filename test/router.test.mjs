@@ -491,6 +491,10 @@ async function main() {
     isFailoverTrigger(403, Buffer.from('{"error":{"message":"Organization is disabled"}}')), true);
   check("isFailoverTrigger: 200 never triggers", isFailoverTrigger(200, rateLimitBody429), false);
   check("isFailoverTrigger: bad json ⇒ false", isFailoverTrigger(503, Buffer.from("not json")), false);
+  check("isFailoverTrigger: 400 + EMPTY body triggers (looks like a network break, not a real rejection)",
+    isFailoverTrigger(400, Buffer.from("")), true);
+  check("isFailoverTrigger: 400 + non-empty bad json does NOT trigger (unchanged)",
+    isFailoverTrigger(400, Buffer.from("not json")), false);
   check("isFailoverTrigger: empty body ⇒ false", isFailoverTrigger(503, Buffer.from("")), false);
   check("isFailoverTrigger: 500 + 'try again later' triggers",
     isFailoverTrigger(500, Buffer.from('{"error":{"message":"try again later"}}')), true);

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-09
+
+### Added
+- **Empirical concurrency self-throttle**: a 429/5xx on a model with a configured concurrency
+  limit (not a hard weekly/monthly exhaustion) no longer bounces straight through account
+  rotation / a profile step — it LEARNS a lower effective ceiling and requeues the same request
+  through the same limiter, so the queue itself is the backoff (no blind fixed delay) and no
+  request is silently dropped. The learned ceiling creeps back up by 1 every
+  `concurrencyRecoveryIntervalMs` (default 30s) of quiet, mirroring the account-pool cooldown
+  ladder's "ease off the brake" shape. Bounded at 3 requeue attempts before falling through to
+  the normal failover cascade.
+- **Concurrency panel in the dashboard**: Settings now has a "Concurrency limits" section to
+  view/edit the per-model `{ glob: max }` map and see the live state (active / queued / learned
+  ceiling when self-throttled) — previously only reachable via `GET/POST /v1/concurrency`.
+
+### Fixed
+- **A 400 with a completely EMPTY response body was never treated as a failover-worthy
+  signal** — the Messages API always returns a structured `{ error: { message } }` on a real
+  rejection, so a zero-byte 400 looks like an HTTP/network-level break (a dropped/reset
+  connection) rather than a genuine validation error. It's now classified the same as a 429/529
+  instead of being relayed to the client as an opaque, silent failure.
+
 ## [0.13.0] - 2026-07-09
 
 ### Added

@@ -131,12 +131,71 @@ async function main() {
     const p3 = lim.acquire("k", 2).then((rel) => { third = "resolved"; return rel; });
     await sleep(20);
     check("limiter: third acquire over limit stays pending", third, "pending");
-    check("limiter: snapshot reports active+queued", JSON.stringify(lim.snapshot()[0]), JSON.stringify({ key: "k", active: 2, limit: 2, queued: 1 }));
+    check("limiter: snapshot reports active+queued", JSON.stringify(lim.snapshot()[0]), JSON.stringify({ key: "k", active: 2, limit: 2, effLimit: 2, queued: 1 }));
     r1(); // free one → the waiter is admitted
     const r3 = await p3;
     check("limiter: releasing one admits the queued waiter", third, "resolved");
     r2(); r3();
     check("limiter: fully drained key is dropped from state", lim.snapshot().length, 0);
+  }
+
+  // ── UNIT: empirical self-throttle (reportLimitHit / recoverDue) ───────────
+  {
+    const lim = new ConcurrencyLimiter();
+    const r1 = await lim.acquire("g", 2);
+    const r2 = await lim.acquire("g", 2);
+    check("throttle: 2 acquires under limit=2 both admitted", typeof r1 === "function" && typeof r2 === "function", true);
+    let third = "pending";
+    const p3 = lim.acquire("g", 2).then(() => { third = "resolved"; });
+    await sleep(20);
+    check("throttle: 3rd over configured limit queues (baseline, no hit yet)", third, "pending");
+
+    lim.reportLimitHit("g"); // effLimit 2 -> 1
+    check("throttle: a hit lowers effLimit by 1", lim.snapshot().find((s) => s.key === "g").effLimit, 1);
+    check("throttle: reportLimitHit is a no-op for a key never acquired", (() => { lim.reportLimitHit("never-touched"); return lim.snapshot().find((s) => s.key === "never-touched"); })(), undefined);
+
+    r1(); // active 2 -> 1; still >= the now-lowered effLimit(1) — the 3rd stays queued
+    await sleep(20);
+    check("throttle: releasing one does NOT admit the 3rd (learned ceiling already reached)", third, "pending");
+
+    // Repeated hits floor at 1, never fully block a model.
+    lim.reportLimitHit("g"); lim.reportLimitHit("g"); lim.reportLimitHit("g");
+    check("throttle: repeated hits floor the ceiling at 1 (never 0)", lim.snapshot().find((s) => s.key === "g").effLimit, 1);
+
+    // Not due yet: recovering immediately after the last hit must NOT bump.
+    lim.recoverDue(Date.now(), 60000);
+    check("throttle: recoverDue is a no-op before the interval elapses", lim.snapshot().find((s) => s.key === "g").effLimit, 1);
+    check("throttle: still not admitted before recovery", third, "pending");
+
+    // Recovery: quiet past the interval creeps the ceiling back up by 1 (1 -> 2), crossing
+    // above the current active count (1) — admitting the queued 3rd waiter.
+    lim.recoverDue(Date.now() + 100000, 60000);
+    check("throttle: recoverDue creeps effLimit up by 1 toward configured", lim.snapshot().find((s) => s.key === "g").effLimit, 2);
+    await p3;
+    check("throttle: the higher ceiling admitted the queued 3rd waiter", third, "resolved");
+
+    r2();
+    // recoverDue never lifts the ceiling past the CONFIGURED limit (still 2 here).
+    lim.recoverDue(Date.now() + 999999, 60000);
+    lim.recoverDue(Date.now() + 1999999, 60000);
+    check("throttle: recoverDue never exceeds the configured limit", lim.snapshot().find((s) => s.key === "g").effLimit, 2);
+
+    // reportLimitHit on a key with NO live state (the common real case: the request that just
+    // hit the limit already released its own slot before the response handler ran, so the key
+    // may have gone fully idle and been dropped) must MATERIALIZE a fresh entry at
+    // configuredLimit - 1, not silently no-op.
+    check("throttle: a hit on an idle/absent key with a configuredLimit creates it pre-lowered", (() => {
+      lim.reportLimitHit("fresh-key", 4);
+      return lim.snapshot().find((s) => s.key === "fresh-key")?.effLimit;
+    })(), 3);
+    check("throttle: NO configuredLimit on an absent key stays a true no-op", (() => {
+      lim.reportLimitHit("still-absent"); // no 2nd arg
+      return lim.snapshot().find((s) => s.key === "still-absent");
+    })(), undefined);
+    check("throttle: an unlimited (Infinity) configuredLimit on an absent key is a no-op", (() => {
+      lim.reportLimitHit("unlimited-key", Infinity);
+      return lim.snapshot().find((s) => s.key === "unlimited-key");
+    })(), undefined);
   }
 
   // ── UNIT: unlimited (Infinity / <=0) is a synchronous no-op ────────────────
@@ -272,6 +331,94 @@ async function main() {
       delete process.env.CONC_KEY;
       await close(router); await close(primary.server); await close(backup.server);
     }
+  }
+
+  // ── INTEGRATION: empirical self-throttle (reportLimitHit / recoverDue wired into the router) ─
+  // A stub whose status is driven by call count (1-based) — deterministic, no timing races.
+  function makeCountingStub(statusForCall, message = "rate limit exceeded") {
+    const received = [];
+    const server = http.createServer((req, res) => {
+      const c = []; req.on("data", (x) => c.push(x));
+      req.on("end", () => {
+        received.push(Buffer.concat(c).toString("utf8"));
+        const s = statusForCall(received.length);
+        if (s >= 400) { res.writeHead(s, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message } })); }
+        else { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "ok" })); }
+      });
+    });
+    return { server, received };
+  }
+
+  // A) a transient 429 requeues through the SAME limiter (never relayed to the client) and
+  // learns a lower ceiling — the request eventually succeeds once the backend recovers.
+  {
+    process.env.CONC_KEY = "x";
+    const stub = makeCountingStub((n) => (n <= 1 ? 429 : 200)); // fails once, then recovers
+    const sPort = await listen(stub.server);
+    const router = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      concurrency: { "glm-5.2": 3 },
+      routes: [{ match: "glm-*", base_url: `http://127.0.0.1:${sPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } }],
+    });
+    const rPort = await listen(router);
+    try {
+      const r = await fire(rPort, "glm-5.2");
+      check("self-throttle: request eventually succeeds (200), never relayed as an error", r.status, 200);
+      check("self-throttle: backend hit twice (initial 429 + requeued retry)", stub.received.length, 2);
+      const snap = router._modelpipe.limiter.snapshot();
+      check("self-throttle: the hit learned a lower ceiling for this key", snap.length > 0 && snap[0].effLimit < snap[0].limit, true);
+    } finally { delete process.env.CONC_KEY; await close(router); await close(stub.server); }
+  }
+
+  // B) a HARD weekly/monthly exhaustion on a concurrency-limited route must NOT requeue —
+  // isRetryWorthy excludes it, so it's relayed straight through on the very first hit.
+  {
+    process.env.CONC_KEY = "x";
+    const stub = makeCountingStub(() => 429, "[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-13 07:43:56]");
+    const sPort = await listen(stub.server);
+    const router = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      concurrency: { "glm-5.2": 3 },
+      routes: [{ match: "glm-*", base_url: `http://127.0.0.1:${sPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } }],
+    });
+    const rPort = await listen(router);
+    try {
+      const r = await fire(rPort, "glm-5.2");
+      check("self-throttle: hard exhaustion is NOT requeued (single hit)", stub.received.length, 1);
+      check("self-throttle: hard exhaustion relays 429 straight to the client", r.status, 429);
+    } finally { delete process.env.CONC_KEY; await close(router); await close(stub.server); }
+  }
+
+  // C) a PERSISTENTLY 429 backend exhausts the requeue budget and falls through to the normal
+  // failover cascade (a profile step here) rather than requeuing forever.
+  {
+    process.env.CONC_KEY = "x";
+    const primary = makeCountingStub(() => 429); // never recovers
+    const backup = makeGatedStub(); backup.setAuto(true); // always-live failover target
+    const pPort = await listen(primary.server);
+    const bPort = await listen(backup.server);
+    const router = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      concurrency: { "glm-5.2": 3 },
+      profiles: { native: { bind: {} }, backup: { bind: { "glm-5.2": "deepseek-v4-pro" } } },
+      auto: { steps: [{ profile: "native" }, { profile: "backup", when: "limit" }] },
+      routes: [
+        { match: "glm-*", base_url: `http://127.0.0.1:${pPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } },
+        { match: "deepseek-*", base_url: `http://127.0.0.1:${bPort}`, auth: { header: "x-api-key", keyEnv: "CONC_KEY" } },
+      ],
+    });
+    const rPort = await listen(router);
+    // Fresh chain state — a PRIOR block in this shared-MODELPIPE_DIR file may have persisted a
+    // shifted profile-state.json under the same step names, which would otherwise pre-route
+    // straight to the backup and never touch primary at all.
+    router._modelpipe.profileState.offset = 0;
+    router._modelpipe.profileState.shiftedAt = 0;
+    try {
+      const r = await fire(rPort, "glm-5.2");
+      check("self-throttle exhausted: requeue budget capped (1 initial + MAX attempts)", primary.received.length, 1 + 3);
+      check("self-throttle exhausted: falls through to the profile-step failover", r.status, 200);
+      check("self-throttle exhausted: backup actually served it", backup.received.length, 1);
+    } finally { delete process.env.CONC_KEY; await close(router); await close(primary.server); await close(backup.server); }
   }
 
   // ── INTEGRATION: account pool — each key carries its OWN concurrency budget ─

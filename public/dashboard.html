@@ -186,25 +186,21 @@ canvas{display:block;width:100%;height:200px}
   </div>
 </div>
 
-<div class="panel" id="compactPanel">
+<div class="panel" id="concurrencyPanel">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-    <h3 style="margin:0">Context fitting (trim to fit a smaller window on failover downshift)</h3>
-    <label style="font-size:13px;color:var(--muted)"><input type="checkbox" id="cpEnabled"> enabled</label>
-    <button class="save" onclick="saveCompact()">Save</button>
+    <h3 style="margin:0">Concurrency limits (max simultaneous requests per model)</h3>
+    <button class="save" onclick="saveConcurrency()">Save</button>
+    <button class="b" onclick="refreshConcurrencyLive()">Refresh live state</button>
   </div>
-  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Safety net, not steady-state compaction (that's the harness's job). When a request is routed to a model whose context window is <b>smaller</b> than the client's — a failover downshift (e.g. 1M → 256K) where the grown conversation no longer fits — the older turns are mechanically dropped to a stable checkpoint (tool_use/tool_result pairs kept intact) so it fits. If a backend still rejects a request as too long, the real window is <b>learned</b> and the request is hard-trimmed and retried. No summarizer, zero added latency on the normal path.</div>
-  <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)">
-    <label>safety % of window <input class="i" id="cpSafetyPct" size="4"></label>
-    <label>default window (tokens) <input class="i" id="cpWindowDefault" size="9"></label>
-    <label>overflow retries <input class="i" id="cpMaxRetries" size="3"></label>
-  </div>
-  <h3 style="margin:14px 0 4px;font-size:14px">Per-model context window (glob → tokens) — order specific ids before broad globs</h3>
-  <div id="cpWindowRows"></div>
+  <div style="color:var(--muted);font-size:12px;margin-bottom:8px">Some providers cap simultaneous requests per key (e.g. a GLM Coding Plan). The overflow QUEUES instead of degrading to a backup — order specific ids before broad globs. A 429/5xx on a limited model self-corrects: the effective ceiling temporarily drops below the configured one (shown in <span style="color:var(--orange)">orange</span> below) and creeps back up on its own once things are quiet — see docs/failover.md#concurrency-limiting.</div>
+  <div id="concRows"></div>
   <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-    <input class="i" id="cpWinGlob" placeholder="model id/glob (e.g. glm-5.2 or claude-*)" style="flex:1">
-    <input class="i" id="cpWinTokens" placeholder="tokens (e.g. 1000000)" style="width:160px">
-    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addCompactWindow()">Add</button>
+    <input class="i" id="concGlob" placeholder="model id/glob (e.g. glm-5.2 or glm-*)" style="flex:1">
+    <input class="i" id="concMax" placeholder="max simultaneous (e.g. 3)" style="width:160px">
+    <button style="background:var(--green);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" onclick="addConcurrencyLimit()">Add</button>
   </div>
+  <h3 style="margin:14px 0 4px;font-size:14px">Live state</h3>
+  <div id="concLive" style="font-size:12px"></div>
 </div>
 
 <div class="panel" id="billingPanel">
@@ -293,18 +289,67 @@ async function saveCompact(){
   renderCompact(await r.json());
 }
 
+// ── Concurrency limits ───────────────────────────────────────────────────────
+let concurrencyMap={};               // editable mirror of the configured { glob: max } map
+function renderConcurrency(d){
+  concurrencyMap={...((d&&d.config)||{})};
+  renderConcurrencyRows();
+  renderConcurrencyLive((d&&d.live)||[]);
+}
+function renderConcurrencyRows(){
+  let h='';
+  for(const[g,n]of Object.entries(concurrencyMap)){
+    h+='<div style="display:flex;gap:6px;align-items:center;margin:2px 0">'+
+      '<span style="min-width:200px;color:var(--muted)">'+escHtml(g)+'</span>'+
+      '<input class="i" data-g="'+escHtml(g)+'" value="'+n+'" size="6" onchange="concurrencyMap[this.dataset.g]=+this.value">'+
+      '<button style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px" onclick="removeConcurrencyLimit(\''+escHtml(g)+'\')">×</button></div>';
+  }
+  if(!h)h='<div class="muted" style="font-size:13px">No configured limits — every model runs unlimited concurrency.</div>';
+  $('concRows').innerHTML=h;
+}
+function renderConcurrencyLive(live){
+  if(!live.length){$('concLive').innerHTML='<div class="muted">no active or queued requests on a limited model right now</div>';return;}
+  let h='<div style="display:flex;gap:14px;font-weight:600;color:var(--muted)"><span style="width:170px">provider</span><span style="width:150px">model</span><span style="width:60px">active</span><span style="width:130px">ceiling</span><span style="width:60px">queued</span></div>';
+  for(const s of live){
+    const throttled=s.effLimit<s.limit;
+    h+='<div style="display:flex;gap:14px;margin:2px 0">'+
+      '<span style="width:170px">'+escHtml(s.provider)+'</span>'+
+      '<span style="width:150px">'+escHtml(s.model)+'</span>'+
+      '<span style="width:60px">'+s.active+'</span>'+
+      '<span style="width:130px'+(throttled?';color:var(--orange)':'')+'">'+(throttled?(s.effLimit+' / '+s.limit+' (learned)'):s.limit)+'</span>'+
+      '<span style="width:60px">'+s.queued+'</span></div>';
+  }
+  $('concLive').innerHTML=h;
+}
+function addConcurrencyLimit(){
+  const g=$('concGlob').value.trim(),n=+$('concMax').value;
+  if(!g||!(n>0)||!Number.isInteger(n)){alert('Enter a model glob and a positive integer.');return;}
+  concurrencyMap[g]=n;$('concGlob').value='';$('concMax').value='';renderConcurrencyRows();
+}
+function removeConcurrencyLimit(g){delete concurrencyMap[g];renderConcurrencyRows();}
+async function saveConcurrency(){
+  const r=await fetch("/v1/concurrency",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(concurrencyMap)});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('Concurrency save failed: '+((e.error&&e.error.message)||r.status));return;}
+  renderConcurrency(await r.json());
+}
+function refreshConcurrencyLive(){
+  fetch("/v1/concurrency").then(r=>r.json()).then(renderConcurrency).catch(()=>{});
+}
+
 // ── Settings ────────────────────────────────────────────────────────────────
 function toggleSettings(){
-  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),pp=$('profilesPanel'),bp=$('billingPanel'),cp=$('compactPanel');
+  const tp=$('tokenPricesPanel'),fp=$('failoverPanel'),pp=$('profilesPanel'),bp=$('billingPanel'),cp=$('compactPanel'),cop=$('concurrencyPanel');
   const show=tp.style.display==='none'||tp.style.display==='';
   tp.style.display=show?'block':'none';
   fp.style.display=show?'block':'none';
   pp.style.display=show?'block':'none';
   bp.style.display=show?'block':'none';
   cp.style.display=show?'block':'none';
+  cop.style.display=show?'block':'none';
   if(show){
     fetch("/v1/profiles").then(r=>r.json()).then(initProfileEditor).catch(()=>{});
     fetch("/v1/compact").then(r=>r.json()).then(renderCompact).catch(()=>{});
+    fetch("/v1/concurrency").then(r=>r.json()).then(renderConcurrency).catch(()=>{});
     fetch("/v1/models").then(r=>r.json()).then(renderBilling).catch(()=>{});
     fetch("/v1/stats").then(r=>r.json()).then(st=>{
       const models=st.models||{},tpOver=st.tokenPrices||{};

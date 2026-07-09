@@ -97,6 +97,15 @@ const MAX_FAILOVER_HOPS = 5; // chain-depth guard — at most 5 backup hops per 
 // from the backend (→ account rotation / model failover). Kept well under a typical client
 // request timeout so the "wait, then failover" safety valve fires before the client gives up.
 const DEFAULT_QUEUE_TIMEOUT_MS = 45000;
+// How long a concurrency key's empirically-learned ceiling must stay quiet before it creeps
+// back up by 1 toward the configured limit (ConcurrencyLimiter.recoverDue).
+const DEFAULT_CONCURRENCY_RECOVERY_INTERVAL_MS = 30000;
+// How often the background ticker checks every key for a recovery bump due (see
+// ConcurrencyRecoveryTicker below) — independent of the interval itself, just the poll rate.
+const CONCURRENCY_RECOVERY_POLL_MS = 5000;
+// Chain-depth guard for the concurrency-requeue loop (report hit + retry through the SAME
+// limiter key) — separate from MAX_FAILOVER_HOPS, which counts hops to a DIFFERENT target.
+const MAX_CONCURRENCY_REQUEUE_ATTEMPTS = 3;
 
 // A synthetic upstream response used when a concurrency-queue wait times out — there is no
 // real backend response, but feeding a 429 into the normal response handler reuses the entire
@@ -308,6 +317,13 @@ export function isFailoverTrigger(status, body) {
   if (status === 429 || status === 529) return true;
   // Only classify 400-599 (exclude 2xx/3xx, and very unusual 1xx).
   if (status < 400 || status >= 600) return false;
+  // An EMPTY body SPECIFICALLY on a 400 is itself the anomaly: the Messages API always returns
+  // a structured { error: { message } } on a genuine rejection, so a zero-byte 400 looks like an
+  // HTTP/network-level break (a dropped/reset connection, a gateway hiccup) rather than a real
+  // validation error — treat it the same as a 429/529 instead of relaying an opaque, silent
+  // error to the client. Scoped to 400 only: a 5xx with no body stays ambiguous (a generic
+  // gateway/proxy error unrelated to any specific API contract) and needs a real keyword match.
+  if (status === 400 && (!body || body.length === 0)) return true;
   let message;
   try {
     const parsed = JSON.parse(body.toString("utf8"));
@@ -753,6 +769,15 @@ export function validateConfig(config) {
   if (config.concurrencyQueueTimeoutMs !== undefined) {
     if (typeof config.concurrencyQueueTimeoutMs !== "number" || config.concurrencyQueueTimeoutMs < 1000) {
       throw new Error("config.concurrencyQueueTimeoutMs: must be a number >= 1000");
+    }
+  }
+  // concurrencyRecoveryIntervalMs: optional number, default 30000. How long a (provider,model)
+  // key's empirically-learned concurrency ceiling (see ConcurrencyLimiter.reportLimitHit) must
+  // stay quiet — no further rate-limit hit — before it creeps back up by 1 toward the
+  // configured limit. Must be >= 1000.
+  if (config.concurrencyRecoveryIntervalMs !== undefined) {
+    if (typeof config.concurrencyRecoveryIntervalMs !== "number" || config.concurrencyRecoveryIntervalMs < 1000) {
+      throw new Error("config.concurrencyRecoveryIntervalMs: must be a number >= 1000");
     }
   }
 
@@ -1232,6 +1257,7 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
     profileEffIndex: stepIndex(config, eff2.active),
     profileProbe: null, // a reroute is no longer the recovery probe — don't wind back on its success
     retryCount: 0, // new target — its own retry budget
+    climitCount: 0, // new target — its own concurrency-requeue budget
   });
 }
 
@@ -1282,7 +1308,12 @@ function makeResponseHandler(ctx) {
     const canProfileStep = !!(ctx.profileState && ctx.config.profiles && ctx.config.auto);
     const retryCfg = ctx.config.auto && ctx.config.auto.retry;
     const canRetry = !!(retryCfg && retryCfg.attempts > 0);
-    const isFailoverCandidate = (canProfileStep || (ctx.account && ctx.route) || canRetry)
+    // A model with a CONFIGURED concurrency limit has a signal to learn against — a 429/5xx on
+    // it is worth buffering + classifying even with no profiles/accounts/auto.retry configured,
+    // so the empirical self-throttle (below) still kicks in on a bare concurrency-limited route.
+    const configuredConcLimit = resolveConcurrencyLimit(ctx.config && ctx.config.concurrency, ctx.model);
+    const canConcurrencyLearn = !!(ctx.limiter && configuredConcLimit > 0 && configuredConcLimit !== Infinity);
+    const isFailoverCandidate = (canProfileStep || (ctx.account && ctx.route) || canRetry || canConcurrencyLearn)
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
     // 413 is also buffered so the context-overflow safety net can classify it (some backends
     // signal an oversized request with 413 rather than a 400).
@@ -1333,6 +1364,40 @@ function makeResponseHandler(ctx) {
       // 1. FAILOVER CHECK: a rate-limit or temporary-unavailable error from a backend
       //    that has a configured backup model → reroute to the backup.
       if (isFailoverCandidate && isFailoverTrigger(status, buffered)) {
+        // CONCURRENCY-LIMIT SELF-CORRECTION: a 429/5xx on a (provider,model) key that has a
+        // CONFIGURED concurrency limit likely means the configured ceiling is currently too
+        // optimistic for what the backend will actually bear — rather than bounce this through
+        // account rotation / a profile step, LEARN a lower ceiling (reportLimitHit) and requeue
+        // the SAME request through the SAME limiter key: proxyToRoute's own concurrency gate
+        // then naturally holds it until a slot frees under the new (lower) ceiling — no blind
+        // fixed delay, the queue IS the backoff. Bounded by MAX_CONCURRENCY_REQUEUE_ATTEMPTS,
+        // independent of auto.retry (for routes with no concurrency signal to learn from) —
+        // always on for any model with a configured limit, no extra config needed. Gated by
+        // isRetryWorthy: a hard weekly/monthly exhaustion isn't a concurrency problem at all,
+        // so it skips straight to failover instead of pointlessly lowering the ceiling.
+        const climitCount = ctx.climitCount || 0;
+        if (canConcurrencyLearn && climitCount < MAX_CONCURRENCY_REQUEUE_ATTEMPTS && isRetryWorthy(status, buffered)) {
+          const concKey = `${ctx.providerId} ${ctx.model}`;
+          ctx.limiter.reportLimitHit(concKey, configuredConcLimit);
+          recordStat(ctx, status, errorReason(buffered));
+          ctx.log(`concurrency: ${ctx.model} @ ${ctx.providerId} hit a limit (status ${status}) — learned ceiling lowered, requeue ${climitCount + 1}/${MAX_CONCURRENCY_REQUEUE_ATTEMPTS}`);
+          let effRoute = ctx.route;
+          if (ctx.account && ctx.accountPools) {
+            const pool = ctx.accountPools.get(ctx.route);
+            const acct = pool && pool.accounts[ctx.account.idx];
+            if (acct) effRoute = { ...ctx.route, auth: acct.auth, base_url: acct.base_url || ctx.route.base_url };
+          }
+          proxyToRoute(effRoute, ctx.req, ctx.res, ctx.body, ctx.log, {
+            onResponse: makeResponseHandler({ ...ctx, climitCount: climitCount + 1 }),
+            statsCtx: ctx.statsCtx,
+            providerId: ctx.providerId,
+            limiter: ctx.limiter,
+            concLimit: configuredConcLimit,
+            queueTimeoutMs: queueTimeoutOf(ctx.config),
+          });
+          return;
+        }
+
         // SAME-TARGET RETRY: a single bad response doesn't necessarily mean the backend/
         // account is actually down — retry the IDENTICAL request against the SAME target
         // up to failoverRetry.attempts times before spending a failover hop (account
@@ -1408,6 +1473,7 @@ function makeResponseHandler(ctx) {
                   failoverHopCount: hop + 1,
                   profileProbe: null,
                   retryCount: 0, // new target — its own retry budget
+                  climitCount: 0, // new target — its own concurrency-requeue budget
                 }),
                 statsCtx: ctx.statsCtx,
                 providerId: acct.label,
@@ -1538,6 +1604,12 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
 // default). Beyond it a queued request is treated as a backend 429 (rotation/failover).
 function queueTimeoutOf(config) {
   return (config && config.concurrencyQueueTimeoutMs) || DEFAULT_QUEUE_TIMEOUT_MS;
+}
+
+// The concurrency-recovery interval for this config, in ms (config.concurrencyRecoveryIntervalMs
+// or the default).
+function concurrencyRecoveryIntervalOf(config) {
+  return (config && config.concurrencyRecoveryIntervalMs) || DEFAULT_CONCURRENCY_RECOVERY_INTERVAL_MS;
 }
 
 // Route one buffered request to its backend, with the reactive vision fallback
@@ -1872,6 +1944,19 @@ export function createRouter(config, options = {}) {
   // state until a request actually queues; unlimited models never touch it.
   const limiter = new ConcurrencyLimiter();
 
+  // Background recovery: periodically ease any empirically-learned (lowered) concurrency
+  // ceiling back up toward its configured limit once a key has been quiet for
+  // concurrencyRecoveryIntervalMs (see ConcurrencyLimiter.recoverDue). Only worth polling when
+  // at least one model has a configured limit to learn against.
+  let concurrencyRecoveryTimer = null;
+  if (config.concurrency && Object.keys(config.concurrency).length > 0) {
+    concurrencyRecoveryTimer = setInterval(
+      () => limiter.recoverDue(Date.now(), concurrencyRecoveryIntervalOf(config)),
+      CONCURRENCY_RECOVERY_POLL_MS,
+    );
+    concurrencyRecoveryTimer.unref(); // never keep the process alive just to poll this
+  }
+
   // Profile routing state — the live { pinned, offset, shiftedAt, attempts } that (with the
   // config's profiles/auto) decides what each alias resolves to. Persisted across restarts in
   // ~/.modelpipe/profile-state.json so a manual pin / active shift survives a restart. Fields
@@ -2147,7 +2232,7 @@ export function createRouter(config, options = {}) {
         // key is "providerId\u0000model"; split for a readable dashboard row.
         live: limiter.snapshot().map((s) => {
           const sep = s.key.indexOf("\u0000");
-          return { provider: sep >= 0 ? s.key.slice(0, sep) : s.key, model: sep >= 0 ? s.key.slice(sep + 1) : "", active: s.active, limit: s.limit, queued: s.queued };
+          return { provider: sep >= 0 ? s.key.slice(0, sep) : s.key, model: sep >= 0 ? s.key.slice(sep + 1) : "", active: s.active, limit: s.limit, effLimit: s.effLimit, queued: s.queued };
         }),
       }));
       return;
@@ -2222,7 +2307,7 @@ export function createRouter(config, options = {}) {
         // key is "providerId\u0000model"; split for a readable dashboard row.
         live: limiter.snapshot().map((s) => {
           const sep = s.key.indexOf("\u0000");
-          return { provider: sep >= 0 ? s.key.slice(0, sep) : s.key, model: sep >= 0 ? s.key.slice(sep + 1) : "", active: s.active, limit: s.limit, queued: s.queued };
+          return { provider: sep >= 0 ? s.key.slice(0, sep) : s.key, model: sep >= 0 ? s.key.slice(sep + 1) : "", active: s.active, limit: s.limit, effLimit: s.effLimit, queued: s.queued };
         }),
       }));
       return;
@@ -2362,6 +2447,7 @@ export function createRouter(config, options = {}) {
     if (stats) stats.shutdown();
     if (quotaPoller) quotaPoller.stop();
     if (profilePinger) profilePinger.stop();
+    if (concurrencyRecoveryTimer) clearInterval(concurrencyRecoveryTimer);
   });
 
   return server;
