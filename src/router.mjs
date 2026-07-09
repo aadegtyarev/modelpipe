@@ -319,6 +319,30 @@ export function isFailoverTrigger(status, body) {
   return /(rate\s*limit|temporarily\s*unavailable|overloaded|try\s*again\s*later|cannot\s*process|capacity|credit\s*balance|organization\s*(is\s*)?disabled|account\s*(is\s*)?disabled|payment\s*required|quota\s*exceeded)/i.test(message);
 }
 
+// A HARD, long-duration exhaustion — a weekly/monthly plan quota, a disabled org/account, or
+// payment required — is a failover trigger (isFailoverTrigger) but NOT worth retrying in
+// place: an identical retry is guaranteed to fail again (the backend won't recover until a
+// reset date, sometimes days away) and only burns the retry budget / delays the ACTUAL fix
+// (account rotation or a profile step). Only meaningful once isFailoverTrigger is already true.
+// A plain rate-limit/overload/capacity blip, a bare 5xx, or our own concurrency-queue-timeout
+// synthetic 429 (see makeSyntheticLimitResponse) all remain retry-worthy — those ARE transient.
+const HARD_EXHAUSTION_RE = /weekly|monthly|credit\s*balance|organization\s*(is\s*)?disabled|account\s*(is\s*)?disabled|payment\s*required|quota\s*exceeded/i;
+export function isRetryWorthy(status, body) {
+  if (status >= 500 && status < 600) return true; // a plain server error is transient by nature
+  // 429/529/400 all only reach here after isFailoverTrigger already matched a keyword (or,
+  // for 429/529, matched unconditionally) — retry-worthy unless the message signals a HARD,
+  // long-duration exhaustion.
+  let message;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    message = parsed && parsed.error && parsed.error.message;
+  } catch {
+    return true; // unparseable body — assume transient
+  }
+  if (typeof message !== "string") return true;
+  return !HARD_EXHAUSTION_RE.test(message);
+}
+
 // Persist the runtime profile state ({ pinned, offset, shiftedAt, attempts }) under
 // ~/.modelpipe/profile-state.json. Best-effort — never throws. Called after a shift /
 // wind-back / pin change so a restart resumes where it left off.
@@ -672,6 +696,15 @@ export function validateConfig(config) {
           if (!Array.isArray(w) || w.length !== 2 || parseHHMM(w[0]) == null || parseHHMM(w[1]) == null) throw new Error(`${at}.windows[${j}]: must be ["HH:MM","HH:MM"] with valid 24h times`);
         }
       }
+    }
+    // retry: OPTIONAL { attempts, delayMs } — before spending a failover hop (account
+    // rotation / profile step), retry the IDENTICAL request against the SAME target this
+    // many times. attempts: 0 (default) = today's immediate-failover behaviour, no retry.
+    if (config.auto.retry !== undefined) {
+      const r = config.auto.retry;
+      if (!r || typeof r !== "object" || Array.isArray(r)) throw new Error("config.auto.retry: must be an object { attempts, delayMs? }");
+      if (!Number.isInteger(r.attempts) || r.attempts < 0) throw new Error("config.auto.retry.attempts: must be a non-negative integer");
+      if (r.delayMs !== undefined && (typeof r.delayMs !== "number" || r.delayMs < 0)) throw new Error("config.auto.retry.delayMs: must be a non-negative number of ms when present");
     }
   }
   // defaultProfile: optional; when set it must name a declared profile.
@@ -1105,14 +1138,33 @@ async function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, 
   upstreamReq.end();
 }
 
+// Best-effort short human-readable reason from a provider's JSON error body (e.g.
+// {"type":"error","error":{"type":"rate_limit_error","message":"..."}}) — surfaced on the
+// dashboard trace so a red row says WHY, not just a status code. Never throws; capped
+// length so a pathological body can't bloat the timeline. undefined when unparseable.
+function errorReason(buffered) {
+  if (!buffered || !buffered.length) return undefined;
+  try {
+    const parsed = JSON.parse(buffered.toString("utf8"));
+    const err = parsed && parsed.error;
+    const msg = (err && (err.message || err.type)) || parsed.message;
+    if (typeof msg !== "string" || !msg) return undefined;
+    return msg.length > 200 ? `${msg.slice(0, 200)}…` : msg;
+  } catch { return undefined; }
+}
+
 // Record a zero-token error/relay stat for the tier a ctx is currently on. No-op when
-// the dashboard is off.
-function recordStat(ctx, status) {
+// the dashboard is off. Carries client/clientModel too, so an error row keeps the same
+// "sent → routed [provider]" trace as a successful one instead of a bare orphan row —
+// and an optional short human-readable reason (see errorReason) for the dashboard tooltip.
+function recordStat(ctx, status, message) {
   if (ctx.statsCtx && ctx.statsCtx.stats) {
     ctx.statsCtx.stats.record({
       providerId: ctx.providerId, model: ctx.model,
+      clientModel: ctx.clientModel, client: ctx.client,
       durationMs: Date.now() - ctx.statsCtx.startTime,
       inputTokens: 0, outputTokens: 0, status,
+      ...(message ? { errorMessage: message } : {}),
     });
   }
 }
@@ -1136,9 +1188,7 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
   const ps = ctx.profileState;
   const config = ctx.config;
   const relay = () => {
-    if (ctx.statsCtx && ctx.statsCtx.stats) {
-      ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
-    }
+    recordStat(ctx, status, errorReason(buffered));
     relayBuffered(ctx.res, status, headers, buffered);
   };
   if (!ps || !config.profiles) { relay(); return; }
@@ -1181,6 +1231,7 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
     failoverHopCount: hop + 1,
     profileEffIndex: stepIndex(config, eff2.active),
     profileProbe: null, // a reroute is no longer the recovery probe — don't wind back on its success
+    retryCount: 0, // new target — its own retry budget
   });
 }
 
@@ -1229,7 +1280,9 @@ function makeResponseHandler(ctx) {
     // that failover can't fix, so buffering them is wasted work + changes delivery
     // semantics for oversized error bodies.
     const canProfileStep = !!(ctx.profileState && ctx.config.profiles && ctx.config.auto);
-    const isFailoverCandidate = (canProfileStep || (ctx.account && ctx.route))
+    const retryCfg = ctx.config.auto && ctx.config.auto.retry;
+    const canRetry = !!(retryCfg && retryCfg.attempts > 0);
+    const isFailoverCandidate = (canProfileStep || (ctx.account && ctx.route) || canRetry)
       && (status === 400 || status === 429 || status === 529 || (status >= 500 && status < 600));
     // 413 is also buffered so the context-overflow safety net can classify it (some backends
     // signal an oversized request with 413 rather than a 400).
@@ -1267,14 +1320,12 @@ function makeResponseHandler(ctx) {
           const base = limit || effectiveWindow(ctx.config.compact, ctx.learnedWindows, ctx.model);
           const win = Math.floor(base * [0.9, 0.7, 0.5][Math.min(attempt, 2)]);
           const trimmed = fitBufferToWindow(ctx.body, win, 1, `${ctx.model} overflow-retry ${attempt + 1}`, ctx.log);
-          recordStat(ctx, status);
+          recordStat(ctx, status, errorReason(buffered));
           ctx.log(`compact: context overflow from ${ctx.model} — hard-trim + retry ${attempt + 1}/${maxRetries}`);
           dispatch(ctx.route, trimmed, ctx, { model: ctx.model, overflowRetry: attempt + 1 });
           return;
         }
-        if (ctx.statsCtx && ctx.statsCtx.stats) {
-          ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
-        }
+        recordStat(ctx, status, errorReason(buffered));
         relayBuffered(ctx.res, status, headers, buffered);
         return;
       }
@@ -1282,12 +1333,46 @@ function makeResponseHandler(ctx) {
       // 1. FAILOVER CHECK: a rate-limit or temporary-unavailable error from a backend
       //    that has a configured backup model → reroute to the backup.
       if (isFailoverCandidate && isFailoverTrigger(status, buffered)) {
+        // SAME-TARGET RETRY: a single bad response doesn't necessarily mean the backend/
+        // account is actually down — retry the IDENTICAL request against the SAME target
+        // up to failoverRetry.attempts times before spending a failover hop (account
+        // rotation / profile step). Off by default (attempts: 0 = today's immediate-failover
+        // behaviour). retryCount resets to 0 whenever a hop moves to a NEW target below.
+        // Gated by isRetryWorthy: a HARD, long-duration exhaustion (weekly/monthly plan
+        // quota, a disabled org/account, payment required) skips retry entirely and goes
+        // straight to failover — retrying it is guaranteed to fail again and only delays
+        // the actual fix. A plain rate-limit/overload/5xx blip, or our own concurrency-queue
+        // timeout, remains retry-worthy.
+        const retryCount = ctx.retryCount || 0;
+        if (retryCfg && retryCfg.attempts > 0 && retryCount < retryCfg.attempts && isRetryWorthy(status, buffered)) {
+          recordStat(ctx, status, errorReason(buffered)); // record this failed attempt on the current tier
+          ctx.log(`retry: ${ctx.model} @ ${ctx.providerId} (status ${status}, retry ${retryCount + 1}/${retryCfg.attempts})`);
+          // Re-send to the EXACT SAME effective backend — NOT dispatch(), which re-runs
+          // accountSetup and (on a round-robin pool) would advance to the NEXT account
+          // instead of retrying this one. Rebuild the same account's effRoute by hand.
+          let effRoute = ctx.route;
+          if (ctx.account && ctx.accountPools) {
+            const pool = ctx.accountPools.get(ctx.route);
+            const acct = pool && pool.accounts[ctx.account.idx];
+            if (acct) effRoute = { ...ctx.route, auth: acct.auth, base_url: acct.base_url || ctx.route.base_url };
+          }
+          const again = () => proxyToRoute(effRoute, ctx.req, ctx.res, ctx.body, ctx.log, {
+            onResponse: makeResponseHandler({ ...ctx, retryCount: retryCount + 1 }),
+            statsCtx: ctx.statsCtx,
+            providerId: ctx.providerId,
+            limiter: ctx.limiter,
+            concLimit: resolveConcurrencyLimit(ctx.config && ctx.config.concurrency, ctx.model),
+            queueTimeoutMs: queueTimeoutOf(ctx.config),
+          });
+          if (retryCfg.delayMs > 0) setTimeout(again, retryCfg.delayMs);
+          else again();
+          return;
+        }
+
         // Chain-depth guard — prevent infinite failover loops.
         const hop = ctx.failoverHopCount || 0;
         if (hop >= MAX_FAILOVER_HOPS) {
-          if (ctx.statsCtx && ctx.statsCtx.stats) {
-            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 502 });
-          }
+          recordStat(ctx, 502, `failover chain limit (${MAX_FAILOVER_HOPS} hops) reached`);
           sendError(ctx.res, 502, `failover chain limit (${MAX_FAILOVER_HOPS} hops) reached — could not route "${ctx.model}"`);
           return;
         }
@@ -1311,7 +1396,7 @@ function makeResponseHandler(ctx) {
             exhausted.attempts = (exhausted.attempts || 0) + 1;
             const nextIdx = pickAccountIndex(pool, now, ctx.account.idx);
             if (accountEligible(pool, nextIdx, now)) {
-              recordStat(ctx, status); // record the error on the exhausted account label
+              recordStat(ctx, status, errorReason(buffered)); // record the error on the exhausted account label
               const acct = pool.accounts[nextIdx];
               ctx.log(`account: ${ctx.model} ${ctx.account.label} -> ${acct.label} (status ${status}, hop ${hop + 1})`);
               const effRoute = { ...ctx.route, auth: acct.auth, base_url: acct.base_url || ctx.route.base_url };
@@ -1322,6 +1407,7 @@ function makeResponseHandler(ctx) {
                   account: { idx: nextIdx, label: acct.label },
                   failoverHopCount: hop + 1,
                   profileProbe: null,
+                  retryCount: 0, // new target — its own retry budget
                 }),
                 statsCtx: ctx.statsCtx,
                 providerId: acct.label,
@@ -1347,9 +1433,7 @@ function makeResponseHandler(ctx) {
         if (ctx.isVisionTarget) {
           // Loop guard: the vision target itself can't take the image — clear error,
           // never re-reroute (no infinite loop).
-          if (ctx.statsCtx && ctx.statsCtx.stats) {
-            ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 422 });
-          }
+          recordStat(ctx, 422, "vision route cannot process this image; not rerouting (loop guard)");
           sendError(ctx.res, 422, "vision route cannot process this image request; not rerouting (loop guard)");
           return;
         }
@@ -1372,27 +1456,18 @@ function makeResponseHandler(ctx) {
         }
         // No vision fallback configured — fail LOUD with a clear error, never the raw
         // cryptic upstream 400.
-        if (ctx.statsCtx && ctx.statsCtx.stats) {
-          ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status: 422 });
-        }
+        recordStat(ctx, 422, `model "${ctx.model}" cannot process images and no vision fallback is configured`);
         sendError(ctx.res, 422, `model "${ctx.model}" cannot process images and no vision fallback is configured`);
         return;
       }
 
       // 3. Any other error — relay it verbatim (an ambiguous 400, a non-rate-limit
       //    5xx, etc.). Never reroute.
-      // DIAGNOSTIC: log the error message so we can see what the backend returned
-      // (only when a failover candidate didn't match — helps tune the classifier).
-      try {
-        const diag = JSON.parse(buffered.toString("utf8"));
-        const diagMsg = (diag && diag.error && diag.error.message) || JSON.stringify(diag).slice(0, 200);
-        ctx.log(`error-relay: ${ctx.model} status=${status} msg="${diagMsg}"`);
-      } catch { /* never fail on diagnostics */ }
+      const reason = errorReason(buffered);
+      if (reason) ctx.log(`error-relay: ${ctx.model} status=${status} msg="${reason}"`);
       windBackProbe(); // a non-retryable response to a recovery probe = head is back
       resetAccountBackoff(); // account answered (a non-limit error) — it's reachable, reset its ladder
-      if (ctx.statsCtx && ctx.statsCtx.stats) {
-        ctx.statsCtx.stats.record({ providerId: ctx.providerId, model: ctx.model, durationMs: Date.now() - ctx.statsCtx.startTime, inputTokens: 0, outputTokens: 0, status });
-      }
+      recordStat(ctx, status, reason);
       relayBuffered(ctx.res, status, headers, buffered);
     });
   };

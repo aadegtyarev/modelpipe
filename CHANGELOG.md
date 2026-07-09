@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-09
+
+### Added
+- **Same-target retry before failover** (`auto.retry: { attempts, delayMs? }`, off by default):
+  on a failover-candidate error, retry the identical request against the SAME backend/account up
+  to `attempts` times before spending a failover hop (account rotation or a profile step) — a
+  one-off blip no longer immediately burns the cascade. Gated by a new `isRetryWorthy` classifier:
+  a HARD, long-duration exhaustion (a weekly/monthly plan quota, a disabled org/account, payment
+  required) is **never** retried — it will fail again regardless — and goes straight to failover;
+  a plain rate-limit/overload/5xx blip, or the router's own concurrency-queue-timeout, remains
+  retry-worthy. Editable in the dashboard next to "Switching rules (auto chain)", or via
+  `POST /v1/profiles/config`.
+- **Dashboard profile pin — commit on select** (was staged in a `<select>` + a separate "Pin"
+  button that the 2s auto-refresh could clobber before it was clicked, making the control feel
+  like it "wouldn't stick"): pinning now commits immediately on change, matching the
+  Default-profile select; an "— auto —" option replaces the separate Clear button.
+
+### Fixed
+- **Error rows in the dashboard trace were orphaned**: a failed hop's stat record (account
+  rotation, a profile step, the final relay) never carried `client`/`clientModel`, so a red row
+  showed a bare backend model with no "who sent it" / "what alias it started as" — and no reason
+  for the error at all. Every error record now carries the same trace as a successful one, plus a
+  short human-readable reason extracted from the backend's own error body (shown inline on the
+  row and in its tooltip).
+
 ## [0.12.0] - 2026-07-09
 
 ### Added

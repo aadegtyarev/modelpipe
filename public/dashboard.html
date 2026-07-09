@@ -511,6 +511,8 @@ function initProfileEditor(d){
     defaultProfile:(d&&d.defaultProfile)||'',
     steps:(auto.steps||[]).map((s,i)=>({profile:s.profile,when:i===0?null:(s.when||'limit')})),
     recover:auto.recover!==false,
+    retryAttempts:(auto.retry&&auto.retry.attempts)||0,
+    retryDelayMs:(auto.retry&&auto.retry.delayMs!=null)?auto.retry.delayMs:250,
     schedules:(auto.schedules||[]).map(s=>({profile:s.profile,tz:s.tz||'+03:00',windows:(s.windows||[]).map(w=>[w[0],w[1]])})),
   };
   renderProfileEditor();
@@ -564,6 +566,17 @@ function renderProfileEditor(){
   });
   h+='<button class="t-add" onclick="peAddStep()">+ Add step</button>';
   h+='<div style="margin-top:8px"><label style="font-size:13px;color:var(--muted)"><input type="checkbox" '+(profCfg.recover?'checked':'')+' onchange="peToggleRecover(this.checked)"> recover — wind back up when the higher provider returns</label></div>';
+  h+='<div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+     '<span style="font-size:13px;color:var(--muted)">retry before switching:</span>'+
+     '<input class="i" type="number" min="0" step="1" style="width:56px" value="'+profCfg.retryAttempts+'" onchange="peSetRetryAttempts(this.value)">'+
+     '<span style="font-size:12px;color:var(--muted)">attempt(s) on the SAME target</span>'+
+     (profCfg.retryAttempts>0
+       ?('<span style="font-size:12px;color:var(--muted)">, wait</span>'+
+         '<input class="i" type="number" min="0" step="50" style="width:70px" value="'+profCfg.retryDelayMs+'" onchange="peSetRetryDelay(this.value)">'+
+         '<span style="font-size:12px;color:var(--muted)">ms between tries</span>')
+       :'')+
+     '</div>'+
+     '<div style="color:var(--muted);font-size:12px;margin-top:2px">0 = today\'s behaviour (switch immediately on the first error). A blip on one backend gets retried in place before a hop burns account rotation / a profile step.</div>';
 
   h+='<h3 style="font-size:14px;margin:14px 0 6px">Schedules <span style="font-weight:400;color:var(--muted);font-size:12px">(optional — force a profile during a wall-clock window)</span></h3>';
   profCfg.schedules.forEach((s,si)=>{
@@ -617,6 +630,8 @@ function peSetStepWhen(i,v){ profCfg.steps[i].when=v; peDirty(); }
 function peMoveStep(i,d){ const j=i+d,s=profCfg.steps; if(j<0||j>=s.length)return; [s[i],s[j]]=[s[j],s[i]]; peFixHead(); peDirty(); renderProfileEditor(); }
 function peDelStep(i){ profCfg.steps.splice(i,1); peFixHead(); peDirty(); renderProfileEditor(); }
 function peToggleRecover(v){ profCfg.recover=v; peDirty(); }
+function peSetRetryAttempts(v){ profCfg.retryAttempts=Math.max(0,parseInt(v,10)||0); peDirty(); renderProfileEditor(); }
+function peSetRetryDelay(v){ profCfg.retryDelayMs=Math.max(0,parseInt(v,10)||0); peDirty(); }
 function peAddSched(){ const nm=peProfileNames()[0]||''; profCfg.schedules.push({profile:nm,tz:'+03:00',windows:[['14:00','18:00']]}); peDirty(); renderProfileEditor(); }
 function peDelSched(i){ profCfg.schedules.splice(i,1); peDirty(); renderProfileEditor(); }
 function peSetSched(si,f,v){ profCfg.schedules[si][f]=v; peDirty(); }
@@ -664,7 +679,11 @@ async function saveProfileConfig(){
   if(profCfg.defaultProfile && !names.has(profCfg.defaultProfile)){ peShowMsg('default profile “'+profCfg.defaultProfile+'” is not a declared profile',true); return; }
   const payload={profiles};
   if(profCfg.defaultProfile) payload.defaultProfile=profCfg.defaultProfile;
-  if(steps.length){ payload.auto={steps,recover:!!profCfg.recover}; if(scheds.length)payload.auto.schedules=scheds; }
+  if(steps.length){
+    payload.auto={steps,recover:!!profCfg.recover};
+    if(scheds.length)payload.auto.schedules=scheds;
+    if(profCfg.retryAttempts>0)payload.auto.retry={attempts:profCfg.retryAttempts,delayMs:profCfg.retryDelayMs};
+  }
   try{
     const r=await fetch("/v1/profiles/config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
     if(!r.ok){ const e=await r.json().catch(()=>({})); peShowMsg((e.error&&e.error.message)||('save failed ('+r.status+')'),true); return; }
@@ -800,13 +819,18 @@ function traceCell(e,pid){
   h+=escHtml(routed);
   if(pid) h+=' <span class="tag sub" style="opacity:.75">'+escHtml(pid)+'</span>';
   if(prov) h+=' <span style="color:'+(prov!==routed?'var(--orange)':'var(--muted)')+'">→ '+escHtml(prov)+'</span>';
+  // Error rows carry no "returned" (the provider errored, not "echoed a model") — show the
+  // status + a short reason instead, so a red row says WHY without a hover.
+  if(e.status>=400) h+=' <span style="color:var(--red)">'+e.status+(e.errorMessage?': '+escHtml(e.errorMessage):'')+'</span>';
   return h;
 }
 function traceTitle(e,pid){
-  return 'client (who): '+(e.client||'—')
+  let t='client (who): '+(e.client||'—')
     +'\nsent model: '+(e.clientModel||e.model||'?')
     +'\nrouted to: '+(e.model||'?')+(pid?' ['+pid+']':'')
     +'\nprovider returned: '+(e.providerModel||'(not reported)');
+  if(e.status>=400) t+='\nstatus: '+e.status+(e.errorMessage?'\nreason: '+e.errorMessage:'');
+  return t;
 }
 
 function drawChart(timeline){
