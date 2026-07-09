@@ -41,7 +41,7 @@ const PRICE_MAP = {
   "claude-sonnet-4-5":     { input: 3,    output: 15   },
   "claude-haiku-4-5":      { input: 0.8,  output: 4    },
   "deepseek-v4-pro":       { input: 0.435, output: 0.87, cacheRead: 0.003625 },
-  "deepseek-v4-flash":     { input: 0.14, output: 0.28 },
+  "deepseek-v4-flash":     { input: 0.14, output: 0.28, cacheRead: 0.0028 },
   "deepseek-chat":         { input: 0.14, output: 0.28 },
   "GLM-5.2":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
   "glm-5.2":               { input: 1.4,  output: 4.4,  cacheRead: 0.26  },
@@ -69,14 +69,28 @@ const PRICE_MAP = {
 // Direct API token prices — overridable via config.tokenPrices.
 // Priority: config.tokenPrices > PRICE_MAP.
 export function modelPrice(model, tokenPrices = null) {
-  if (tokenPrices && tokenPrices[model]) return tokenPrices[model];
+  const base = PRICE_MAP[model] || null;
+  // Direct match in overrides — merge with PRICE_MAP so that fields missing from the
+  // override (e.g. cacheRead dropped by an older dashboard save) fall back to the
+  // built-in price instead of falling back to the full input rate.
+  if (tokenPrices && tokenPrices[model]) {
+    return base ? { ...base, ...tokenPrices[model] } : tokenPrices[model];
+  }
   // Fuzzy: try matching by prefix (e.g. "claude-opus-*" matches any claude-opus variant)
   if (tokenPrices) {
     for (const [key, p] of Object.entries(tokenPrices)) {
-      if (key.includes("*") && globMatch(key, model)) return p;
+      if (key.includes("*") && globMatch(key, model)) {
+        if (base) {
+          // Prefix-matched override — still merge with the base price for the concrete model
+          const merged = { ...base };
+          for (const [k, v] of Object.entries(p)) { if (v != null) merged[k] = v; }
+          return merged;
+        }
+        return p;
+      }
     }
   }
-  return PRICE_MAP[model] || null;
+  return base;
 }
 
 function globMatch(pattern, str) {

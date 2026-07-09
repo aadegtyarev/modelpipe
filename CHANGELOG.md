@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-09
+
+### Fixed
+- Dashboard token-price editor silently dropped the `cacheRead` field on save,
+  causing cache-hit tokens to be billed at the full input rate (120× overcharge
+  for `deepseek-v4-pro`). The editor now renders and preserves a `cache` field.
+- `modelPrice()` now merges dashboard overrides with built-in `PRICE_MAP` entries
+  so that a field missing from the override (e.g. `cacheRead`) falls back to the
+  known price instead of the full input rate.
+- Added `cacheRead: 0.0028` for `deepseek-v4-flash` (verified against DeepSeek
+  billing data).
+
 ## [0.14.0] - 2026-07-09
 
 ### Added

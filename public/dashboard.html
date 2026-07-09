@@ -230,7 +230,7 @@ let billingByProvider={};        // providerId -> "metered" | "subscription"
 
 function fmt(n){return n!=null?Number(n).toLocaleString():"—"}
 function usd(v){return'$'+Number(v||0).toFixed(3)}
-function pricestr(pin,pout){return pin==null?'price —':'$'+pin+' / $'+pout+' per 1M in·out'}
+function pricestr(pin,pout,pcr){return pin==null?'price —':'$'+pin+' / $'+pout+' per 1M in·out'+(pcr!=null?' · $'+pcr+' cache':'')}
 // Metered only when the route table explicitly says so — an unknown provider (e.g. a
 // failed /v1/models fetch) HIDES the $ rather than fabricating one (honesty-first default).
 function isMetered(pid){return billingByProvider[pid]==='metered'}
@@ -357,10 +357,12 @@ function toggleSettings(){
       for(const[mid,m]of Object.entries(models)){
         const metered=isMetered(m.providerId);
         const p=tpOver[mid]||{input:m.priceInput,output:m.priceOutput};
+        const pcr=tpOver[mid]&&tpOver[mid].cacheRead!=null?tpOver[mid].cacheRead:(m.priceCacheRead!=null?m.priceCacheRead:'');
         rows+='<div class="tprow" data-model="'+escHtml(mid)+'" style="display:flex;align-items:center;gap:6px;margin:2px 0">'+
           '<span style="min-width:150px;color:var(--muted)">'+escHtml(mid)+(metered?'':' <span class="tag sub">flat plan</span>')+'</span>'+
           '<span style="color:var(--muted)">in</span><input class="i tpin" size="5" value="'+(p.input!=null?p.input:'')+'">'+
           '<span style="color:var(--muted)">out</span><input class="i tpout" size="5" value="'+(p.output!=null?p.output:'')+'">'+
+          '<span style="color:var(--muted)">cache</span><input class="i tpcr" size="5" value="'+pcr+'">'+
           '<span style="font-size:11px;color:var(--muted)">per 1M</span></div>';
       }
       if(!rows)rows='<span style="color:var(--muted)">no model traffic yet — prices shown from the catalog once a model is used</span>';
@@ -412,7 +414,15 @@ async function saveTokenPrices(){
   for(const r of $('tpriceRows').querySelectorAll('.tprow')){
     const mid=r.dataset.model;
     const inp=parseFloat(r.querySelector('.tpin').value),out=parseFloat(r.querySelector('.tpout').value);
-    if(!isNaN(inp)&&!isNaN(out)&&inp>=0&&out>=0)tp[mid]={input:inp,output:out};
+    if(!isNaN(inp)&&!isNaN(out)&&inp>=0&&out>=0){
+      const entry={input:inp,output:out};
+      const crInput=r.querySelector('.tpcr');
+      if(crInput){
+        const cr=parseFloat(crInput.value);
+        if(!isNaN(cr)&&cr>=0)entry.cacheRead=cr;
+      }
+      tp[mid]=entry;
+    }
   }
   await fetch("/v1/token-prices",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tokenPrices:tp})});
   load();
@@ -777,7 +787,7 @@ function render(stats,quotas,cfg){
       '<div class="head"><span class="name" style="color:'+dotColor+'" title="'+(allFail?'all requests failing':(online?'active':'idle'))+'">'+(online||allFail?'● ':'○ ')+escHtml(mid)+'</span>'+
         '<span class="tag '+(metered?'metered':'sub')+'">'+(metered?'metered':'flat plan')+'</span></div>'+
       '<div class="provider">'+escHtml(m.providerId)+'</div>'+
-      '<div class="price">'+(metered?pricestr(m.priceInput,m.priceOutput):'subscription — cost not metered')+'</div>'+
+      '<div class="price">'+(metered?pricestr(m.priceInput,m.priceOutput,m.priceCacheRead):'subscription — cost not metered')+'</div>'+
       '<div class="bar-wrap"><div class="bar">'+
         '<div class="in" style="width:'+(inSum/tot*100)+'%"></div>'+
         '<div class="out" style="width:'+(m.outputTokens/tot*100)+'%"></div></div></div>'+
