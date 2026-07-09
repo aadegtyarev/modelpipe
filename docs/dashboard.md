@@ -26,10 +26,15 @@ The `billing` mode is derived per route (passthrough & z.ai/GLM ⇒ subscription
 - **Provider cards** — real data only: DeepSeek balance, OpenRouter credits, Anthropic
   RPM/ITPM/OTPM (from live response headers), per-provider session totals, and a **console ↗**
   link to each provider.
-- **Request log** — last 50 requests (time, model, tokens in/out, cost, duration).
+- **Request log** — last 50 requests: time, client (who — user-agent·auth-fingerprint), the
+  routing trace (sent alias → routed model `[provider]` → what the provider echoed back), tokens
+  in/out, cost, duration. An error row carries the same trace plus a short human-readable reason
+  extracted from the backend's own error body.
 - **Sessions** — "New session" archives + starts fresh; history dropdown holds the last 20.
-- **Settings (⚙)** — metered token prices, failover pairs, account-pool state, and the billing
-  override.
+- **Settings (⚙)** — profiles & switching rules (including same-target retry — see
+  [profiles.md](profiles.md#config)), metered token prices, context fitting (compact),
+  concurrency limits (including the live self-throttled ceiling — see
+  [failover.md](failover.md#concurrency-limiting)), account-pool state, and the billing override.
 
 ## Persistence
 
@@ -53,13 +58,18 @@ Override per-model at runtime via Settings (⚙) or `config.tokenPrices`.
 | `GET /v1/quotas` | Real provider balances (DeepSeek, OpenRouter). |
 | `GET /v1/sessions` | Archived session history (up to 20). |
 | `GET /v1/models` | Secret-free route listing (globs, hosts, auth mode, vision + billing). |
-| `GET /v1/failover` | Failover pairs, active state, group ladders/offsets. |
+| `GET /v1/profiles` | Profile definitions, `auto` chain, live state (pinned/offset), routing summary — see [profiles.md](profiles.md). |
+| `GET /v1/compact` | Live, normalized context-compaction config — see [compaction.md](compaction.md). |
+| `GET /v1/concurrency` | Configured per-model limits + live queue state (`active`, `limit`, `effLimit`, `queued`) — see [failover.md#concurrency-limiting](failover.md#concurrency-limiting). |
 | `GET /v1/accounts` | Account-pool state: labels, strategy, per-account cooldown. |
 | `POST /v1/sessions/reset` | Archive the current session, start a new one. |
 | `POST /v1/token-prices` | Update metered token prices (persisted). |
 | `POST /v1/billing` | Override a provider's billing mode: `{provider, mode: metered\|subscription\|auto}`. |
-| `POST /v1/failover` | Set failover pairs and/or cooldown (persisted). |
-| `POST /v1/failover/reset` | Clear failover state. `?model=X` one pair · `?group=N` one group's shift. |
+| `POST /v1/profiles/config` | Replace the profile definitions + switching rules (`profiles`, `auto`, `defaultProfile`), persisted. |
+| `POST /v1/profiles/pin` | Set (`{profile: "name"}`) or clear (`{profile: null}`) the manual pin. |
+| `POST /v1/profiles/reset` | Clear the pin and any active error-shift — back to the default head. |
+| `POST /v1/compact` | Replace the compaction config, persisted. |
+| `POST /v1/concurrency` | Replace the per-model concurrency limits (and optionally `queueTimeoutMs`), persisted. |
 | `POST /v1/accounts/reset` | Clear account cooldowns (`?label=X` for one). |
 
 All endpoints are JSON, secret-free (no keys, no env-var names), served only on localhost.

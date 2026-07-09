@@ -42,13 +42,14 @@ A shell `export` or a systemd `EnvironmentFile` still wins over it. Copy
 | `dropProcessedImages` | boolean | `true` | Strip an already-answered (historical) image to a text placeholder before a non-vision backend sees it, so a lingering image no longer pins every follow-up turn to the vision target. `false` restores the legacy behaviour (any image → vision target). See [Vision routing](#vision-routing). |
 | `tokenPrices` | `{modelGlob: {input, output}}` | — | Per-model **metered** API price overrides ($ per 1M tokens); `*` globs allowed. Editable at runtime (⚙) and persisted. |
 | `profiles` | `{name: {bind}}` | — | Named alias→target [routing profiles](profiles.md). The active profile rewrites the incoming model id before route matching. |
-| `auto` | `{steps, recover?, schedules?}` | — | The automatic profile chain (best→fallback), error conditions, and schedule windows. See [profiles](profiles.md). |
+| `auto` | `{steps, recover?, schedules?, retry?}` | — | The automatic profile chain (best→fallback), error conditions, schedule windows, and same-target retry before a hop. See [profiles](profiles.md). |
 | `defaultProfile` | string | `auto.steps[0]` | The base profile when no pin/schedule selects. |
 | `failoverRecoveryIntervalMs` | number | `60000` | Min ms between recovery probes (a profile winding back up / account cooldown). Must be ≥ 1000. |
 | `proxyUrl` | string | — | Public URL of this proxy, surfaced in `--list`. |
 | `compact` | object | on by default | [Context fitting](compaction.md): trim a request to fit a smaller window on failover downshift (safety net; steady-state compaction is the harness's job). Editable at runtime (⚙) and persisted. |
-| `concurrency` | `{modelGlob: maxInt}` | — | Max **simultaneous** in-flight requests per `(provider, model)`; overflow is queued, not failed. First match wins (order specific ids before globs). Per account/key. See [Concurrency limiting](failover.md#concurrency-limiting). Editable at runtime (`/v1/concurrency`) and persisted. |
+| `concurrency` | `{modelGlob: maxInt}` | — | Max **simultaneous** in-flight requests per `(provider, model)`; overflow is queued, not failed. First match wins (order specific ids before globs). Per account/key. A 429/5xx (not a hard weekly/monthly exhaustion) on a limited model **self-throttles**: it learns a lower effective ceiling and requeues through the same limiter instead of failing over, then eases back up on its own — see [Concurrency limiting](failover.md#concurrency-limiting). Editable at runtime (`/v1/concurrency`, or the dashboard's Concurrency panel) and persisted. |
 | `concurrencyQueueTimeoutMs` | number | `45000` | How long a request waits in a full concurrency queue before it's treated as a backend 429 (→ account rotation / model failover). Must be ≥ 1000. |
+| `concurrencyRecoveryIntervalMs` | number | `30000` | How long a self-throttled (lowered) concurrency ceiling must stay quiet before it creeps back up by 1 toward the configured limit. Must be ≥ 1000. |
 | `routes[]` | array | required | Route entries (below). |
 
 ## Route fields

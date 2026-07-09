@@ -1,98 +1,18 @@
-# Failover & account pools
+# Account pools & concurrency limiting
 
-Three independent mechanisms, innermost first:
+Model-level failover — routing a failing model to a backup, or shifting a whole tier ladder
+together on an outage — is handled by **routing profiles** (`config.profiles`/`auto`), not by
+this document. See [profiles.md](profiles.md) for that: the active profile, `auto.steps`
+(best→fallback), `auto.retry` (same-target retry before a hop), `auto.recover`, and
+`auto.schedules`. (Older `failover`/`failoverGroups`/`schedules` top-level fields are gone —
+`modelpipe migrate <config.json>` rewrites an old config into `profiles`/`auto` in place.)
+
+This document covers the two mechanisms that sit **below** the profile ladder, per route:
 
 1. **Account pools** — rotate between several keys for the *same* model.
-2. **Failover pairs** — reroute a failing model to a *backup model*.
-3. **Failover groups** — shift a whole tier ladder together.
+2. **Concurrency limiting** — cap simultaneous in-flight requests per `(provider, model)`.
 
-## Failover pairs
-
-When `failover` is set, modelpipe switches to a backup model when a primary backend returns a
-retryable error:
-
-```json
-"failover": {
-  "claude-opus-*": "glm-5.1",
-  "glm-5.1": "deepseek-v4-pro"
-}
-```
-
-- **Reactive trigger** — 429 (rate limit), 529 (overloaded), or any 4xx/5xx whose body
-  mentions rate-limit / quota / capacity / credit / account / organisation → rewrite
-  `body.model` to the backup and reroute.
-- **Pre-route** — once a model is in failover, requests within the cooldown skip the primary.
-- **Chain** — if the backup also fails and has its own pair, follow the chain (guarded at 5 hops).
-- **Recovery** — a background pinger probes failed-over primaries; on a normal response the
-  failover clears. For passthrough routes, the next real request after the cooldown is the probe.
-
-Editable at runtime via the dashboard (⚙ → Failover) or `POST /v1/failover` — no restart, and
-edits persist.
-
-## Group failover
-
-A plain pair reroutes only the **one** model that erred. A group performs a **coordinated
-shift**: when a provider goes down, move a whole ladder down together so the next tier isn't
-doubly loaded.
-
-```json
-"failoverGroups": [
-  { "ladder": ["claude-opus-*", "glm-5.1", "deepseek-v4-pro"], "mode": "shift" }
-]
-```
-
-- **`mode: "shift"` (default)** — the ladder rides a shared offset. When the **head** tier fails
-  (e.g. Anthropic is down), the offset moves the whole ladder down one: `opus → glm` **and glm's
-  own traffic → deepseek at the same time**. It winds back when the head recovers.
-- **`mode: "cascade"`** — no coordinated shift; each request walks the ladder on error.
-- The **head** (index 0) may be a glob; every lower tier is a rewrite target and **must be a
-  concrete model id**. Each tier needs a matching route. Groups take precedence over pairs.
-- **Recovery** works even for a passthrough/glob head the pinger can't probe: after the
-  cooldown, the next head request tries the real head with its real model id and, on success,
-  winds the ladder back.
-- **Limitation** — the shift is a single scalar offset, so it can't wind back *past* a still-down
-  middle tier (double failure). Rare, self-limiting, and fixable without a restart via
-  `POST /v1/failover/reset?group=N`.
-
-**Routing to other providers.** A backup (pair value or ladder tier) can target any provider —
-including OpenRouter — as long as a route matches its id:
-
-```json
-"routes": [
-  { "match": "anthropic/*", "base_url": "https://openrouter.ai/api",
-    "auth": { "header": "Authorization", "scheme": "Bearer", "keyEnv": "OPENROUTER_API_KEY" } }
-],
-"failover": { "claude-opus-*": "anthropic/claude-sonnet-4.6" }
-```
-
-(Order the OpenRouter `*/*`-style route **last** — first match wins.)
-
-## The `effective` head signal
-
-`GET /v1/failover` returns an `effective` object — a ready-to-consume view of what the **head
-slot** resolves to *right now*, so an external consumer reads one field instead of re-deriving
-`groups[].effective[offset]` and keeping its own model→window table:
-
-```jsonc
-"effective": {
-  "believed": "glm-5.2",   // the configured head (offset 0) — what the client still thinks it's on
-  "head":     "glm-5.1",   // the model actually serving the head now (after any shift)
-  "window":   200000,      // head's effective context window — from resolveWindow, not the client
-  "shifted":  true,        // offset > 0 (fast branch)
-  "recoversInSec": 240,    // ETA to the next head-recovery probe window; null when healthy
-  "accountCooldown": null  // secs until the head's account pool has a live key again, else null
-}
-```
-
-- **`window`** is the single source of truth — `effectiveWindow`/`resolveWindow`, min'd with any
-  learned ceiling. No consumer needs to hardcode a model→window table.
-- **Healthy head** (offset 0): `head === believed`, `shifted:false`, `recoversInSec:null`.
-- **`null`** when no failover group is configured (plain pairs reroute per-model; there's no
-  coordinated head to report). With multiple groups it reflects the **first** group.
-- Built for an **out-of-harness compaction trigger**: Claude Code doesn't auto-compact on a
-  downshift (its window is static, it doesn't know the head dropped), so an external loop that
-  reads `effective.window` is the way to fit the shrunk window. A statusline is a simpler
-  consumer of the same field.
+Both are opt-in per route and independent of each other and of profiles.
 
 ## Account pools
 
@@ -118,9 +38,9 @@ Anthropic API keys — rolling onto the next when one runs out of quota:
   out under a different key.
 - **On a limit** the active account is parked and the request retries on the next eligible
   account; the parked one becomes eligible again once its cooldown elapses. The park is
-  **progressive** — it climbs the same `failoverRecoveryBackoffMs` ladder (1→5→10 min) model
-  failover rides, so a persistently rate-limited key is re-probed ever less often instead of
-  every 60s. The ladder resets to its first rung the moment the account serves a request
+  **progressive** — it climbs the same `failoverRecoveryBackoffMs` ladder (1→5→10 min) the
+  profile ladder rides, so a persistently rate-limited key is re-probed ever less often instead
+  of every 60s. The ladder resets to its first rung the moment the account serves a request
   cleanly. (With no `failoverRecoveryBackoffMs` set, it falls back to a flat
   `failoverRecoveryIntervalMs`.)
 - **`strategy`** — `"failover"` (default) drains the primary and moves down on a limit;
@@ -130,8 +50,8 @@ Anthropic API keys — rolling onto the next when one runs out of quota:
   account's `attempts` (how far up the cooldown ladder it has climbed); `POST /v1/accounts/reset`
   (optionally `?label=X`) clears both without a restart.
 
-Account rotation is the innermost layer: it happens **within** a route first; only when a pool
-has no live account left does model-level `failover`/`failoverGroups` take over.
+Account rotation is the **innermost** layer: it happens **within** a route first; only when a
+pool has no live account left does the profile ladder (`auto.steps`) step down.
 
 > **Subscription tokens expire.** A GLM Coding-Plan token or an Anthropic OAuth token is
 > short-lived — account pools are most robust with **long-lived API keys**.
@@ -148,7 +68,8 @@ client keeps the strong model — it just waits a moment:
 
 ```json
 "concurrency": { "glm-5.2": 3, "glm-*": 8 },
-"concurrencyQueueTimeoutMs": 45000
+"concurrencyQueueTimeoutMs": 45000,
+"concurrencyRecoveryIntervalMs": 30000
 ```
 
 - **First match wins** (like `compact.window`) — order specific ids before broad globs
@@ -159,12 +80,35 @@ client keeps the strong model — it just waits a moment:
   matching how a provider meters the cap (per subscription).
 - **Held for the whole response.** A slot is occupied until the backend finishes sending
   (streamed SSE included), matching the provider's own in-flight accounting.
-- **Wait, then failover.** A request that can't get a slot within `concurrencyQueueTimeoutMs`
-  (default 45s) is treated as a backend `429` → account rotation → model failover. So the queue
-  is the primary mechanism and failover is the safety valve; and any `429` that *does* get
-  through is a genuine limit (quota/overload), where failover is the right response. The two
-  compose cleanly.
+
+### Empirical self-throttle
+
+The configured limit is a ceiling, not necessarily the backend's *real* capacity right now. A
+plain rate-limit/overload `429`/5xx on a limited model (never a **hard**, long-duration
+exhaustion — a weekly/monthly plan quota, a disabled org/account, payment required — those go
+straight to the profile ladder instead) doesn't bounce through account rotation or a profile
+step. Instead:
+
+1. The effective ceiling for that `(provider, model)` key is **learned one lower** (floored at 1
+   — never fully blocks a model).
+2. The **same** request is requeued through the **same** limiter key — its own concurrency gate
+   then naturally holds it until a slot opens under the new, lower ceiling. No blind fixed
+   delay: the queue itself is the backoff.
+3. Bounded at **3** requeue attempts per request; beyond that it falls through to the normal
+   failover cascade (`auto.retry` → account rotation → a profile step).
+4. A key that's stayed quiet (no further hit) for `concurrencyRecoveryIntervalMs` (default 30s)
+   creeps its ceiling back up by 1 toward the configured limit — the same "ease off the brake"
+   shape as the account-pool cooldown ladder above, so a transient burst doesn't leave a model
+   throttled forever.
+
+**Wait, self-throttle, then failover.** A request that can't get a slot within
+`concurrencyQueueTimeoutMs` (default 45s) — including while requeued under a lowered ceiling —
+is treated as a backend `429` → account rotation → a profile step. So the queue (with its own
+self-correcting ceiling) is the primary mechanism and failover is the safety valve underneath it.
 
 **State & runtime edits.** `GET /v1/concurrency` returns the configured limits plus the live
-queue (real `active`/`queued` counts per key — never a fabricated number). `POST /v1/concurrency`
-replaces the map (and optionally `queueTimeoutMs`), validated like the file and persisted.
+queue state per key — `active`, `limit` (configured), `effLimit` (the current, possibly
+self-throttled ceiling — equals `limit` unless a hit has learned it lower), and `queued` (never
+a fabricated number). `POST /v1/concurrency` replaces the map (and optionally
+`queueTimeoutMs`), validated like the file and persisted. The dashboard's **Concurrency** panel
+(⚙ Settings) edits the same map and shows the same live state.

@@ -1,7 +1,8 @@
 # Routing profiles
 
-> **Status:** design spec (in implementation). Replaces `failover`, `failoverGroups`,
-> `schedules`, and dashboard model-overrides with one concept: **profiles**.
+> Replaces the older `failover`, `failoverGroups`, `schedules`, and dashboard model-overrides
+> with one concept: **profiles**. `modelpipe migrate <config.json>` rewrites an old config in
+> place.
 
 ## The idea
 
@@ -42,7 +43,8 @@ rewrites the incoming `model` id before route matching (the same rewrite primiti
     "recover": true,
     "schedules": [
       { "profile": "budget", "tz": "+03:00", "windows": [["14:00", "18:00"]] }
-    ]
+    ],
+    "retry": { "attempts": 2, "delayMs": 1500 }
   }
 }
 ```
@@ -59,6 +61,14 @@ rewrites the incoming `model` id before route matching (the same rewrite primiti
   head once the higher step's backend recovers.
 - **`auto.schedules`** — time windows that set the intended profile (proactive cost control).
   `tz` is a fixed UTC offset (`"+03:00"`/`"Z"`), `windows` are `[["HH:MM","HH:MM"]]` pairs.
+- **`auto.retry`** — `{ attempts, delayMs? }`, off by default (`attempts: 0`). Before spending a
+  failover hop (account rotation or a step down the ladder), retry the identical request against
+  the **same** backend/account up to `attempts` times — a one-off blip gets a second chance
+  instead of immediately burning the cascade. Gated by `isRetryWorthy`: a **hard**, long-duration
+  exhaustion (a weekly/monthly plan quota, a disabled org/account, payment required) is never
+  retried — it will fail again regardless — and goes straight to failover; a plain rate-limit/
+  overload/5xx blip remains retry-worthy. Editable in the dashboard next to "Switching rules
+  (auto chain)", or via `POST /v1/profiles/config`.
 - **`defaultProfile`** — the base when nothing else selects; defaults to `auto.steps[0]`.
 
 ## The resolver
@@ -93,7 +103,7 @@ the existing cascade does it.
 { pinned: string|null, offset: number, shiftedAt: number, attempts: number }
 ```
 
-`computeEffectiveHead` is superseded by `effectiveProfile(config, state, now)` →
+`effectiveProfile(config, state, now)` resolves this to
 `{ active, intended, source, shifted, offset }` (source: `manual|schedule|error|default`),
 consumed by the dashboard banner, the statusline, and compaction (window of `active`'s targets).
 
