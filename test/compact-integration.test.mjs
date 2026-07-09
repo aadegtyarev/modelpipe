@@ -112,5 +112,39 @@ await (async () => {
   await close(router); await close(stub);
 })();
 
+// ===== 3. PRE-ROUTE DOWNSHIFT (a FRESH request landing on an ALREADY-shifted step) =====
+// Unlike case 1 (the request that TRIGGERS the shift, mid-request, inside makeResponseHandler's
+// reroute), this drives a request that arrives AFTER the ladder already sits on the small-window
+// step — forward() pre-routes it straight there before ever touching makeResponseHandler. It
+// still gets trimmed because dispatch() is the SOLE send choke-point (forward()'s tail calls it
+// for the primary hop too) — this pins that down as a regression guard.
+await (async () => {
+  const smallReqs = [];
+  const stubSmall = http.createServer((req, res) => { const c = []; req.on("data", (x) => c.push(x)); req.on("end", () => { smallReqs.push(Buffer.concat(c).toString("utf8")); res.writeHead(200, { "content-type": "text/event-stream" }); res.end("event: done\ndata: {}\n\n"); }); });
+  const pSmall = await listen(stubSmall);
+
+  const router = createRouter({
+    routes: [{ match: "small-model", base_url: `http://127.0.0.1:${pSmall}`, auth: "passthrough" }],
+    profiles: { primary: { bind: {} }, small: { bind: { "big-model": "small-model" } } },
+    auto: { steps: [{ profile: "primary" }, { profile: "small", when: "limit" }] },
+    compact: { enabled: true, safetyPct: 0.95, windowDefault: 1000000, window: { "big-model": 1000000, "small-model": 200 }, maxOverflowRetries: 2 },
+  }, { log: () => {} });
+  const port = await listen(router);
+
+  // Force the ladder onto the "small" step WITHOUT going through a live failover (simulates a
+  // request arriving well after some earlier request already shifted it).
+  router._modelpipe.profileState.offset = 1;
+  router._modelpipe.profileState.shiftedAt = Date.now(); // inside the recovery backoff — no live re-probe
+
+  const res = await post(port, { model: "big-model", stream: true, messages: convo });
+  ok("pre-route downshift: request succeeds", res.status === 200);
+  ok("pre-route downshift: pre-routed straight to the backup", smallReqs.length === 1);
+  if (smallReqs.length) {
+    const got = JSON.parse(smallReqs[0]);
+    ok("pre-route downshift: body trimmed to fit the small window", got.messages.length < convo.length);
+  }
+  await close(router); await close(stubSmall);
+})();
+
 if (fails.length) { console.error(`compact-integration: ${pass} passed, ${fails.length} FAILED:\n` + fails.join("\n")); process.exit(1); }
 console.log(`compact-integration: all ${pass} checks passed`);

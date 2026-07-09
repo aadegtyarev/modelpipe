@@ -1503,7 +1503,9 @@ function dispatch(targetRoute, sendBody, carryCtx, overrides = {}) {
   // is SMALLER than the client's original model (a failover downshift, e.g. 1M → 256K), the
   // grown conversation may not fit — trim it to the target's window before sending. Only fires
   // on a genuine downshift: the primary hop (same/again window) is never touched, so the
-  // harness stays in charge of normal compaction. Off unless config.compact.enabled.
+  // harness stays in charge of normal compaction. Off unless config.compact.enabled. dispatch()
+  // is the SOLE send choke-point (forward() calls it for the primary hop too, see its tail), so
+  // this one check covers a fresh pre-routed request AND every later reroute.
   const compact = carryCtx.config && carryCtx.config.compact;
   let outBody = sendBody;
   if (compact && compact.enabled && carryCtx.clientModel) {
