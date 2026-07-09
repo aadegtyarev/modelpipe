@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **One-shot vision routing** (`dropProcessedImages`, default on): the image-fallback reroute now
+  keys on the **current turn** (an image after the last assistant reply), not the whole
+  transcript. Once the model has answered an image, follow-up turns are no longer forced to the
+  vision model — the historical image is stripped to an `[image omitted]` placeholder before a
+  non-vision backend sees it (a vision-capable backend keeps its images). Fixes the failure where
+  one image in the conversation pinned every later turn to the vision model for the life of the
+  image. Set `dropProcessedImages: false` to restore the legacy any-image-in-transcript behaviour.
+
+### Fixed
+- **Output-token over-count for providers that stream multiple `message_delta` events**: usage
+  `output_tokens` is CUMULATIVE per the Messages API, so it is now taken as the latest (max)
+  rather than summed. No change for the common single-delta case (Anthropic, DeepSeek, z.ai).
+
 ## [0.11.0] - 2026-07-08
 
 ### Added

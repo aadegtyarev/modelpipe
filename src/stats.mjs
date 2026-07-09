@@ -394,7 +394,11 @@ export function createUsageTracker(stats, { providerId, model, clientModel, clie
               cacheReadTokens += u.cacheReadTokens;
             }
           } else if (eventType === "message_delta" && data.usage) {
-            outputTokens += data.usage.output_tokens || 0;
+            // message_delta usage.output_tokens is CUMULATIVE per the Messages API — take the
+            // latest (max), never sum. Summing over-counts many-fold for a provider that emits
+            // more than one message_delta (each repeating the running total); the max is a
+            // no-op for the common single-delta case.
+            outputTokens = Math.max(outputTokens, data.usage.output_tokens || 0);
           }
         } catch {
           /* malformed JSON — skip */
@@ -442,7 +446,7 @@ export function createUsageTracker(stats, { providerId, model, clientModel, clie
                     cacheReadTokens += u.cacheReadTokens;
                   }
                 } else if (eventType === "message_delta" && data.usage) {
-                  outputTokens += data.usage.output_tokens || 0;
+                  outputTokens = Math.max(outputTokens, data.usage.output_tokens || 0); // cumulative — take latest, never sum
                 }
               } catch { /* skip malformed */ }
             }
