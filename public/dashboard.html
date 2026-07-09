@@ -436,6 +436,9 @@ async function load(){
 // present); the pin control is always available. Hidden while viewing an archived session.
 function renderRouting(prof){
   if(histMode){$("routing").innerHTML="";return;}
+  // Don't clobber an in-progress choice: while the pin dropdown is focused/open the 2s
+  // auto-refresh would rebuild innerHTML and reset the <select> before onchange fires.
+  if(document.activeElement&&document.activeElement.id==="pinSel")return;
   if(!prof||!prof.summary){$("routing").innerHTML="";return;}
   const s=prof.summary;
   let h='';
@@ -460,26 +463,30 @@ function renderRouting(prof){
     h+='</div>';
   }
 
-  // Pin control — always shown so a profile can be switched by hand. Styled to match the
-  // session-control bar (styled .b select/buttons) instead of raw browser widgets.
+  // Pin control — always shown so a profile can be switched by hand. Selecting a profile
+  // pins it immediately (onchange), the "— auto —" option clears the pin; no separate
+  // commit button, so the 2s auto-refresh can't clobber an uncommitted choice. Matches the
+  // Default-profile select pattern.
   const names=Object.keys(prof.profiles||{});
   const pinned=(prof.state&&prof.state.pinned)||'';
   h+='<div class="sessctl" style="margin-bottom:14px">'+
      '<span style="color:var(--muted);font-size:13px">Profile:</span>'+
-     '<select class="b" id="pinSel">'+names.map(n=>'<option value="'+escHtml(n)+'"'+(n===pinned?' selected':'')+'>'+escHtml(n)+(n===prof.defaultProfile?' (default)':'')+'</option>').join('')+'</select>'+
-     '<button class="b" onclick="pinProfile()">Pin</button>'+
-     '<button class="b" onclick="pinProfile(null)"'+(pinned?'':' disabled style="opacity:.45;cursor:default"')+'>Clear pin</button>'+
+     '<select class="b" id="pinSel" onchange="pinProfile(this.value)">'+
+       '<option value=""'+(pinned?'':' selected')+'>— auto (default + failover) —</option>'+
+       names.map(n=>'<option value="'+escHtml(n)+'"'+(n===pinned?' selected':'')+'>'+escHtml(n)+(n===prof.defaultProfile?' (default)':'')+'</option>').join('')+
+     '</select>'+
      (pinned
        ?'<span class="tag" style="color:var(--blue);border-color:var(--blue)">📌 pinned</span>'
-       :'<span style="color:var(--muted);font-size:12px">auto — default + failover</span>')+
+       :'<span style="color:var(--muted);font-size:12px">auto</span>')+
      '</div>';
 
   $("routing").innerHTML=h;
 }
 
-// POST the manual pin (or clear it with null). The router validates the profile name exists.
-async function pinProfile(explicit){
-  const profile = explicit===null ? null : ($("pinSel")?$("pinSel").value:null);
+// POST the manual pin from the select value; the empty "— auto —" option ("") clears it.
+// The router validates the profile name exists (and treats ""/null as clear).
+async function pinProfile(val){
+  const profile = val ? val : null;
   try{ await fetch("/v1/profiles/pin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({profile})}); }
   catch(e){}
   load();
