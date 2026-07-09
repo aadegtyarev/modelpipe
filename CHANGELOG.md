@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-09
+
 ### Added
 - **One-shot vision routing** (`dropProcessedImages`, default on): the image-fallback reroute now
   keys on the **current turn** (an image after the last assistant reply), not the whole
