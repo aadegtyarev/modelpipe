@@ -9,11 +9,12 @@
     "strategy": "OPTIONAL \"failover\" (default) | \"round-robin\" — only with accounts. failover drains account #1 then #2 on a limit; round-robin spreads requests to stretch total quota.",
     "forImages": "OPTIONAL true on exactly ONE route — the vision fallback target. An image-bearing request rejected with an image-unsupported 400 is rerouted here.",
     "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects; on reroute ONLY body.model is rewritten to this.",
-    "vision": "OPTIONAL boolean, default true. false ⇒ this backend has no vision; an image-bearing request matched here goes STRAIGHT to the forImages target."
+    "vision": "OPTIONAL boolean, default true. false ⇒ this backend has no vision; a CURRENT-TURN image matched here goes STRAIGHT to the forImages target, and an already-answered (historical) image is stripped to a text placeholder so this backend can still serve the turn (see dropProcessedImages)."
   },
   "_config_shape": {
     "listen": "OPTIONAL { host, port } — default 127.0.0.1:8787",
     "dashboard": "OPTIONAL boolean, default false — enables /dashboard, /v1/stats, /v1/profiles, and per-model usage tracking. Live state (the active profile pin/offset) persists under ~/.modelpipe/ across restarts.",
+    "dropProcessedImages": "OPTIONAL boolean, default true — strip an already-answered (historical) image to a text placeholder before a non-vision backend sees it, so a lingering image no longer pins every follow-up turn to the vision target. false ⇒ legacy behaviour (any image in the transcript → forImages target).",
     "tokenPrices": "OPTIONAL object { modelGlob: { input, output, cacheRead? } } — per-model metered API prices in $ per 1M tokens; keys may use * globs; falls back to the built-in catalog. Editable at runtime and persisted.",
     "profiles": "REQUIRED (for routing profiles) object { name: { bind: { aliasGlob: targetModelId } } } — each profile is a NAMED SNAPSHOT of alias→target bindings ('which model goes where'). A client sends a stable alias (e.g. glm-5.2); the ACTIVE profile rewrites it to a concrete target BEFORE route matching. An empty bind = no rewrite (every alias routes to its own backend). First matching alias glob wins. See _profiles_doc and docs/profiles.md.",
     "defaultProfile": "OPTIONAL string — the base profile when nothing else selects; defaults to auto.steps[0].profile.",

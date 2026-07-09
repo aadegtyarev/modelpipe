@@ -39,6 +39,7 @@ A shell `export` or a systemd `EnvironmentFile` still wins over it. Copy
 | `listen` | `{host, port}` | `127.0.0.1:8787` | Bind address and port. |
 | `maxBodyBytes` | number | `26214400` (25 MB) | Request body size cap; 413 if exceeded. |
 | `dashboard` | boolean | `false` | Enable the monitoring [dashboard](dashboard.md), stats, and management endpoints. |
+| `dropProcessedImages` | boolean | `true` | Strip an already-answered (historical) image to a text placeholder before a non-vision backend sees it, so a lingering image no longer pins every follow-up turn to the vision target. `false` restores the legacy behaviour (any image → vision target). See [Vision routing](#vision-routing). |
 | `tokenPrices` | `{modelGlob: {input, output}}` | — | Per-model **metered** API price overrides ($ per 1M tokens); `*` globs allowed. Editable at runtime (⚙) and persisted. |
 | `profiles` | `{name: {bind}}` | — | Named alias→target [routing profiles](profiles.md). The active profile rewrites the incoming model id before route matching. |
 | `auto` | `{steps, recover?, schedules?}` | — | The automatic profile chain (best→fallback), error conditions, and schedule windows. See [profiles](profiles.md). |
@@ -87,7 +88,7 @@ A shell `export` or a systemd `EnvironmentFile` still wins over it. Copy
 
 ## Vision routing
 
-A model-bearing turn can carry an image. modelpipe handles three cases:
+A model-bearing turn can carry an image. modelpipe handles these cases:
 
 - **Reactive 400 fallback** — a backend that rejects an image with an image-unsupported `400`
   gets the same request rerouted to the `forImages: true` route. Any other 400 is relayed as-is.
@@ -96,6 +97,16 @@ A model-bearing turn can carry an image. modelpipe handles three cases:
 - **`vision: false` pre-route** — for a backend that *doesn't* 400 on images (soft-200 refusal
   or a server-side image tool): image requests matched by it go **straight** to the `forImages`
   target. Text-only turns route normally.
+
+**Current turn vs history (one-shot vision).** The reroute above triggers only when the image
+is in the **current turn** (after the last assistant reply), not anywhere in the transcript.
+Once the model has answered an image, follow-up turns are no longer forced to the vision model.
+The historical image — dead weight to a non-vision backend, which can't read it — is stripped to
+a `[image omitted]` text placeholder before that backend sees it (`dropProcessedImages`, default
+on; the reroute crossing to a vision backend is unaffected, and a vision-capable backend keeps
+its images). This fixes the failure where one image in the transcript pinned every later turn to
+the vision model for the life of the image. Set `dropProcessedImages: false` to restore the
+legacy behaviour, where **any** image in the transcript pre-routes to the vision target.
 
 ## Inspecting a config — `--list`
 

@@ -92,6 +92,21 @@ async function run() {
   check("SSE tracker extracts output_tokens", rec[0].outputTokens, 45);
   check("SSE tracker tags status 200", rec[0].status, 200);
 
+  // ── message_delta usage.output_tokens is CUMULATIVE — take the latest, never sum ─────
+  // A provider that emits multiple message_delta events (each repeating the running total)
+  // must not be summed, or output is over-counted many-fold. Also ignore the input_tokens
+  // some providers (e.g. DeepSeek) repeat on message_delta — input is counted at message_start.
+  const recCum = [];
+  const trCum = createUsageTracker({ record: (e) => recCum.push(e) }, { providerId: "deepseek", model: "deepseek-chat", startTime: Date.now() });
+  const drainedCum = drain(trCum);
+  trCum.write('event: message_start\ndata: {"message":{"usage":{"input_tokens":18}}}\n\n');
+  trCum.write('event: message_delta\ndata: {"usage":{"input_tokens":18,"output_tokens":100}}\n\n');
+  trCum.write('event: message_delta\ndata: {"usage":{"input_tokens":18,"output_tokens":260}}\n\n');
+  trCum.end();
+  await drainedCum;
+  check("cumulative message_delta: output is the latest total, not the sum", recCum[0].outputTokens, 260);
+  check("cumulative message_delta: repeated input_tokens on delta not double-counted", recCum[0].inputTokens, 18);
+
   // ── request trace: client alias, routed model, provider-returned model ──────────
   const recT = [];
   const trT = createUsageTracker({ record: (e) => recT.push(e) }, { providerId: "anthropic", model: "claude-sonnet-5", clientModel: "glm-5.2", startTime: Date.now() });

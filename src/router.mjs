@@ -222,6 +222,63 @@ export function bodyHasImageBlock(body) {
   }
 }
 
+// True when the CURRENT turn carries an image — an image block in a message AFTER the
+// last `assistant` reply (or anywhere, on the first turn before any assistant message).
+// This is what decides a vision reroute: an image the model has NOT yet answered needs a
+// vision backend, whereas an image buried in earlier history has already been "processed"
+// (see stripImageBlocks). Distinct from bodyHasImageBlock, which is true for an image
+// ANYWHERE — the whole-history scan that made the reroute sticky for the life of the image.
+// Fail-safe to false on any parse miss.
+export function currentTurnHasImage(body) {
+  if (!body || body.length === 0) return false;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    if (!Array.isArray(parsed.messages)) return false;
+    let lastAssistant = -1;
+    for (let i = 0; i < parsed.messages.length; i++) {
+      if (parsed.messages[i] && parsed.messages[i].role === "assistant") lastAssistant = i;
+    }
+    for (let i = lastAssistant + 1; i < parsed.messages.length; i++) {
+      const content = parsed.messages[i] && parsed.messages[i].content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (block && block.type === "image") return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// Replace every image content block with a short text placeholder, returning a NEW Buffer
+// (the original is never mutated); returns the body UNCHANGED when there is nothing to strip
+// or on any parse miss. This is the second scoped exception to passthrough (alongside
+// rewriteModelInBody), applied ONLY when dispatching to a backend that cannot see images
+// (a `vision: false` route, or one learned non-vision): the image bytes are useless to that
+// backend, and leaving them in would force every follow-up turn onto the vision target for
+// the whole life of the image. Only reached for HISTORICAL images (a current-turn image
+// pre-routes to the vision backend before this runs), so the model has already answered them.
+export function stripImageBlocks(body) {
+  if (!body || body.length === 0) return body;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    if (!Array.isArray(parsed.messages)) return body;
+    let stripped = 0;
+    for (const msg of parsed.messages) {
+      if (!msg || !Array.isArray(msg.content)) continue;
+      msg.content = msg.content.map((block) => {
+        if (block && block.type === "image") { stripped++; return { type: "text", text: "[image omitted]" }; }
+        return block;
+      });
+    }
+    if (stripped === 0) return body;
+    return Buffer.from(JSON.stringify(parsed), "utf8");
+  } catch {
+    return body;
+  }
+}
+
 // True only for the SPECIFIC image-unsupported 400 signal: status 400 AND the JSON
 // error message mentions an image together with a support/block word (e.g. a backend's
 // "does not support image blocks"). Deliberately narrow — an ambiguous 400 (e.g.
@@ -516,6 +573,13 @@ export function validateConfig(config) {
   // and serves /v1/stats, /v1/quotas, and /dashboard endpoints.
   if (config.dashboard !== undefined && config.dashboard !== true && config.dashboard !== false) {
     throw new Error("config.dashboard: must be a boolean (default false) when present");
+  }
+  // dropProcessedImages: optional boolean (default true). When true, an image that has
+  // already been answered (not in the current turn) is stripped to a text placeholder before
+  // a non-vision backend sees it, so a historical image no longer pins every follow-up turn
+  // to the vision target. Set false to keep the old behaviour (any image → vision target).
+  if (config.dropProcessedImages !== undefined && config.dropProcessedImages !== true && config.dropProcessedImages !== false) {
+    throw new Error("config.dropProcessedImages: must be a boolean (default true) when present");
   }
   // tokenPrices: optional per-model API price overrides ($ per 1M tokens).
   // E.g. { "claude-opus-*": { input: 15, output: 75 }, "glm-5.2": { input: 1.2, output: 4.0, cacheRead: 0.26 } }.
@@ -1455,28 +1519,44 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
 
   const visionRoute = pickVisionRoute(config.routes);
 
+  // A route is "known non-vision" when it is DECLARED (`vision: false`) or LEARNED (cached
+  // from a prior 400-image on this model) to lack vision — and is not itself the vision
+  // target. Such a backend cannot process an image at all: a current-turn image must go to
+  // the vision target, and a historical image is dead weight to strip (see below).
+  const knownNonVision =
+    route !== visionRoute &&
+    (route.vision === false || (model && nonVisionCache.has(model)));
+
+  // One-shot vision (default) vs legacy sticky vision (config.dropProcessedImages === false).
+  const stripProcessed = config.dropProcessedImages !== false;
+
+  // Strip already-processed (historical) images before a non-vision backend ever sees them.
+  // Only reached when the CURRENT turn has no image (a current-turn image pre-routes to vision
+  // just below), so every image left in the body is historical — the model has already
+  // answered it, and the backend can't read it anyway. Without this, one image in the
+  // transcript would pin every later turn to the vision target for the life of the image.
+  if (stripProcessed && knownNonVision && bodyHasImageBlock(body) && !currentTurnHasImage(body)) {
+    const before = body.length;
+    body = stripImageBlocks(body);
+    if (body.length !== before) log(`vision: stripped processed image(s) from "${model}" history (non-vision backend)`);
+  }
+
   // Build the base ctx for makeResponseHandler — the shared context threaded through every
   // hop (vision reroute, profile failover reroute, account rotation). providerId/account/route
-  // are set per hop by dispatch().
+  // are set per hop by dispatch(). body is the (possibly image-stripped) buffer every hop carries.
   const baseCtx = { res, req, body, log, model, clientModel, client, learnedWindows, visionRoute, nonVisionCache, isVisionTarget: route === visionRoute, statsCtx, config, profileState, profileEffIndex, profileProbe, accountPools, limiter, failoverHopCount: 0 };
 
-  // Pre-route an image-bearing request straight to the vision target, skipping the
-  // non-vision backend call, when the matched route is known non-vision — EITHER:
-  //   • DECLARED non-vision (`vision: false` on the route) — proactive, reliable. Needed
-  //     because a backend that lacks vision does NOT always 400: it may soft-refuse with a
-  //     200 ("I can't see images") or invoke its own server-side image tool, neither of
-  //     which the reactive catch-400 path (makeResponseHandler) can detect. The flag is
-  //     the config-driven escape from wire-detection's blind spots.
-  //   • LEARNED non-vision (cached from a prior 400-image on this model) — the reactive
-  //     optimisation that skips a repeat known-failing first call.
-  // The catch-400 fallback in makeResponseHandler stays for the default (vision unset/true)
-  // route — belt-and-suspenders for a backend that DOES 400.
-  if (
-    visionRoute &&
-    route !== visionRoute &&
-    bodyHasImageBlock(body) &&
-    (route.vision === false || (model && nonVisionCache.has(model)))
-  ) {
+  // Pre-route an image straight to the vision target, skipping the non-vision backend call,
+  // when the matched route is known non-vision. The trigger differs by mode: a CURRENT-TURN
+  // image (default) — so the reroute is one image, not sticky; once answered, follow-up turns
+  // fall through to the native backend with the image stripped above — OR ANY image (legacy
+  // mode, dropProcessedImages:false). Needed because a backend that lacks vision does NOT
+  // always 400 — it may soft-refuse with a 200 or invoke its own server-side image tool,
+  // neither of which the reactive catch-400 path (makeResponseHandler) can detect. That
+  // reactive fallback stays for the default (vision unset/true) route — belt-and-suspenders
+  // for a backend that DOES 400.
+  const needsVision = stripProcessed ? currentTurnHasImage(body) : bodyHasImageBlock(body);
+  if (visionRoute && knownNonVision && needsVision) {
     const visionBody = rewriteModelInBody(body, visionRoute.forImagesModel);
     dispatch(visionRoute, visionBody, baseCtx, { model: visionRoute.forImagesModel, isVisionTarget: true });
     return;

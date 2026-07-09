@@ -37,6 +37,8 @@ const {
   resolveAuthHeader,
   isPassthrough,
   bodyHasImageBlock,
+  currentTurnHasImage,
+  stripImageBlocks,
   isImageUnsupported400,
   isFailoverTrigger,
   pickVisionRoute,
@@ -342,6 +344,39 @@ async function main() {
     bodyHasImageBlock(Buffer.from('{"model":"m","messages":[{"role":"user","content":"hi"}]}')), false);
   check("bodyHasImageBlock false for bad json", bodyHasImageBlock(Buffer.from("not json")), false);
   check("bodyHasImageBlock false for empty", bodyHasImageBlock(Buffer.from("")), false);
+
+  // currentTurnHasImage: true only for an image AFTER the last assistant reply (or on the
+  // first turn), so a historical image the model already answered is NOT a current-turn image.
+  const curTurnImg = Buffer.from(JSON.stringify({ model: "m", messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "A" } }, { type: "text", text: "look" }] },
+  ] }));
+  check("currentTurnHasImage true on the first turn", currentTurnHasImage(curTurnImg), true);
+  const historicalImg = Buffer.from(JSON.stringify({ model: "m", messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "A" } }] },
+    { role: "assistant", content: [{ type: "text", text: "I see a cat" }] },
+    { role: "user", content: [{ type: "text", text: "and now?" }] },
+  ] }));
+  check("currentTurnHasImage false when the image precedes the last assistant reply", currentTurnHasImage(historicalImg), false);
+  check("bodyHasImageBlock still true for that historical image", bodyHasImageBlock(historicalImg), true);
+  const newImgAfterReply = Buffer.from(JSON.stringify({ model: "m", messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "A" } }] },
+    { role: "assistant", content: [{ type: "text", text: "I see a cat" }] },
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "B" } }, { type: "text", text: "and this?" }] },
+  ] }));
+  check("currentTurnHasImage true for a fresh image after the last reply", currentTurnHasImage(newImgAfterReply), true);
+  check("currentTurnHasImage false for bad json", currentTurnHasImage(Buffer.from("not json")), false);
+
+  // stripImageBlocks: replaces image blocks with a text placeholder, preserves other blocks,
+  // returns a new buffer only when something changed, fail-safe on bad json.
+  const strippedBuf = stripImageBlocks(historicalImg);
+  const strippedParsed = JSON.parse(strippedBuf.toString());
+  check("stripImageBlocks replaces the image block with a text placeholder", strippedParsed.messages[0].content[0].type, "text");
+  check("stripImageBlocks placeholder text is the omitted marker", strippedParsed.messages[0].content[0].text, "[image omitted]");
+  check("stripImageBlocks leaves text turns untouched", strippedParsed.messages[2].content[0].text, "and now?");
+  check("stripImageBlocks preserves the model id", strippedParsed.model, "m");
+  const textOnly = Buffer.from('{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}');
+  check("stripImageBlocks returns the SAME buffer when there is nothing to strip", stripImageBlocks(textOnly), textOnly);
+  check("stripImageBlocks returns body unchanged for bad json (fail-safe)", stripImageBlocks(Buffer.from("not json")).toString(), "not json");
 
   const imageErr = Buffer.from('{"error":{"message":"this model does not support image blocks"}}');
   check("isImageUnsupported400 matches the image-unsupported signal", isImageUnsupported400(400, imageErr), true);
@@ -794,6 +829,26 @@ async function main() {
   const noVisionRouter = createRouter(noVisionConfig);
   const noVisionPort = await listen(noVisionRouter);
 
+  // A legacy router: dropProcessedImages:false ⇒ ANY image (even historical) pre-routes to
+  // the vision target, the old sticky behaviour.
+  const legacyVisionConfig = { ...visionConfig, dropProcessedImages: false };
+  const legacyRouter = createRouter(legacyVisionConfig);
+  const legacyPort = await listen(legacyRouter);
+
+  // A multi-turn request whose image sits in HISTORY (before the last assistant reply),
+  // with a text-only current turn — the "already processed" case.
+  const historyImageReq = (model) => ({
+    model,
+    messages: [
+      { role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "IMG-DATA-SENTINEL" } },
+        { type: "text", text: "VISION-BODY-SENTINEL" },
+      ] },
+      { role: "assistant", content: [{ type: "text", text: "seen it" }] },
+      { role: "user", content: [{ type: "text", text: "follow-up question" }] },
+    ],
+  });
+
   try {
     // V1. image request → route A 400-image → rerouted to B → client gets B's 200.
     aStub.setMode("reject");
@@ -879,6 +934,58 @@ async function main() {
     check("V8 declared-non-vision text: B NOT touched", bStub.received.length, bBefore8);
     check("V8 declared-non-vision text: client gets A's 200", v8.status, 200);
 
+    // V9. one-shot vision: an image in HISTORY (already answered) + a text current turn on a
+    //     vision:false route → NOT pre-routed to B; served natively by A with the historical
+    //     image stripped to a placeholder (default dropProcessedImages). Fixes the "stuck on
+    //     the vision model" bug where a lingering image pinned every follow-up turn to vision.
+    aStub.setMode("ok");
+    const aBefore9 = aStub.received.length;
+    const bBefore9 = bStub.received.length;
+    const v9 = await request(vPort, historyImageReq("declared-hist"));
+    check("V9 one-shot: A served the follow-up (no pre-route to vision)", aStub.received.length, aBefore9 + 1);
+    check("V9 one-shot: B was NOT touched", bStub.received.length, bBefore9);
+    check("V9 one-shot: client gets A's 200", v9.status, 200);
+    const v9body = JSON.parse(aStub.received[aStub.received.length - 1].body);
+    check("V9 one-shot: the historical image was stripped to a placeholder", v9body.messages[0].content[0].type, "text");
+    check("V9 one-shot: placeholder is the omitted marker", v9body.messages[0].content[0].text, "[image omitted]");
+    check("V9 one-shot: image bytes never reached A", aStub.received[aStub.received.length - 1].body.includes("IMG-DATA-SENTINEL"), false);
+    check("V9 one-shot: the text current turn is preserved", v9body.messages[2].content[0].text, "follow-up question");
+
+    // V10. one-shot vision, fresh image: an image in the CURRENT turn (after the last reply)
+    //      still pre-routes to the vision target B — the model has not answered THIS image yet.
+    aStub.setMode("reject"); // would 400 if A were hit
+    const aBefore10 = aStub.received.length;
+    const bBefore10 = bStub.received.length;
+    bStub.setMode("ok");
+    const freshImageReq = {
+      model: "declared-fresh",
+      messages: [
+        { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "OLD" } }] },
+        { role: "assistant", content: [{ type: "text", text: "seen it" }] },
+        { role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "IMG-DATA-SENTINEL" } },
+          { type: "text", text: "and this one?" },
+        ] },
+      ],
+    };
+    const v10 = await request(vPort, freshImageReq);
+    check("V10 fresh-image: A was NOT hit (current-turn image pre-routes)", aStub.received.length, aBefore10);
+    check("V10 fresh-image: B served it directly", bStub.received.length, bBefore10 + 1);
+    check("V10 fresh-image: B got the rewritten model id", JSON.parse(bStub.received[bStub.received.length - 1].body).model, "vendor/vision-model");
+    check("V10 fresh-image: client gets B's 200", v10.status, 200);
+
+    // V11. legacy sticky vision (dropProcessedImages:false): a HISTORICAL image still pre-routes
+    //      to the vision target B, and the image bytes reach B unaltered (no stripping).
+    aStub.setMode("reject"); // would 400 if A were hit
+    bStub.setMode("ok");
+    const aBefore11 = aStub.received.length;
+    const bBefore11 = bStub.received.length;
+    const v11 = await request(legacyPort, historyImageReq("declared-legacy"));
+    check("V11 legacy: A was NOT hit (any image pre-routes)", aStub.received.length, aBefore11);
+    check("V11 legacy: B served it directly", bStub.received.length, bBefore11 + 1);
+    check("V11 legacy: image bytes reached B unaltered (not stripped)", JSON.parse(bStub.received[bStub.received.length - 1].body).messages[0].content[0].source.data, "IMG-DATA-SENTINEL");
+    check("V11 legacy: client gets B's 200", v11.status, 200);
+
     // log safety across every vision case: no key, no body sentinel, no image bytes.
     const vLogText = vLogCapture.join("");
     check("V-log: leaks NO backend key", vLogText.includes("VIS-SECRET-789"), false);
@@ -892,6 +999,7 @@ async function main() {
     delete process.env.MODEL_ROUTER_LOG;
     await close(vRouter);
     await close(noVisionRouter);
+    await close(legacyRouter);
     await close(aStub.server);
     await close(bStub.server);
   }
