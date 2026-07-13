@@ -9,7 +9,8 @@
     "strategy": "OPTIONAL \"failover\" (default) | \"round-robin\" — only with accounts. failover drains account #1 then #2 on a limit; round-robin spreads requests to stretch total quota.",
     "forImages": "OPTIONAL true on exactly ONE route — the vision fallback target. An image-bearing request rejected with an image-unsupported 400 is rerouted here.",
     "forImagesModel": "REQUIRED on the forImages route — the model id the vision backend expects; on reroute ONLY body.model is rewritten to this.",
-    "vision": "OPTIONAL boolean, default true. false ⇒ this backend has no vision; a CURRENT-TURN image matched here goes STRAIGHT to the forImages target, and an already-answered (historical) image is stripped to a text placeholder so this backend can still serve the turn (see dropProcessedImages)."
+    "vision": "OPTIONAL boolean, default true. false ⇒ this backend has no vision; a CURRENT-TURN image matched here goes STRAIGHT to the forImages target, and an already-answered (historical) image is stripped to a text placeholder so this backend can still serve the turn (see dropProcessedImages).",
+    "stripThinking": "OPTIONAL boolean, default false. Drop every `thinking`/`redacted_thinking` block from the request's message history before forwarding to THIS backend. Set it on a signature-VALIDATING backend (real Anthropic) that receives transcripts carrying thinking blocks minted elsewhere — after a cross-provider model rewrite, or a z.ai/GLM Anthropic-shim reply replayed here — which it rejects with `400 invalid_request_error: Invalid \\`signature\\` in \\`thinking\\` block`. The signature can't be repaired (the API rejects a MODIFIED block too), so the whole block is dropped; the target loses that turn's reasoning trace but the request goes through. A turn whose ONLY content is a thinking block is kept intact (never produces empty content)."
   },
   "_config_shape": {
     "listen": "OPTIONAL { host, port } — default 127.0.0.1:8787",

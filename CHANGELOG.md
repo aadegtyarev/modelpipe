@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-14
+
+### Added
+- **`stripThinking` route option — signature-safe cross-provider routing.** A signature-validating
+  backend (real Anthropic) rejects the WHOLE request with `400 invalid_request_error: Invalid
+  \`signature\` in \`thinking\` block` when the transcript carries an extended-thinking block whose
+  signature it can't verify — e.g. one minted by a different provider's Anthropic-shim (z.ai/GLM,
+  whose thinking blocks carry signatures that aren't real Anthropic signatures) and replayed here
+  after a model rewrite, or a block carried across a cross-provider profile hop. The signature
+  can't be repaired — the Messages API rejects a *modified* thinking block just as it does an
+  invalid one, and stripping only the `signature` field turns "invalid" into "missing" — so the
+  only edit the API accepts is dropping the whole block. Set `"stripThinking": true` on the route
+  pointing at the strict backend to drop every `thinking`/`redacted_thinking` block from the
+  request's history before forwarding. Opt-in (the target loses that turn's reasoning trace); a
+  turn whose only content is a thinking block is kept intact so the strip never produces an empty
+  content array.
+
+### Fixed
+- **Compressed upstream error bodies were invisible to the classifiers.** Anthropic (and others)
+  can return the `{ error: { message } }` JSON gzip/br-encoded. The reroute path buffered those
+  raw compressed bytes and every classifier (`isContextOverflow`, `isFailoverTrigger`,
+  `isImageUnsupported400`, `errorReason`, …) `JSON.parse`d them, silently failed, and fell through
+  to relay-verbatim — so a compressed "prompt is too long" (context overflow), rate-limit, or
+  image-unsupported error was never caught, never failed over, and showed up on the dashboard as a
+  bare status with no message. The buffered error body is now decompressed once (new
+  `decompressBuffer`) before classification; on success `content-encoding`/`content-length` are
+  dropped so the verbatim relay still sends honest headers. Fail-safe: an undecodable body is left
+  exactly as before.
+
 ## [0.14.3] - 2026-07-13
 
 ### Fixed
