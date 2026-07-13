@@ -349,6 +349,24 @@ export function decompressIfNeeded(upstreamRes) {
   return { stream: upstreamRes, headers: upstreamRes.headers, decompressed: false };
 }
 
+// Synchronously decompress an ALREADY-buffered body per its Content-Encoding. The
+// streaming decompressIfNeeded can't be used once a response has been read fully into a
+// buffer (the reroute/classify path buffers a small error body). Returns the decoded
+// Buffer, or the input unchanged when uncompressed / on any decode failure (fail-safe:
+// a classifier that can't parse the bytes just falls through to relay-verbatim, exactly
+// as before this helper existed). `contentEncoding` is the raw header value.
+export function decompressBuffer(buf, contentEncoding) {
+  const ce = (contentEncoding || "").toLowerCase();
+  if (!buf || buf.length === 0) return buf;
+  try {
+    if (ce.includes("br")) return zlib.brotliDecompressSync(buf);
+    if (ce.includes("gzip") || ce.includes("deflate")) return zlib.unzipSync(buf);
+  } catch {
+    return buf;
+  }
+  return buf;
+}
+
 // An SSE stream has its tokens extracted incrementally (from `buffer`), so we never hold
 // it in full — that is the module's zero-buffer promise. Only a NON-streaming JSON reply
 // needs the whole body (its usage is one top-level object the flush fallback parses), so

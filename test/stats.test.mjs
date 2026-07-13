@@ -10,7 +10,8 @@ import path from "node:path";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "modelpipe-stats-test-"));
 process.env.MODELPIPE_DIR = TMP;
 
-const { StatsCollector, modelPrice, providerIdFromUrl, createUsageTracker, decompressIfNeeded } =
+import zlib from "node:zlib";
+const { StatsCollector, modelPrice, providerIdFromUrl, createUsageTracker, decompressIfNeeded, decompressBuffer } =
   await import("../src/stats.mjs");
 
 let pass = 0;
@@ -39,6 +40,21 @@ async function run() {
   check("providerId openrouter", providerIdFromUrl("https://openrouter.ai/api"), "openrouter");
   check("providerId falls back to host", providerIdFromUrl("https://example.com/x"), "example.com");
   check("providerId bad url ⇒ unknown", providerIdFromUrl("not a url"), "unknown");
+
+  // ── decompressBuffer (sync, for already-buffered error bodies) ─────────────────
+  const errJson = '{"type":"error","error":{"message":"prompt is too long"}}';
+  check("decompressBuffer gzip round-trips",
+    decompressBuffer(zlib.gzipSync(Buffer.from(errJson)), "gzip").toString(), errJson);
+  check("decompressBuffer deflate round-trips",
+    decompressBuffer(zlib.deflateSync(Buffer.from(errJson)), "deflate").toString(), errJson);
+  check("decompressBuffer br round-trips",
+    decompressBuffer(zlib.brotliCompressSync(Buffer.from(errJson)), "br").toString(), errJson);
+  check("decompressBuffer no encoding ⇒ same reference",
+    (() => { const b = Buffer.from(errJson); return decompressBuffer(b, "") === b; })(), true);
+  check("decompressBuffer bad bytes for encoding ⇒ same reference (fail-safe)",
+    (() => { const b = Buffer.from("not gzip"); return decompressBuffer(b, "gzip") === b; })(), true);
+  check("decompressBuffer empty ⇒ unchanged",
+    (() => { const b = Buffer.alloc(0); return decompressBuffer(b, "gzip") === b; })(), true);
 
   // ── record + snapshot ─────────────────────────────────────────────────────────
   const sc = new StatsCollector();

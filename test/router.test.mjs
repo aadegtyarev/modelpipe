@@ -34,6 +34,7 @@ const {
   clientLabel,
   modelFromBody,
   rewriteModelInBody,
+  stripThinkingBlocks,
   resolveAuthHeader,
   isPassthrough,
   bodyHasImageBlock,
@@ -290,6 +291,44 @@ async function main() {
     rewriteModelInBody(Buffer.from('{"model":"glm-x"}'), "").toString(), '{"model":"glm-x"}');
   check("rewriteModelInBody bad json ⇒ body unchanged (fail-safe)",
     rewriteModelInBody(Buffer.from("not json"), "vendor/m").toString(), "not json");
+
+  // stripThinkingBlocks — drop thinking/redacted_thinking from history so a signature-validating
+  // backend doesn't 400 on a foreign/cross-provider thinking-block signature.
+  {
+    const withThinking = Buffer.from(JSON.stringify({
+      model: "claude-opus-4-8",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "hi" }] },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "hmm", signature: "sig-from-glm" },
+          { type: "text", text: "hello" },
+        ] },
+      ],
+    }));
+    const stripped = JSON.parse(stripThinkingBlocks(withThinking).toString());
+    check("stripThinkingBlocks removes the thinking block",
+      stripped.messages[1].content.length, 1);
+    check("stripThinkingBlocks keeps the text block",
+      stripped.messages[1].content[0].type, "text");
+    check("stripThinkingBlocks leaves the user turn untouched",
+      stripped.messages[0].content[0].text, "hi");
+  }
+  check("stripThinkingBlocks redacted_thinking also dropped",
+    JSON.parse(stripThinkingBlocks(Buffer.from(JSON.stringify({
+      messages: [{ role: "assistant", content: [
+        { type: "redacted_thinking", data: "x" }, { type: "text", text: "y" },
+      ] }],
+    }))).toString()).messages[0].content.length, 1);
+  check("stripThinkingBlocks no thinking ⇒ same buffer reference (no re-serialize)",
+    (() => { const b = Buffer.from('{"messages":[{"role":"user","content":[{"type":"text","text":"a"}]}]}'); return stripThinkingBlocks(b) === b; })(), true);
+  check("stripThinkingBlocks thinking-only turn is KEPT (never empties content)",
+    JSON.parse(stripThinkingBlocks(Buffer.from(JSON.stringify({
+      messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s" }] }],
+    }))).toString()).messages[0].content.length, 1);
+  check("stripThinkingBlocks bad json ⇒ body unchanged (fail-safe)",
+    stripThinkingBlocks(Buffer.from("not json")).toString(), "not json");
+  check("stripThinkingBlocks no messages array ⇒ unchanged",
+    stripThinkingBlocks(Buffer.from('{"model":"x"}')).toString(), '{"model":"x"}');
 
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },

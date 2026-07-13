@@ -48,7 +48,7 @@ import { fileURLToPath } from "node:url";
 import {
   StatsCollector, QuotaPoller, DASHBOARD_HTML,
   createUsageTracker, providerIdFromUrl,
-  decompressIfNeeded,
+  decompressIfNeeded, decompressBuffer,
 } from "./stats.mjs";
 import { readJson, writeJson, OVERRIDES_FILE } from "./store.mjs";
 import {
@@ -205,6 +205,46 @@ export function rewriteModelInBody(body, newModel) {
   } catch {
     return body;
   }
+}
+
+// Drop every `thinking` / `redacted_thinking` block from the request's message history.
+// WHY: a strict, signature-validating backend (real Anthropic) rejects the WHOLE request with a
+// 400 "Invalid `signature` in `thinking` block" when the transcript carries a thinking block whose
+// signature it can't verify — e.g. one minted by a different provider's Anthropic-shim (z.ai/GLM,
+// which returns thinking blocks with signatures that aren't real Anthropic signatures) and then
+// replayed here after a model rewrite, or a block carried across a cross-provider profile hop. The
+// signature can't be repaired: the Messages API rejects a MODIFIED thinking block just as it does an
+// invalid one, and stripping only the `signature` field turns "invalid" into "missing". Omitting the
+// whole block is the one edit the API accepts. Trade-off: the target model loses the prior reasoning
+// trace for those turns — acceptable for a cross-provider router whose point is free model routing,
+// which is exactly why this is OPT-IN per route (route.stripThinking) rather than always-on.
+// A block whose removal would leave an assistant turn with EMPTY content is kept, so the strip never
+// produces an invalid empty-content message. Fail-safe: returns the body unchanged on any parse miss
+// or when nothing was stripped (no re-serialization). Pure — never throws.
+export function stripThinkingBlocks(body) {
+  if (!body || body.length === 0) return body;
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return body;
+  }
+  if (!Array.isArray(parsed.messages)) return body;
+  let changed = false;
+  for (const msg of parsed.messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const filtered = msg.content.filter(
+      (b) => !(b && (b.type === "thinking" || b.type === "redacted_thinking")),
+    );
+    // Only apply if something was removed AND the turn keeps at least one block — dropping a
+    // turn's last block would make an empty content array, itself a 400.
+    if (filtered.length !== msg.content.length && filtered.length > 0) {
+      msg.content = filtered;
+      changed = true;
+    }
+  }
+  if (!changed) return body;
+  return Buffer.from(JSON.stringify(parsed), "utf8");
 }
 
 // True when the request body carries an image content block — the Messages API
@@ -1403,6 +1443,25 @@ function makeResponseHandler(ctx) {
         return;
       }
 
+      // Decompress the error body for classification. Anthropic (and others) can return the
+      // { error: { message } } JSON gzip/br-encoded; the classifiers below JSON.parse the raw
+      // bytes and silently fail on compressed input — so an overflow/rate-limit/image-unsupported
+      // error would be relayed verbatim instead of being caught. Decode once here; on success also
+      // drop content-encoding/content-length so the verbatim relay sends the (now plain) bytes with
+      // honest headers. On any decode failure decompressBuffer returns the input unchanged and we
+      // leave headers alone — identical to the pre-decode behaviour.
+      if (headers) {
+        const enc = headers["content-encoding"];
+        if (enc) {
+          const decoded = decompressBuffer(buffered, enc);
+          if (decoded !== buffered) {
+            buffered = decoded;
+            delete headers["content-encoding"];
+            delete headers["content-length"];
+          }
+        }
+      }
+
       // 0. CONTEXT-OVERFLOW SAFETY NET: the backend rejected the request as too long for its
       //    window — our proactive downshift-fit under-estimated, or the model's real window is
       //    smaller than configured. Learn the real ceiling (from the error message when it
@@ -1756,6 +1815,15 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
   if (!route) {
     sendError(res, 400, model ? `no route for model "${model}"` : "request has no routable model");
     return;
+  }
+
+  // Signature-safe cross-provider routing: drop thinking blocks the target would reject (see
+  // stripThinkingBlocks). Opt-in per route — set on a signature-validating backend (real
+  // Anthropic) that receives transcripts carrying thinking minted elsewhere.
+  if (route.stripThinking) {
+    const before = body.length;
+    body = stripThinkingBlocks(body);
+    if (body.length !== before) log(`stripThinking: dropped thinking block(s) from "${model}" history -> ${route.base_url}`);
   }
 
   const visionRoute = pickVisionRoute(config.routes);

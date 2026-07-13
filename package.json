@@ -1,6 +1,6 @@
 {
   "name": "modelpipe",
-  "version": "0.14.3",
+  "version": "0.15.0",
   "description": "Passthrough Anthropic-format model router: route any model-bearing call from an Anthropic-format client to a chosen backend. No translator.",
   "type": "module",
   "bin": {
