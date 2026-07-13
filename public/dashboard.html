@@ -246,6 +246,13 @@ const CONSOLE={
   openrouter:"https://openrouter.ai/settings/credits",
 };
 const colors={};
+// Next unused palette slot — PERSISTENT across drawChart() calls, like `colors` itself. Must
+// NOT be a per-call local: a model whose bins are empty in one render (so it's absent from that
+// call's `series`) doesn't get its cached color re-touched, but a NEW model appearing that same
+// render would start counting from 0 again with a local counter — handing out an already-claimed
+// COLORS[0] a second time (two models sharing a color) purely because of which requests happened
+// to fall in this particular window.
+let colorIdx=0;
 
 // ── Context compaction ───────────────────────────────────────────────────────
 let compactWindow={};                // editable mirror of compact.window (glob → tokens)
@@ -847,7 +854,12 @@ function render(stats,quotas,cfg){
   const tl=stats.timeline||[];
   for(let i=tl.length-1;i>=Math.max(0,tl.length-50);i--){
     const e=tl[i];
-    const pid=(models[e.model]||{}).providerId;
+    // Use THIS row's own providerId, not models[e.model].providerId — the per-model aggregate
+    // is set ONCE from the first request ever recorded for that model id and never updated, so
+    // it goes stale the moment a pooled route's account rotates (every later row for the same
+    // model then shows the ORIGINAL account forever, e.g. "primary" long after traffic moved to
+    // "backup"). Each timeline entry already carries the account that actually served IT.
+    const pid=e.providerId;
     const metered=isMetered(pid);
     const timeStr=new Date(e.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
     lhtml+='<div class="row'+(e.status>=400?' er':'')+'">'+
@@ -912,9 +924,9 @@ function drawChart(timeline){
     ctx.fillStyle="#8b949e";ctx.font="11px sans-serif";ctx.textAlign="right";
     ctx.fillText(fmt(Math.round(maxVal*(1-i/ySteps))),pad.l-5,y+4);
   }
-  ctx.lineWidth=2;let ci=0;const legend=[];
+  ctx.lineWidth=2;const legend=[];
   for(const[id,vals]of Object.entries(series)){
-    const color=colors[id]||(colors[id]=COLORS[ci++%COLORS.length]);legend.push({id,color});
+    const color=colors[id]||(colors[id]=COLORS[colorIdx++%COLORS.length]);legend.push({id,color});
     ctx.beginPath();ctx.strokeStyle=color;
     for(let i=0;i<vals.length;i++){const x=pad.l+(pw/(bins-1))*i,y=pad.t+ph-(vals[i]/maxVal*ph);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
     ctx.stroke();

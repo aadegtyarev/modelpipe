@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-07-13
+
+### Fixed
+- **Dashboard trace showed the WRONG account for a pooled route.** The "sent → routed
+  [provider] → returned" row for a model rewound to whichever account happened to serve that
+  model's very FIRST request ever recorded, because the trace read `models[model].providerId` (a
+  per-model aggregate set once and never updated) instead of the row's own `providerId`. Once a
+  pooled route's account rotated (e.g. primary → backup), every later row for that model kept
+  showing the original account forever, even while traffic had long since moved on — looking
+  like the rotation itself was broken when it wasn't. Both the per-model aggregate (`stats.mjs`)
+  and the trace row (`dashboard.html`) now track/read the actual account that served each
+  request.
+- **"Tokens over time" chart could assign two different models the SAME line color.** The
+  palette-index counter that hands out a new color was a per-render local, reset to 0 every
+  redraw; a model already holding a cached color doesn't consume a slot on a later render, so a
+  DIFFERENT model appearing for the first time in that render could be handed an already-claimed
+  color. The counter is now persistent across redraws, like the color cache itself.
+
 ## [0.14.2] - 2026-07-13
 
 ### Fixed

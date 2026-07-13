@@ -147,6 +147,12 @@ export class StatsCollector {
       m = { providerId: pid, requests: 0, errors: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, lastRequestAt: 0 };
       this.#models.set(mid, m);
     }
+    // Keep this pointed at whichever account most recently served the model — a pooled route
+    // rotates providerId (account label) across requests for the SAME model id, and this field
+    // used to be set once from the FIRST request ever recorded and never touched again, so the
+    // model card (and the dashboard's timeline trace, which used to read this field per row
+    // instead of the row's own providerId) kept showing a possibly long-stale account.
+    m.providerId = pid;
     m.requests++;
     if (entry.status >= 400) m.errors++;
     m.inputTokens += entry.inputTokens || 0;

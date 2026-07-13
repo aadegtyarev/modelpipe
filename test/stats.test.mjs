@@ -50,6 +50,16 @@ async function run() {
   check("snapshot computes real cost", Number(snap.session.cost.toFixed(2)), 0.42);
   check("snapshot marks errors", (() => { sc.record({ providerId: "deepseek", model: "deepseek-chat", status: 500 }); return sc.snapshot().models["deepseek-chat"].errors; })(), 1);
 
+  // A pooled route rotates providerId (account label) across requests for the SAME model id —
+  // the per-model aggregate's providerId must track the MOST RECENT account, not freeze on the
+  // first one ever recorded (the dashboard's model card, and formerly its timeline trace too,
+  // read this field — freezing it made a rotated-away-from account look permanently active).
+  const scPool = new StatsCollector();
+  scPool.record({ providerId: "z.ai (primary)", model: "glm-4.7", inputTokens: 10, outputTokens: 10, status: 200 });
+  check("model providerId starts as the first account seen", scPool.snapshot().models["glm-4.7"].providerId, "z.ai (primary)");
+  scPool.record({ providerId: "z.ai (backup)", model: "glm-4.7", inputTokens: 10, outputTokens: 10, status: 200 });
+  check("model providerId tracks the MOST RECENT account, not the first", scPool.snapshot().models["glm-4.7"].providerId, "z.ai (backup)");
+
   // ── cache_read_input_tokens billed at the cheaper cacheRead rate, not the input rate ─
   const scCache = new StatsCollector();
   scCache.record({ providerId: "glm", model: "glm-5.2", inputTokens: 0, cacheReadTokens: 1_000_000, outputTokens: 0, status: 200 });
