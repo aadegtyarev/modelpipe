@@ -359,6 +359,29 @@ export function isRetryWorthy(status, body) {
   return !HARD_EXHAUSTION_RE.test(message);
 }
 
+// Some backends (observed on z.ai) put an explicit reset timestamp in a HARD-exhaustion
+// message ("...limit will reset at 2026-07-16 07:17:46..."). It's the only authoritative
+// signal we have for how long a hard exhaustion actually lasts, so the caller parks the
+// account directly against it (sanity-capped — see MAX_HARD_PARK_MS at the call site — in
+// case of a malformed or absurd timestamp). Returns ms-until-reset (>0) when a timestamp is
+// found and still in the future, else null (caller falls back to the sanity cap).
+export function parseHardExhaustionResetMs(body, nowMs) {
+  let message;
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    message = parsed && parsed.error && parsed.error.message;
+  } catch {
+    return null;
+  }
+  if (typeof message !== "string") return null;
+  const m = /reset\s*(?:at)?\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/i.exec(message);
+  if (!m) return null;
+  const resetMs = Date.parse(`${m[1].replace(" ", "T")}Z`);
+  if (!Number.isFinite(resetMs)) return null;
+  const delta = resetMs - nowMs;
+  return delta > 0 ? delta : null;
+}
+
 // Persist the runtime profile state ({ pinned, offset, shiftedAt, attempts }) under
 // ~/.modelpipe/profile-state.json. Best-effort — never throws. Called after a shift /
 // wind-back / pin change so a restart resumes where it left off.
@@ -1213,10 +1236,55 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
   const ps = ctx.profileState;
   const config = ctx.config;
   const relay = () => {
+    ctx.log(`profile: no further step for ${ctx.model} (status ${status}) — relaying error`);
     recordStat(ctx, status, errorReason(buffered));
     relayBuffered(ctx.res, status, headers, buffered);
   };
-  if (!ps || !config.profiles) { relay(); return; }
+  // The profile ladder (if any) has nothing further to offer this request (no profiles
+  // configured, or — checked again further down — the active profile resolves to the same
+  // failing model). This route's account pool, if any, already declared itself fully exhausted
+  // to get here (see the ACCOUNT ROTATION block in makeResponseHandler). That "no eligible
+  // account" read is a snapshot at ONE hop's failure time; with several concurrent requests in
+  // flight, another hop can park/un-park an account between that snapshot and now. Rather than
+  // relay a raw upstream error while the pool's picture may already be stale, force ONE
+  // last-resort attempt on the least-recently-parked OTHER account, ignoring its cooldown, before
+  // truly giving up. Capped at ONE last-resort hop per client request (ctx.lastResortTried) — a
+  // pool that is genuinely, entirely dead (e.g. both accounts hard-exhausted for real) must not
+  // ping-pong between its accounts hop after hop; it gets exactly one extra roll of the dice,
+  // then relays honestly like before.
+  const giveUpOrLastResort = () => {
+    if (!ctx.lastResortTried && ctx.account && ctx.route && ctx.accountPools) {
+      const pool = ctx.accountPools.get(ctx.route);
+      const now = Date.now();
+      const lastResortIdx = pool ? pickAccountIndex(pool, now, ctx.account.idx) : -1;
+      if (pool && lastResortIdx >= 0 && lastResortIdx !== ctx.account.idx) {
+        const acct = pool.accounts[lastResortIdx];
+        recordStat(ctx, status, errorReason(buffered));
+        ctx.log(`account: ${ctx.model} ${ctx.account.label} -> ${acct.label} (status ${status}, hop ${hop + 1}, last resort — profile has nowhere else to go)`);
+        const effRoute = { ...ctx.route, auth: acct.auth, base_url: acct.base_url || ctx.route.base_url };
+        proxyToRoute(effRoute, ctx.req, ctx.res, ctx.body, ctx.log, {
+          onResponse: makeResponseHandler({
+            ...ctx,
+            providerId: acct.label,
+            account: { idx: lastResortIdx, label: acct.label, lastResort: true },
+            failoverHopCount: hop + 1,
+            lastResortTried: true,
+            profileProbe: null,
+            retryCount: 0,
+            climitCount: 0,
+          }),
+          statsCtx: ctx.statsCtx,
+          providerId: acct.label,
+          limiter: ctx.limiter,
+          concLimit: resolveConcurrencyLimit(ctx.config && ctx.config.concurrency, ctx.model),
+          queueTimeoutMs: queueTimeoutOf(ctx.config),
+        });
+        return;
+      }
+    }
+    relay();
+  };
+  if (!ps || !config.profiles) { giveUpOrLastResort(); return; }
 
   const errorClass = errorClassOf(status);
   if (ps.pinned) {
@@ -1243,8 +1311,8 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
   const targetRoute = targetModel ? pickRoute(targetModel, config.routes) : null;
   if (!targetRoute || targetModel === ctx.model) {
     // Nothing further to try (no route, or the active profile resolves to the same failing
-    // model) — relay the error honestly.
-    relay();
+    // model) — see giveUpOrLastResort above for why this isn't an immediate relay.
+    giveUpOrLastResort();
     return;
   }
   recordStat(ctx, status); // record the original error on the failing tier
@@ -1446,7 +1514,12 @@ function makeResponseHandler(ctx) {
         // failed account for a cooldown and retry the SAME request (same model, no body
         // rewrite) on the next eligible account. Only when the pool has no live account left
         // do we fall through to model-level failover (group/pairs).
-        if (ctx.account && ctx.route && ctx.accountPools) {
+        // ctx.account.lastResort marks a hop that handleProfileFailover already sent back into a
+        // KNOWN-parked account as a last-ditch effort (see giveUpOrLastResort) — if that retry
+        // also fails, re-parking it here would double-count the SAME underlying exhaustion (it
+        // was already parked moments ago); skip straight to model-level failover instead, which
+        // now just relays honestly (giveUpOrLastResort only spends its one shot once per request).
+        if (ctx.account && !ctx.account.lastResort && ctx.route && ctx.accountPools) {
           const pool = ctx.accountPools.get(ctx.route);
           if (pool) {
             const now = Date.now();
@@ -1456,9 +1529,28 @@ function makeResponseHandler(ctx) {
             // it climbs the ladder each repeat park and is reset to 0 the next time the account
             // serves a request cleanly (recovery). Falls back to the flat cooldown when no
             // backoff schedule is configured.
+            //
+            // EXCEPTION — a HARD-classified message (isRetryWorthy false: "weekly/monthly limit
+            // exhausted" and friends) is a GENUINE multi-day block in practice (confirmed: a
+            // backend can quote a reset days out and mean it), so climbing the same short ladder
+            // used for ordinary rate-limit blips would re-probe a dead account every few minutes
+            // for days, burning requests against it for nothing. When the message quotes an
+            // explicit reset time, trust it directly (sanity-capped at MAX_HARD_PARK_MS so one
+            // malformed/absurd timestamp can't park an account forever); otherwise fall back to
+            // that same cap rather than the short ladder. attempts is left untouched here (not
+            // incremented) so a later GENUINE transient hit on this account still starts the
+            // ordinary ladder from its first rung instead of inheriting a count run up by a
+            // multi-day hard block.
             const exhausted = pool.accounts[ctx.account.idx];
-            exhausted.exhaustedUntil = now + recoveryWaitMs(ctx.config, exhausted.attempts || 0);
-            exhausted.attempts = (exhausted.attempts || 0) + 1;
+            const hardHit = !isRetryWorthy(status, buffered);
+            const MAX_HARD_PARK_MS = 3 * 24 * 60 * 60 * 1000; // 3 days — sanity ceiling, not a guess at the real duration
+            if (hardHit) {
+              const quoted = parseHardExhaustionResetMs(buffered, now);
+              exhausted.exhaustedUntil = now + Math.min(quoted ?? MAX_HARD_PARK_MS, MAX_HARD_PARK_MS);
+            } else {
+              exhausted.exhaustedUntil = now + recoveryWaitMs(ctx.config, exhausted.attempts || 0);
+              exhausted.attempts = (exhausted.attempts || 0) + 1;
+            }
             const nextIdx = pickAccountIndex(pool, now, ctx.account.idx);
             if (accountEligible(pool, nextIdx, now)) {
               recordStat(ctx, status, errorReason(buffered)); // record the error on the exhausted account label

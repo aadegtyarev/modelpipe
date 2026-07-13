@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-07-13
+
+### Fixed
+- **Account-pool HARD exhaustion (weekly/monthly quota, disabled org/account, payment
+  required) no longer parks on the short rate-limit ladder.** It's a genuine multi-day block in
+  practice, so re-probing it every 1-30 minutes (the ladder used for ordinary rate-limit blips)
+  just burns requests against a dead account for days. When the backend's own error message
+  quotes an explicit reset time, the account is now parked directly against it (sanity-capped at
+  3 days in case of a malformed/absurd timestamp); otherwise it falls back to that same 3-day
+  cap. The consecutive-hit counter (`attempts`) is left untouched on a hard hit, so a later
+  GENUINE transient rate-limit on the same account still starts the ordinary ladder at its first
+  rung instead of inheriting an inflated count.
+- **Silent dead-end in profile failover.** When the account pool for a route had no eligible
+  account left AND the active profile had nowhere different to send the request (or no
+  profile/auto ladder was configured at all), the router gave up with no log line and relayed
+  the raw upstream error straight to the client — even when a snapshot of "no eligible account"
+  could be stale (a concurrent request may have parked/un-parked an account moments earlier).
+  It now takes one last-resort attempt on the least-recently-parked OTHER account (ignoring its
+  cooldown) before giving up, capped at exactly one extra hop per request so a genuinely dead
+  pool still fails out cleanly instead of ping-ponging. The give-up path is also logged now.
+
 ## [0.14.1] - 2026-07-09
 
 ### Fixed

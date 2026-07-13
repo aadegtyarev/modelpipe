@@ -39,15 +39,16 @@ function close(server) { return new Promise((resolve) => server.close(resolve));
 // A stub whose status is switchable at runtime (429 to exhaust, 200 to recover).
 function makeStatusStub(initial = 429) {
   let status = initial;
+  let message = "rate limited";
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      if (status >= 400) { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "rate limited" } })); }
+      if (status >= 400) { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message } })); }
       else { res.writeHead(200, { "content-type": "text/event-stream" }); res.end("ok"); }
     });
   });
-  return { server, setStatus: (s) => { status = s; } };
+  return { server, setStatus: (s) => { status = s; }, setMessage: (m) => { message = m; } };
 }
 
 function fire(port, model) {
@@ -158,6 +159,63 @@ async function main() {
       await fire(rp2, "glm-5.2");
       checkNear("no backoff schedule: park stays flat at the cooldown", p2.accounts[0].exhaustedUntil - t2, 60000);
       await close(r2); await close(stub2.server);
+    }
+
+    // HARD exhaustion (weekly/monthly wording): confirmed to be a genuine multi-day block in
+    // practice, so it must NOT climb the short rate-limit ladder (that would just re-hammer a
+    // dead account every few minutes for days) and must NOT ratchet `attempts` (a later GENUINE
+    // transient hit on this account should still start the ordinary ladder at its first rung).
+    {
+      const stub3 = makeStatusStub(429);
+      stub3.setMessage("[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-01-01 00:00:00]");
+      const s3 = await listen(stub3.server);
+      const r3 = createRouter({
+        listen: { host: "127.0.0.1", port: 0 },
+        failoverRecoveryBackoffMs: [60000, 300000, 600000],
+        routes: [{
+          match: "glm-*", base_url: `http://127.0.0.1:${s3}`, strategy: "failover",
+          accounts: [
+            { label: "a1", auth: { header: "x-api-key", keyEnv: "ACC_A" } },
+            { label: "a2", auth: { header: "x-api-key", keyEnv: "ACC_B" } },
+          ],
+        }],
+      });
+      const rp3 = await listen(r3);
+      const p3 = [...r3._modelpipe.accountPools.values()][0];
+      const t3 = Date.now();
+      await fire(rp3, "glm-5.2");
+      check("hard exhaustion: attempts NOT incremented", p3.accounts[0].attempts, 0);
+      // Message quotes a reset ~73 years out — sanity-capped at MAX_HARD_PARK_MS (3 days), not
+      // trusted verbatim, and far longer than the ordinary rate-limit ladder's 10-min ceiling.
+      checkNear("hard exhaustion: parked at the 3-day sanity cap, not the quoted date",
+        p3.accounts[0].exhaustedUntil - t3, 3 * 24 * 60 * 60 * 1000, 5000);
+      await close(r3); await close(stub3.server);
+    }
+
+    // HARD exhaustion with a near reset quoted in the message: trusted directly (the only
+    // authoritative signal available), not forced to the 3-day sanity cap.
+    {
+      const stub4 = makeStatusStub(429);
+      const resetAt = new Date(Date.now() + 5 * 60 * 1000); // 5 min out
+      stub4.setMessage(`[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at ${resetAt.toISOString().slice(0, 19).replace("T", " ")}]`);
+      const s4 = await listen(stub4.server);
+      const r4 = createRouter({
+        listen: { host: "127.0.0.1", port: 0 },
+        failoverRecoveryBackoffMs: [60000, 300000, 600000],
+        routes: [{
+          match: "glm-*", base_url: `http://127.0.0.1:${s4}`, strategy: "failover",
+          accounts: [
+            { label: "a1", auth: { header: "x-api-key", keyEnv: "ACC_A" } },
+            { label: "a2", auth: { header: "x-api-key", keyEnv: "ACC_B" } },
+          ],
+        }],
+      });
+      const rp4 = await listen(r4);
+      const p4 = [...r4._modelpipe.accountPools.values()][0];
+      const t4 = Date.now();
+      await fire(rp4, "glm-5.2");
+      checkNear("hard exhaustion: a near quoted reset is trusted directly", p4.accounts[0].exhaustedUntil - t4, 5 * 60 * 1000, 5000);
+      await close(r4); await close(stub4.server);
     }
   } finally {
     delete process.env.ACC_A; delete process.env.ACC_B;

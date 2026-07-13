@@ -176,6 +176,34 @@ async function main() {
     } finally { await close(router); await close(stub.server); }
   }
 
+  // ── R3b: both pool accounts hard-exhausted, no profile ladder configured — the pool looks
+  // fully spent, but the router still gets ONE last-resort roll on the least-recently-parked
+  // account (ignoring its cooldown) before relaying honestly. Bounded to exactly one extra hop —
+  // it must NOT ping-pong between the two dead accounts. ──
+  {
+    const stubA = makeStatusStub(429, "[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-01-01 00:00:00]");
+    const stubB = makeStatusStub(429, "[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-01-01 00:00:00]");
+    const portA = await listen(stubA.server);
+    const portB = await listen(stubB.server);
+    const router = createRouter({
+      listen: { host: "127.0.0.1", port: 0 },
+      routes: [{
+        match: "glm-*", base_url: `http://127.0.0.1:${portA}`, strategy: "failover",
+        accounts: [
+          { label: "acctA", base_url: `http://127.0.0.1:${portA}`, auth: { header: "x-api-key", keyEnv: "RETRY_KEY" } },
+          { label: "acctB", base_url: `http://127.0.0.1:${portB}`, auth: { header: "x-api-key", keyEnv: "RETRY_KEY" } },
+        ],
+      }],
+    });
+    const rPort = await listen(router);
+    try {
+      const r = await fire(rPort, "glm-5.2");
+      check("R3b last-resort: A hit twice (initial + the one last-resort roll)", stubA.received.length, 2);
+      check("R3b last-resort: B hit once (normal rotation only)", stubB.received.length, 1);
+      check("R3b last-resort: still relays 429 once the last resort ALSO fails (no infinite ping-pong)", r.status, 429);
+    } finally { await close(router); await close(stubA.server); await close(stubB.server); }
+  }
+
   // ── R4: retryCount resets on a NEW target — account rotation gets its OWN full budget ──
   {
     const stubA = makeStatusStub(429); // always fails
