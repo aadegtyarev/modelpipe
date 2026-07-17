@@ -743,11 +743,18 @@ async function main() {
     check("unknown model not forwarded to anthropic", anthropicStub.received.length, 1);
     check("unknown model not forwarded to bearer", bearerStub.received.length, 1);
 
-    // 4. missing model + unparseable body fail closed.
+    // 4. missing model + unparseable body — proxied to the default route (passthrough)
+    //    so the upstream responds, rather than the proxy inventing a 400 for a field
+    //    it doesn't own. The real upstream would return a proper error for a malformed
+    //    messages call; the stub returns 200.
     const r4 = await request(routerPort, { messages: [] });
-    check("missing model ⇒ 4xx", r4.status >= 400 && r4.status < 500, true);
+    check("missing model proxied to default route (200 from stub)", r4.status, 200);
     const r5 = await request(routerPort, null, { raw: "this is not json" });
-    check("unparseable body ⇒ 4xx", r5.status >= 400 && r5.status < 500, true);
+    check("unparseable body proxied to default route (200 from stub)", r5.status, 200);
+
+    // 4b. A model that genuinely matches no route still fails closed.
+    const r4b = await request(routerPort, { model: "gpt-4-turbo", messages: [] });
+    check("unknown model with model field ⇒ 4xx", r4b.status >= 400 && r4b.status < 500, true);
 
     // 5. matched route but unset key env ⇒ fail closed, NOT forwarded.
     const r6 = await request(routerPort, { model: "needkey-1", messages: [] });
@@ -764,10 +771,12 @@ async function main() {
     // 7. passthrough (B): the client's auth header is forwarded UNCHANGED — no
     //    backend key swap, no strip. Proves auth:"passthrough" works for a
     //    subscription/OAuth session that has no backend key.
+    //    received[2] because tests #4 (missing model) and #5 (unparseable body) are
+    //    now also proxied to the default passthrough route.
     const r7 = await request(routerPort, { model: "passthru-1", messages: [{ role: "user", content: "BODY-SENTINEL-PT" }] });
     check("passthrough status 200", r7.status, 200);
     check("passthrough streamed response intact", r7.body, STREAM_BODY);
-    const pReq = passthroughStub.received[0];
+    const pReq = passthroughStub.received[passthroughStub.received.length - 1];
     check("passthrough forwarded the client x-api-key VERBATIM", pReq.headers["x-api-key"], "CLIENT-FRONT-KEY");
     check("passthrough sent NO Authorization swap", pReq.headers["authorization"], undefined);
     check("passthrough body passed through intact", JSON.parse(pReq.body).messages[0].content, "BODY-SENTINEL-PT");

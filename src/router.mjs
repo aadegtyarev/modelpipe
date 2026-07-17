@@ -177,6 +177,16 @@ export function pickVisionRoute(routes) {
   return routes.find((route) => route.forImages === true) || null;
 }
 
+// The default/fallback route for requests that don't carry a routable model id
+// (GET /v1/models, HEAD /, a misc count_tokens call, or any auxiliary endpoint).
+// Prefers a passthrough route (the natural universal target — it forwards the
+// client's own auth unchanged) then falls back to the first configured route.
+export function findDefaultRoute(routes) {
+  if (!Array.isArray(routes) || routes.length === 0) return null;
+  const passthrough = routes.find(r => r.auth === "passthrough");
+  return passthrough || routes[0];
+}
+
 // The `model` field of a JSON request body, or null when the body is empty, not
 // JSON, or carries no string model — all fail-closed (the caller returns a 4xx).
 export function modelFromBody(body) {
@@ -1813,6 +1823,24 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
 
   const route = pickRoute(model, config.routes);
   if (!route) {
+    // If the body has no model field at all, fall back to the default route
+    // (passthrough or first route) so requests to auxiliary endpoints
+    // (count_tokens without a model, any new Anthropic endpoint, etc.) still
+    // reach a backend instead of failing with a 400.
+    if (!model) {
+      const fallback = findDefaultRoute(config.routes);
+      if (fallback) {
+        log(`no model in body — using default route (${fallback.match} -> ${fallback.base_url})`);
+        proxyToRoute(fallback, req, res, body, log, {
+          statsCtx,
+          providerId: providerIdFromUrl(fallback.base_url),
+          limiter,
+          concLimit: resolveConcurrencyLimit(config.concurrency, null),
+          queueTimeoutMs: queueTimeoutOf(config),
+        });
+        return;
+      }
+    }
     sendError(res, 400, model ? `no route for model "${model}"` : "request has no routable model");
     return;
   }
@@ -2572,11 +2600,10 @@ export function createRouter(config, options = {}) {
       return;
     }
 
-    // GET /v1/models (and the bare /models) returns the configured routes as a
-    // secret-free model listing (listModels). Intercepted BEFORE body reading/routing so
-    // it needs no request body and never reaches a backend — everything else (POST
-    // messages, passthrough, the vision reroute) flows through readBody → forward unchanged.
-    if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
+    // GET /v1/models (and /models) — model discovery. Served locally from the route
+    // config (listModels). Accepts any query string (e.g. ?limit=1000 from the gateway
+    // protocol) — the path alone decides.
+    if (req.method === "GET" && (req.url.split("?")[0] === "/v1/models" || req.url.split("?")[0] === "/models")) {
       const models = listModels(config);
       // Apply dashboard billing overrides (by provider id, or by account label for pools).
       if (dashboard) {
@@ -2591,6 +2618,32 @@ export function createRouter(config, options = {}) {
       res.end(JSON.stringify({ object: "list", data: models }));
       return;
     }
+
+    // HEAD / — connectivity probe (best-effort startup traffic). Respond locally.
+    if (req.method === "HEAD" && (req.url === "/" || req.url === "")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end();
+      return;
+    }
+
+    // GET / HEAD requests to every other path — proxy them through the default route
+    // (passthrough or first route) so auxiliary endpoints (model discovery from the
+    // real upstream, connectivity probes that reach past the proxy, count_tokens, etc.)
+    // work without requiring a routable model id in the body.
+    const defaultRoute = findDefaultRoute(config.routes);
+    if (defaultRoute && (req.method === "GET" || req.method === "HEAD")) {
+      const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
+      proxyToRoute(defaultRoute, req, res, Buffer.alloc(0), log, {
+        statsCtx,
+        providerId: providerIdFromUrl(defaultRoute.base_url),
+        limiter,
+        concLimit: 0, // no concurrency limiting for GET/HEAD
+        queueTimeoutMs: queueTimeoutOf(config),
+      });
+      return;
+    }
+
+    // Everything else (POST, PUT, etc.) — read body and route by model (or fall back to default).
     readBody(req, maxBytes)
       .then((body) => {
         const statsCtx = dashboard ? { stats, startTime: Date.now() } : null;
