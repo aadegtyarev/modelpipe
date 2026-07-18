@@ -434,6 +434,89 @@ export function rewriteBadServerToolUseBlocks(body) {
   return Buffer.from(JSON.stringify(parsed), "utf8");
 }
 
+// A `thinking` block WITHOUT a `signature` is FOREIGN — real Anthropic always signs its
+// thinking; z.ai/GLM mint unsigned ones. Their presence means the transcript crossed providers
+// (or was minted by a shim), and replaying it in thinking mode trips the upstream's
+// `400 … content[].thinking … must be passed back` (the unsigned blocks can't be echoed back
+// consistently). Detected to trigger a history-flatten (flattenHistoryToText).
+export function hasUnsignedThinking(parsed) {
+  const messages = parsed && parsed.messages;
+  if (!Array.isArray(messages)) return false;
+  for (const msg of messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b && b.type === "thinking" && !b.signature) return true;
+    }
+  }
+  return false;
+}
+
+function _safeJsonText(v, n) {
+  try { return (JSON.stringify(v) || "").slice(0, n); } catch { return ""; }
+}
+function _contentToText(c) {
+  if (typeof c === "string") return c.slice(0, 240);
+  if (Array.isArray(c)) return c.map(_blockToText).filter(Boolean).join(" ").slice(0, 240);
+  return _safeJsonText(c, 240);
+}
+function _blockToText(b) {
+  if (!b) return "";
+  if (typeof b !== "object") return String(b);
+  switch (b.type) {
+    case "text": return typeof b.text === "string" ? b.text : "";
+    case "thinking":
+    case "redacted_thinking": return "";   // reasoning trace — the poison, drop it
+    case "image": return "[image]";
+    case "tool_use": return `[tool_use ${b.name || "?"} ${_safeJsonText(b.input, 160)}]`;
+    case "tool_result": return `[tool_result ${_contentToText(b.content)}]`;
+    case "server_tool_use": return `[server_tool_use ${b.name || "?"}]`;
+    default:
+      if (typeof b.type === "string" && b.type.endsWith("_tool_result"))
+        return `[${b.type} ${_contentToText(b.content)}]`;
+      return "";
+  }
+}
+function _msgToText(msg) {
+  if (!msg) return "";
+  const role = msg.role === "assistant" ? "Assistant"
+    : msg.role === "user" ? "User"
+    : msg.role === "system" ? "System" : (msg.role || "?");
+  const body = typeof msg.content === "string" ? msg.content
+    : Array.isArray(msg.content) ? msg.content.map(_blockToText).filter(Boolean).join("\n") : "";
+  if (!body.trim()) return "";
+  return `${role}: ${body}`;
+}
+
+// Flatten a cross-provider-poisoned transcript into ONE user text message: every prior turn
+// rendered as "Role: <text>", tool calls/results as inline bracketed text, thinking dropped.
+// The model sees the whole history as a single message the user "passed in" — no thinking
+// blocks, no server_tool_use ids, no tool_use/tool_result pairing → nothing for a strict
+// backend to reject. thinking-mode config is dropped too (it's what tripped the 400). The
+// latest user turn survives as the final line. Pure: body unchanged on parse miss / empty.
+export function flattenHistoryToText(body) {
+  if (!body || body.length === 0) return body;
+  let parsed;
+  try { parsed = JSON.parse(body.toString("utf8")); } catch { return body; }
+  if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) return body;
+  const lines = parsed.messages.map(_msgToText).filter(Boolean);
+  if (lines.length === 0) return body;
+  parsed.messages = [{ role: "user", content: [{ type: "text", text: lines.join("\n\n") }] }];
+  delete parsed.thinking;   // thinking-mode is what the upstream tripped on — drop it
+  return Buffer.from(JSON.stringify(parsed), "utf8");
+}
+
+// If the transcript carries FOREIGN (unsigned) thinking blocks — the cross-provider poison
+// behind z.ai's thinking-mode 400 — collapse the whole history to a text transcript. Clean
+// transcripts pass through UNCHANGED (same buffer, no re-serialize). Opt-in per route; run
+// BEFORE rewriteServerToolUse (flatten supersedes it — nothing foreign survives to rewrite).
+export function flattenIfPoisoned(body) {
+  if (!body || body.length === 0) return body;
+  let parsed;
+  try { parsed = JSON.parse(body.toString("utf8")); } catch { return body; }
+  if (!hasUnsignedThinking(parsed)) return body;
+  return flattenHistoryToText(body);
+}
+
 // True when the request body carries an image content block — the Messages API
 // shape is a `messages[].content[]` block whose `type` is "image" (verified against
 // the Anthropic Messages API, the only format this router speaks). Used ONLY by the
@@ -2048,6 +2131,16 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
   // route — preferred over the plain drop. Falls back to `stripServerToolUse` (drop the whole
   // pair) when only that is set. Set either on a strict, schema-validating backend (real
   // Anthropic) that receives transcripts carrying tool-use artifacts minted by another provider.
+  // Cross-provider poison with no surgical fix: a transcript carrying FOREIGN (unsigned)
+  // thinking blocks trips the upstream's thinking-mode 400 ("content[].thinking … must be
+  // passed back"). Rewrite can't repair an unsigned signature, so collapse the WHOLE history
+  // to a text transcript — the model sees it as one user message, nothing to reject. Clean
+  // transcripts pass through untouched. Opt-in per route; runs BEFORE rewrite (supersedes it).
+  if (route.flattenPoisonedHistory) {
+    const before = body.length;
+    body = flattenIfPoisoned(body);
+    if (body.length !== before) log(`flattenPoisonedHistory: foreign thinking detected — history flattened to text for "${model}" -> ${route.base_url}`);
+  }
   if (route.rewriteServerToolUse) {
     const before = body.length;
     body = rewriteBadServerToolUseBlocks(body);

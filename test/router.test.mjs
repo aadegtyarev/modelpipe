@@ -37,6 +37,9 @@ const {
   stripThinkingBlocks,
   stripBadServerToolUseBlocks,
   rewriteBadServerToolUseBlocks,
+  hasUnsignedThinking,
+  flattenHistoryToText,
+  flattenIfPoisoned,
   resolveAuthHeader,
   isPassthrough,
   bodyHasImageBlock,
@@ -498,6 +501,57 @@ async function main() {
     }))).toString()).messages[0].content.length, 1);
   check("rewriteBadServerToolUseBlocks bad json ⇒ unchanged",
     rewriteBadServerToolUseBlocks(Buffer.from("not json")).toString(), "not json");
+
+  // hasUnsignedThinking — a thinking block WITHOUT a signature is foreign (z.ai/GLM); real
+  // Anthropic always signs. Drives the poisoned-history flatten.
+  check("hasUnsignedThinking unsigned block ⇒ true",
+    hasUnsignedThinking({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "x" }] }] }), true);
+  check("hasUnsignedThinking signed block ⇒ false",
+    hasUnsignedThinking({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "s" }] }] }), false);
+  check("hasUnsignedThinking no thinking ⇒ false",
+    hasUnsignedThinking({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] }), false);
+
+  // flattenHistoryToText — collapse a cross-provider-poisoned transcript into ONE user text
+  // message: thinking dropped, tool calls/results inline as text, latest turn preserved.
+  {
+    const poisoned = Buffer.from(JSON.stringify({
+      model: "glm-5.2",
+      thinking: { type: "enabled", budget_tokens: 2000 },
+      messages: [
+        { role: "user", content: [{ type: "text", text: "what is 2+2" }] },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "reasoning about arithmetic" },          // unsigned → foreign
+          { type: "text", text: "it's 4" },
+          { type: "tool_use", id: "toolu_1", name: "calc", input: { x: 2 } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+        { role: "user", content: [{ type: "text", text: "and 3+3?" }] },          // latest ask
+      ],
+    }));
+    const flat = JSON.parse(flattenHistoryToText(poisoned).toString());
+    check("flatten ⇒ single user message",
+      flat.messages.length === 1 && flat.messages[0].role === "user", true);
+    check("flatten ⇒ content is one text block",
+      flat.messages[0].content.length === 1 && flat.messages[0].content[0].type === "text", true);
+    const t = flat.messages[0].content[0].text;
+    check("flatten keeps the answers as text",
+      t.includes("it's 4") && t.includes("and 3+3?"), true);
+    check("flatten keeps tool calls/results inline",
+      t.includes("tool_use calc") && t.includes("tool_result"), true);
+    check("flatten drops thinking-mode config (what tripped the 400)",
+      flat.thinking === undefined, true);
+    check("flatten drops the thinking trace itself",
+      t.includes("reasoning about arithmetic"), false);
+  }
+  check("flattenIfPoisoned clean transcript ⇒ same buffer (no flatten)",
+    (() => { const b = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "a" }] }] })); return flattenIfPoisoned(b) === b; })(), true);
+  check("flattenIfPoisoned unsigned-thinking ⇒ flattened (length differs)",
+    (() => {
+      const b = Buffer.from(JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "x" }, { type: "text", text: "y" }] }] }));
+      return flattenIfPoisoned(b) !== b;
+    })(), true);
+  check("flattenHistoryToText bad json ⇒ unchanged",
+    flattenHistoryToText(Buffer.from("not json")).toString(), "not json");
 
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },

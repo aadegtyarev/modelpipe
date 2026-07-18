@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-18
+
+### Added
+
+- **`flattenPoisonedHistory` route option — escape hatch for cross-provider thinking-400.** When
+  a transcript carries FOREIGN (unsigned) `thinking` blocks — real Anthropic always signs its
+  thinking; z.ai/GLM mint unsigned ones — replaying it in thinking mode trips the upstream's
+  `400 … content[].thinking … must be passed back`. The signature can't be repaired and the
+  blocks can't be echoed back consistently, so the whole history is collapsed into ONE user text
+  message: every turn rendered as `Role: <text>`, tool calls/results inline as bracketed text,
+  thinking dropped, thinking-mode config removed. The model sees it as a message the user "passed
+  in" — nothing structured left to reject. Clean transcripts pass through UNCHANGED. Opt-in per
+  route (set on the z.ai/GLM route); runs before `rewriteServerToolUse`. Motivated by a long-lived
+  noos session whose transcript mixed signed (Anthropic) and unsigned (z.ai) thinking blocks and
+  could no longer make a turn without the thinking-400.
+
 ## [0.17.0] - 2026-07-18
 
 ### Added
