@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rewriteServerToolUse` route option — info-preserving cross-provider routing.** Sibling to
+  `stripServerToolUse` with the same trigger (a foreign `server_tool_use.id` or a misplaced
+  `tool_result`), but instead of dropping the poisoned pair it rewrites the tool's RESULT into a
+  labelled `text` block, so later turns keep what the tool returned. The CALL block (bad id,
+  unrepairable) is still dropped; its name + query fold into the label. Bookkeeping the model
+  doesn't need — the provider's opaque `encrypted_content` blob, the foreign id, an image carried
+  in the result — is discarded; only the signal survives (search titles + urls, a vision tool's
+  description). Takes precedence over `stripServerToolUse` when both are set. Motivated by z.ai/GLM
+  web_search and the `analyze_image` MCP tool both minting `server_tool_use` blocks with `call_…`
+  ids: plain strip lost the result for every subsequent turn, rewrite keeps it.
+
 ## [0.16.2] - 2026-07-18
 
 ### Fixed

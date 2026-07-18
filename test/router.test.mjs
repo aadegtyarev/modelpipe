@@ -36,6 +36,7 @@ const {
   rewriteModelInBody,
   stripThinkingBlocks,
   stripBadServerToolUseBlocks,
+  rewriteBadServerToolUseBlocks,
   resolveAuthHeader,
   isPassthrough,
   bodyHasImageBlock,
@@ -408,6 +409,95 @@ async function main() {
       }));
       return stripBadServerToolUseBlocks(b) === b;
     })(), true);
+
+  // rewriteBadServerToolUseBlocks — like strip, but rewrites a poisoned tool-use RESULT into a
+  // labelled text block (preserving what the tool returned for later turns) instead of dropping
+  // it. The CALL block (bad id, unrepairable) is still dropped; its name/query fold into the
+  // label. Bookkeeping (encrypted_content, the foreign id, the image) is discarded.
+  {
+    // z.ai/GLM web_search: server_tool_use (foreign id) + web_search_tool_result in one turn.
+    const withSearch = Buffer.from(JSON.stringify({
+      model: "claude-opus-4-8",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "search the web" }] },
+        { role: "assistant", content: [
+          { type: "server_tool_use", id: "call_from_glm_1", name: "web_search", input: { query: "rust async" } },
+          { type: "web_search_tool_result", tool_use_id: "call_from_glm_1", content: [
+            { type: "web_search_result", title: "Async Rust", url: "https://example.com/a", encrypted_content: "blob" },
+            { type: "web_search_result", title: "Tokio", url: "https://example.com/b", encrypted_content: "blob" },
+          ] },
+          { type: "text", text: "here's what I found" },
+        ] },
+      ],
+    }));
+    const rw = JSON.parse(rewriteBadServerToolUseBlocks(withSearch).toString());
+    const c = rw.messages[1].content;
+    check("rewrite drops the bad server_tool_use call",
+      c.some((b) => b.type === "server_tool_use"), false);
+    check("rewrite keeps the assistant's text answer",
+      c.some((b) => b.type === "text" && b.text === "here's what I found"), true);
+    const resultText = c.find((b) => b.type === "text" && b.text.includes("server-side"));
+    check("rewrite turns the search result into a labelled text block", !!resultText, true);
+    check("rewrite label carries the query",
+      resultText && resultText.text.includes('query: "rust async"'), true);
+    check("rewrite keeps titles + urls (the signal)",
+      resultText && resultText.text.includes("Async Rust — https://example.com/a"), true);
+    check("rewrite drops encrypted_content (bookkeeping)",
+      resultText && !resultText.text.includes("blob"), true);
+  }
+  {
+    // z.ai MCP image tool (analyze_image): server_tool_use (foreign id) + a misplaced tool_result
+    // inlined into the assistant turn. The tool's OUTPUT (the description) is what we keep; the
+    // image itself we discard.
+    const withImg = Buffer.from(JSON.stringify({
+      model: "claude-opus-4-8",
+      messages: [
+        { role: "user", content: [
+          { type: "text", text: "what is in this image" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } },
+        ] },
+        { role: "assistant", content: [
+          { type: "server_tool_use", id: "call_e995f248", name: "analyze_image", input: {} },
+          { type: "tool_result", tool_use_id: "call_e995f248", content: "a red fox sitting on snow" },
+          { type: "text", text: "it's a fox" },
+        ] },
+      ],
+    }));
+    const rw = JSON.parse(rewriteBadServerToolUseBlocks(withImg).toString());
+    const c = rw.messages[1].content;
+    check("rewrite(image) drops the analyze_image server_tool_use",
+      c.some((b) => b.type === "server_tool_use"), false);
+    const out = c.find((b) => b.type === "text" && b.text.includes("analyze_image"));
+    check("rewrite(image) preserves the tool's output (the description)",
+      out && out.text.includes("a red fox sitting on snow"), true);
+    check("rewrite(image) labels it as server-side",
+      out && out.text.includes("server-side"), true);
+    check("rewrite(image) leaves the user's image block untouched",
+      rw.messages[0].content.some((b) => b.type === "image"), true);
+  }
+  check("rewriteBadServerToolUseBlocks empty result ⇒ labelled stub (not dropped)",
+    (() => {
+      const rw = JSON.parse(rewriteBadServerToolUseBlocks(Buffer.from(JSON.stringify({
+        messages: [{ role: "assistant", content: [
+          { type: "server_tool_use", id: "call_bad", name: "web_search", input: { query: "x" } },
+          { type: "web_search_tool_result", tool_use_id: "call_bad", content: [] },
+        ] }],
+      }))).toString());
+      const t = rw.messages[0].content.find((b) => b.type === "text");
+      return !!t && t.text.includes("results not captured") && t.text.includes('query: "x"');
+    })(), true);
+  check("rewriteBadServerToolUseBlocks valid srvtoolu_ id ⇒ same buffer (no rewrite)",
+    (() => { const b = Buffer.from(JSON.stringify({ messages: [{ role: "assistant", content: [
+      { type: "server_tool_use", id: "srvtoolu_01AbCd23", name: "web_search", input: {} },
+      { type: "text", text: "y" }] }] })); return rewriteBadServerToolUseBlocks(b) === b; })(), true);
+  check("rewriteBadServerToolUseBlocks no bad ids ⇒ same buffer (no re-serialize)",
+    (() => { const b = Buffer.from('{"messages":[{"role":"user","content":[{"type":"text","text":"a"}]}]}'); return rewriteBadServerToolUseBlocks(b) === b; })(), true);
+  check("rewriteBadServerToolUseBlocks server_tool_use-only turn KEPT (no result to salvage)",
+    JSON.parse(rewriteBadServerToolUseBlocks(Buffer.from(JSON.stringify({
+      messages: [{ role: "assistant", content: [{ type: "server_tool_use", id: "call_bad", name: "web_search", input: {} }] }],
+    }))).toString()).messages[0].content.length, 1);
+  check("rewriteBadServerToolUseBlocks bad json ⇒ unchanged",
+    rewriteBadServerToolUseBlocks(Buffer.from("not json")).toString(), "not json");
 
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },

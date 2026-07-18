@@ -282,6 +282,27 @@ export function stripThinkingBlocks(body) {
 // when nothing was stripped (no re-serialization). Pure — never throws.
 const SERVER_TOOL_USE_ID_RE = /^srvtoolu_[a-zA-Z0-9_]+$/;
 
+// Pass 1 shared by stripBadServerToolUseBlocks and rewriteBadServerToolUseBlocks: the set of
+// tool_use ids a strict, schema-validating backend will reject — (1) a `server_tool_use` whose
+// `id` isn't Anthropic's own `^srvtoolu_...` shape, and (2) a plain client `tool_result` sitting
+// in a NON-`user` message (some providers' shims inline the whole tool_use/tool_result round-trip
+// into one assistant turn). Either half of a poisoned pair marks its id.
+function _poisonedToolUseIds(messages) {
+  const ids = new Set();
+  for (const msg of messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (!b) continue;
+      if (b.type === "server_tool_use" && typeof b.id === "string" && !SERVER_TOOL_USE_ID_RE.test(b.id)) {
+        ids.add(b.id);
+      } else if (b.type === "tool_result" && msg.role !== "user" && typeof b.tool_use_id === "string") {
+        ids.add(b.tool_use_id);
+      }
+    }
+  }
+  return ids;
+}
+
 export function stripBadServerToolUseBlocks(body) {
   if (!body || body.length === 0) return body;
   let parsed;
@@ -292,22 +313,10 @@ export function stripBadServerToolUseBlocks(body) {
   }
   if (!Array.isArray(parsed.messages)) return body;
 
-  // Pass 1: find every id that must be purged.
-  const poisonedIds = new Set();
-  for (const msg of parsed.messages) {
-    if (!msg || !Array.isArray(msg.content)) continue;
-    for (const b of msg.content) {
-      if (!b) continue;
-      if (b.type === "server_tool_use" && typeof b.id === "string" && !SERVER_TOOL_USE_ID_RE.test(b.id)) {
-        poisonedIds.add(b.id);
-      } else if (b.type === "tool_result" && msg.role !== "user" && typeof b.tool_use_id === "string") {
-        poisonedIds.add(b.tool_use_id);
-      }
-    }
-  }
+  const poisonedIds = _poisonedToolUseIds(parsed.messages);
   if (poisonedIds.size === 0) return body;
 
-  // Pass 2: drop every block anywhere (either half of a poisoned pair) that references one.
+  // Drop every block anywhere (either half of a poisoned pair) that references one.
   let changed = false;
   for (const msg of parsed.messages) {
     if (!msg || !Array.isArray(msg.content)) continue;
@@ -320,6 +329,104 @@ export function stripBadServerToolUseBlocks(body) {
     });
     if (filtered.length !== msg.content.length && filtered.length > 0) {
       msg.content = filtered;
+      changed = true;
+    }
+  }
+  if (!changed) return body;
+  return Buffer.from(JSON.stringify(parsed), "utf8");
+}
+
+// Like stripBadServerToolUseBlocks, but instead of dropping a poisoned tool-use RESULT it rewrites
+// the result into a plain `text` block — preserving what the tool returned for later turns, with a
+// label saying how it was obtained. The `server_tool_use`/`tool_use` CALL block (the part whose id
+// is bad and unrepairable) is still dropped; its name/input fold into the label. Bookkeeping the
+// model has no use for (the provider's opaque `encrypted_content`, the foreign id) is discarded —
+// only the result payload (titles, urls, snippets) survives, as readable text. A turn that would be
+// left empty is kept intact (never produces an empty content array). Same fail-safes as strip:
+// body unchanged on parse miss / no poisoned ids / nothing rewritten (no re-serialize). Pure.
+function _renderToolResult(meta, block) {
+  const name = (meta && meta.name) || (block.type === "web_search_tool_result" ? "web_search" : "tool");
+  const query = meta && meta.input && typeof meta.input.query === "string" ? meta.input.query : null;
+  const head = query ? `[${name} · server-side · query: "${query}"]` : `[${name} · server-side]`;
+  let payload = "";
+  const c = Array.isArray(block.content) ? block.content : null;
+  if (c && c.length) {
+    const lines = [];
+    for (let i = 0; i < c.length; i++) {
+      const it = c[i];
+      if (!it || typeof it !== "object") { lines.push(`${i + 1}. ${String(it)}`); continue; }
+      // A tool result can carry mixed content (z.ai/GLM image-reading tools, text snippets, …);
+      // render each by what it IS, never dumping a raw base64/encrypted blob into history.
+      if (it.type === "image") { lines.push(`${i + 1}. [image]`); continue; }
+      if (it.type === "text" && typeof it.text === "string") { lines.push(`${i + 1}. ${it.text}`); continue; }
+      const title = typeof it.title === "string" ? it.title : "";
+      const url = typeof it.url === "string" ? it.url : "";
+      // encrypted_content is the provider's opaque blob — drop it (bookkeeping, not signal).
+      if (title && url) lines.push(`${i + 1}. ${title} — ${url}`);
+      else if (title) lines.push(`${i + 1}. ${title}`);
+      else if (url) lines.push(`${i + 1}. ${url}`);
+      else lines.push(`${i + 1}. ${JSON.stringify(it).slice(0, 200)}`);
+    }
+    payload = lines.join("\n");
+  } else if (typeof block.content === "string" && block.content.length) {
+    payload = block.content;   // a misplaced client tool_result often carries a string content
+  } else {
+    payload = "(results not captured)";
+  }
+  return `${head}\n${payload}`;
+}
+
+export function rewriteBadServerToolUseBlocks(body) {
+  if (!body || body.length === 0) return body;
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return body;
+  }
+  if (!Array.isArray(parsed.messages)) return body;
+
+  const poisonedIds = _poisonedToolUseIds(parsed.messages);
+  if (poisonedIds.size === 0) return body;
+
+  // meta[id] = {name, input} from the CALL block, so the rewritten result carries the query.
+  const meta = Object.create(null);
+  for (const msg of parsed.messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (!b) continue;
+      if ((b.type === "server_tool_use" || b.type === "tool_use") && typeof b.id === "string" && poisonedIds.has(b.id)) {
+        meta[b.id] = { name: b.name, input: b.input };
+      }
+    }
+  }
+
+  let changed = false;
+  for (const msg of parsed.messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const mapped = [];
+    let msgChanged = false;
+    for (const b of msg.content) {
+      if (!b) { mapped.push(b); continue; }
+      // Drop the CALL half — bad id, unrepairable.
+      if ((b.type === "server_tool_use" || b.type === "tool_use") && typeof b.id === "string" && poisonedIds.has(b.id)) {
+        msgChanged = true;
+        continue;
+      }
+      // Rewrite the RESULT half into a labelled text block (1:1, schema-safe).
+      const isResult =
+        (b.type === "tool_result" || (typeof b.type === "string" && b.type.endsWith("_tool_result"))) &&
+        typeof b.tool_use_id === "string" && poisonedIds.has(b.tool_use_id);
+      if (isResult) {
+        mapped.push({ type: "text", text: _renderToolResult(meta[b.tool_use_id], b) });
+        msgChanged = true;
+        continue;
+      }
+      mapped.push(b);
+    }
+    // Commit only if the turn still has content — never produce an empty content array (a 400).
+    if (msgChanged && mapped.length > 0) {
+      msg.content = mapped;
       changed = true;
     }
   }
@@ -1935,11 +2042,17 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
     if (body.length !== before) log(`stripThinking: dropped thinking block(s) from "${model}" history -> ${route.base_url}`);
   }
 
-  // Schema-safe cross-provider routing: drop foreign server_tool_use/tool_result bookkeeping
-  // the target would reject (see stripBadServerToolUseBlocks). Opt-in per route — set on a
-  // strict, schema-validating backend (real Anthropic) that receives transcripts carrying
-  // tool-use artifacts minted by another provider.
-  if (route.stripServerToolUse) {
+  // Schema-safe cross-provider routing: rewrite-or-drop foreign server_tool_use/tool_result
+  // bookkeeping the target would reject. `rewriteServerToolUse` keeps the tool's RESULT in
+  // history as a labelled text block (drops only the bad-id call + opaque blobs); opt-in per
+  // route — preferred over the plain drop. Falls back to `stripServerToolUse` (drop the whole
+  // pair) when only that is set. Set either on a strict, schema-validating backend (real
+  // Anthropic) that receives transcripts carrying tool-use artifacts minted by another provider.
+  if (route.rewriteServerToolUse) {
+    const before = body.length;
+    body = rewriteBadServerToolUseBlocks(body);
+    if (body.length !== before) log(`rewriteServerToolUse: inlined foreign tool-use result(s) as text in "${model}" history -> ${route.base_url}`);
+  } else if (route.stripServerToolUse) {
     const before = body.length;
     body = stripBadServerToolUseBlocks(body);
     if (body.length !== before) log(`stripServerToolUse: dropped foreign tool-use block(s) from "${model}" history -> ${route.base_url}`);
