@@ -35,6 +35,7 @@ const {
   modelFromBody,
   rewriteModelInBody,
   stripThinkingBlocks,
+  stripBadServerToolUseBlocks,
   resolveAuthHeader,
   isPassthrough,
   bodyHasImageBlock,
@@ -329,6 +330,50 @@ async function main() {
     stripThinkingBlocks(Buffer.from("not json")).toString(), "not json");
   check("stripThinkingBlocks no messages array ⇒ unchanged",
     stripThinkingBlocks(Buffer.from('{"model":"x"}')).toString(), '{"model":"x"}');
+
+  // stripBadServerToolUseBlocks — drop a server_tool_use block (+ its paired *_tool_result) whose
+  // id doesn't match Anthropic's own `srvtoolu_...` shape, so a strict backend doesn't 400 on a
+  // foreign/cross-provider server_tool_use id.
+  {
+    // Server-side tool results (unlike client tool_use/tool_result) live in the SAME assistant
+    // turn as the tool_use block — Anthropic executes the tool inline and appends the result.
+    const withForeignId = Buffer.from(JSON.stringify({
+      model: "claude-opus-4-8",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "search the web" }] },
+        { role: "assistant", content: [
+          { type: "server_tool_use", id: "call_from_glm_123", name: "web_search", input: { query: "x" } },
+          { type: "web_search_tool_result", tool_use_id: "call_from_glm_123", content: [] },
+          { type: "text", text: "here's what I found" },
+        ] },
+      ],
+    }));
+    const stripped = JSON.parse(stripBadServerToolUseBlocks(withForeignId).toString());
+    check("stripBadServerToolUseBlocks removes the bad server_tool_use block + its paired result",
+      stripped.messages[1].content.length, 1);
+    check("stripBadServerToolUseBlocks keeps the text block",
+      stripped.messages[1].content[0].type, "text");
+  }
+  check("stripBadServerToolUseBlocks valid Anthropic id ⇒ left alone",
+    (() => {
+      const b = Buffer.from(JSON.stringify({
+        messages: [{ role: "assistant", content: [
+          { type: "server_tool_use", id: "srvtoolu_01AbCd23", name: "web_search", input: {} },
+          { type: "text", text: "y" },
+        ] }],
+      }));
+      return stripBadServerToolUseBlocks(b) === b;
+    })(), true);
+  check("stripBadServerToolUseBlocks no bad ids ⇒ same buffer reference (no re-serialize)",
+    (() => { const b = Buffer.from('{"messages":[{"role":"user","content":[{"type":"text","text":"a"}]}]}'); return stripBadServerToolUseBlocks(b) === b; })(), true);
+  check("stripBadServerToolUseBlocks server_tool_use-only turn is KEPT (never empties content)",
+    JSON.parse(stripBadServerToolUseBlocks(Buffer.from(JSON.stringify({
+      messages: [{ role: "assistant", content: [{ type: "server_tool_use", id: "call_bad", name: "web_search", input: {} }] }],
+    }))).toString()).messages[0].content.length, 1);
+  check("stripBadServerToolUseBlocks bad json ⇒ body unchanged (fail-safe)",
+    stripBadServerToolUseBlocks(Buffer.from("not json")).toString(), "not json");
+  check("stripBadServerToolUseBlocks no messages array ⇒ unchanged",
+    stripBadServerToolUseBlocks(Buffer.from('{"model":"x"}')).toString(), '{"model":"x"}');
 
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },

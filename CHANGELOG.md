@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-18
+
+### Added
+- **`stripServerToolUse` route option — schema-safe cross-provider routing.** A strict,
+  schema-validating backend (real Anthropic) rejects the WHOLE request with `400
+  invalid_request_error: messages.N.content.M.server_tool_use.id: String should match pattern
+  '^srvtoolu_[a-zA-Z0-9_]+$'` when the transcript carries a `server_tool_use` block whose id was
+  minted by a different provider's Anthropic-shim (e.g. z.ai/GLM's own web-search tool-call id)
+  and replayed here after a model rewrite or cross-provider profile hop — the same failure mode
+  `stripThinking` already covers for thinking-block signatures. Set `"stripServerToolUse": true`
+  on the route pointing at the strict backend to drop every `server_tool_use` block whose id
+  doesn't match Anthropic's own shape (plus any paired `*_tool_result` block, so nothing dangles)
+  from the request's history before forwarding. Only a block that actually violates the pattern
+  is touched — a genuine Anthropic id passes through untouched. A turn whose only content is the
+  dropped block(s) is kept intact so the strip never produces an empty content array.
+
 ## [0.15.0] - 2026-07-14
 
 ### Added
