@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-07-18
+
+### Fixed
+- **`errorReason` no longer goes silent on an unrecognized error body.** It only ever extracted
+  `error.message` / `error.type` / `message` from a JSON body — a body that parses but carries
+  none of those (e.g. an OAuth-style `{error, error_description}` shape from a gateway/edge layer
+  in front of the real API), or isn't JSON at all (a plain-text or HTML error page), produced
+  `undefined`, which the dashboard then rendered as a bare status code with no reason at all. Now
+  falls back to the RAW body text (whitespace-collapsed to one line, still capped at 200 chars)
+  when no nice field is found — an ugly reason beats no reason when a red row needs explaining.
+
 ## [0.16.1] - 2026-07-18
 
 ### Fixed

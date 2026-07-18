@@ -43,6 +43,7 @@ const {
   stripImageBlocks,
   isImageUnsupported400,
   isFailoverTrigger,
+  errorReason,
   pickVisionRoute,
   validateConfig,
   listConfig,
@@ -625,6 +626,32 @@ async function main() {
     isFailoverTrigger(402, Buffer.from('{"error":{"message":"payment required"}}')), true);
   check("isFailoverTrigger: 500 + 'quota exceeded' triggers",
     isFailoverTrigger(500, Buffer.from('{"error":{"message":"quota exceeded"}}')), true);
+
+  // ── errorReason (pure, no network) ──────────────────────────────────────────
+  check("errorReason: empty buffer ⇒ undefined", errorReason(Buffer.from("")), undefined);
+  check("errorReason: null buffer ⇒ undefined", errorReason(null), undefined);
+  check("errorReason: standard Anthropic shape ⇒ error.message",
+    errorReason(Buffer.from('{"type":"error","error":{"type":"rate_limit_error","message":"rate limited, slow down"}}')),
+    "rate limited, slow down");
+  check("errorReason: no message, falls back to error.type",
+    errorReason(Buffer.from('{"error":{"type":"rate_limit_error"}}')), "rate_limit_error");
+  check("errorReason: top-level message field",
+    errorReason(Buffer.from('{"message":"nope"}')), "nope");
+  check("errorReason: message too long ⇒ capped at 200 + ellipsis",
+    errorReason(Buffer.from(JSON.stringify({ message: "x".repeat(250) }))), `${"x".repeat(200)}…`);
+  // No nice message anywhere in the parsed JSON — surface the raw (whitespace-collapsed) body
+  // rather than nothing, e.g. a gateway/edge 429 in front of the real API with its own shape.
+  check("errorReason: JSON with no recognizable message field ⇒ raw body fallback",
+    errorReason(Buffer.from('{"error":"Error","error_description":"Too many requests"}')),
+    '{"error":"Error","error_description":"Too many requests"}');
+  check("errorReason: not JSON at all ⇒ raw text fallback",
+    errorReason(Buffer.from("Too Many Requests")), "Too Many Requests");
+  check("errorReason: raw text with newlines ⇒ collapsed to one line",
+    errorReason(Buffer.from("line one\nline two\n  line three")), "line one line two line three");
+  check("errorReason: whitespace-only body ⇒ undefined",
+    errorReason(Buffer.from("   \n  ")), undefined);
+  check("errorReason: raw fallback also capped at 200 + ellipsis",
+    errorReason(Buffer.from("y".repeat(250))), `${"y".repeat(200)}…`);
 
   // ── time-window pure helpers ────────────────────────────────────────────────
   check("parseTzOffset +08:00", parseTzOffset("+08:00"), 480);

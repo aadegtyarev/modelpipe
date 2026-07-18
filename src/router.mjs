@@ -1306,19 +1306,30 @@ async function proxyToRoute(route, req, res, body, log, { onResponse, statsCtx, 
   upstreamReq.end();
 }
 
-// Best-effort short human-readable reason from a provider's JSON error body (e.g.
-// {"type":"error","error":{"type":"rate_limit_error","message":"..."}}) — surfaced on the
-// dashboard trace so a red row says WHY, not just a status code. Never throws; capped
-// length so a pathological body can't bloat the timeline. undefined when unparseable.
-function errorReason(buffered) {
+function capReason(s) {
+  return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+}
+
+// Best-effort short human-readable reason from a provider's error body — surfaced on the
+// dashboard trace so a red row says WHY, not just a status code. Tries the shape Anthropic (and
+// most others) use ({"type":"error","error":{"type":"rate_limit_error","message":"..."}}) first;
+// when the body doesn't parse as JSON, or parses but carries no `error.message`/`error.type`/
+// `message` field (e.g. a gateway/edge 429 in front of the real API, or a plain-text body), falls
+// back to the RAW body text (whitespace-collapsed to one line) rather than surfacing nothing —
+// an ugly reason beats a bare status code on the dashboard. Never throws; capped length so a
+// pathological body can't bloat the timeline. undefined only when the body is empty or, after
+// collapsing, blank.
+export function errorReason(buffered) {
   if (!buffered || !buffered.length) return undefined;
+  const raw = buffered.toString("utf8");
   try {
-    const parsed = JSON.parse(buffered.toString("utf8"));
+    const parsed = JSON.parse(raw);
     const err = parsed && parsed.error;
     const msg = (err && (err.message || err.type)) || parsed.message;
-    if (typeof msg !== "string" || !msg) return undefined;
-    return msg.length > 200 ? `${msg.slice(0, 200)}…` : msg;
-  } catch { return undefined; }
+    if (typeof msg === "string" && msg) return capReason(msg);
+  } catch { /* fall through to the raw-body fallback below */ }
+  const flat = raw.replace(/\s+/g, " ").trim();
+  return flat ? capReason(flat) : undefined;
 }
 
 // Record a zero-token error/relay stat for the tier a ctx is currently on. No-op when
