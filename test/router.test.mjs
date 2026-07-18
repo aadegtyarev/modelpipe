@@ -375,6 +375,39 @@ async function main() {
   check("stripBadServerToolUseBlocks no messages array ⇒ unchanged",
     stripBadServerToolUseBlocks(Buffer.from('{"model":"x"}')).toString(), '{"model":"x"}');
 
+  // stripBadServerToolUseBlocks — a plain `tool_result` block inlined into a NON-user message
+  // (some providers' shims fold the client tool_use/tool_result round-trip into one assistant
+  // turn) is illegal ("tool_result blocks can only be in user messages") — drop it + its paired
+  // tool_use, wherever each half lives.
+  {
+    const misplaced = Buffer.from(JSON.stringify({
+      model: "claude-opus-4-8",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "edit the file" }] },
+        { role: "assistant", content: [
+          { type: "tool_use", id: "toolu_glm_1", name: "edit_file", input: {} },
+          { type: "tool_result", tool_use_id: "toolu_glm_1", content: "done" },
+          { type: "text", text: "edited" },
+        ] },
+      ],
+    }));
+    const stripped = JSON.parse(stripBadServerToolUseBlocks(misplaced).toString());
+    check("stripBadServerToolUseBlocks removes the misplaced tool_result + its paired tool_use",
+      stripped.messages[1].content.length, 1);
+    check("stripBadServerToolUseBlocks keeps the text block (misplaced-result case)",
+      stripped.messages[1].content[0].type, "text");
+  }
+  check("stripBadServerToolUseBlocks tool_result correctly in a user message ⇒ left alone",
+    (() => {
+      const b = Buffer.from(JSON.stringify({
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "x", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+        ],
+      }));
+      return stripBadServerToolUseBlocks(b) === b;
+    })(), true);
+
   const sampleRoutes = [
     { match: "claude-*", base_url: "https://api.anthropic.com", auth: { header: "x-api-key", keyEnv: "K" } },
     { match: "deepseek-*", base_url: "https://api.deepseek.com/anthropic", auth: { header: "x-api-key", keyEnv: "K" } },

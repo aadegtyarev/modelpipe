@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-18
+
+### Fixed
+- **`stripServerToolUse` also strips a misplaced plain `tool_result`.** 0.16.0 only handled a
+  `server_tool_use.id` shape mismatch; live traffic through the same cross-provider route then
+  hit a second, distinct 400 on the SAME kind of history: `messages.N: \`tool_result\` blocks can
+  only be in \`user\` messages`. Some providers' Anthropic-shims fold the client
+  tool_use/tool_result round-trip into a single assistant turn (unlike Anthropic's own two-message
+  dance) — replayed against real Anthropic, that placement is rejected outright. `stripServerToolUse`
+  now also drops a plain `tool_result` block sitting in a non-`user` message, plus its paired
+  `tool_use` wherever it lives, using the same "poisoned id → drop both halves" approach as the
+  original fix. Named server-tool result types (`web_search_tool_result`, etc.) legitimately live
+  inline in an assistant turn and are left untouched — only the generic `tool_result` type is
+  placement-checked.
+
 ## [0.16.0] - 2026-07-18
 
 ### Added

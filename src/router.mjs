@@ -257,21 +257,29 @@ export function stripThinkingBlocks(body) {
   return Buffer.from(JSON.stringify(parsed), "utf8");
 }
 
-// Anthropic mints `server_tool_use` ids (its own bookkeeping for server-executed tools —
-// web_search, code_execution, ...) as `srvtoolu_<alnum/underscore>` and enforces that shape by
-// schema: a request replaying one minted by another provider's Anthropic-shim (whose id format
-// differs) after a cross-provider model rewrite or profile hop fails with `400
-// invalid_request_error: messages.N.content.M.server_tool_use.id: String should match pattern
-// '^srvtoolu_[a-zA-Z0-9_]+$'` — rejecting the WHOLE request, same failure mode as the thinking-
-// signature case (see stripThinkingBlocks). Unlike a signature, the id shape is untrusted-but-
-// checkable, so only a block that actually violates the pattern is touched — a genuine Anthropic
-// id is left alone. The id can't be coerced into shape (we don't know what internal state
-// Anthropic keys off it), so the whole block is dropped; any paired `*_tool_result` block (its
-// `tool_use_id` referencing the dropped id) is dropped too, else it dangles the way compact's
-// tool-pairing guard exists to avoid. A turn whose only content is the dropped block(s) is kept
-// intact, so the strip never produces an empty content array. Fail-safe: returns the body
-// unchanged on any parse miss or when nothing was stripped (no re-serialization). Pure — never
-// throws.
+// Drop two distinct shapes of foreign tool-use bookkeeping a strict, schema-validating backend
+// (real Anthropic) rejects outright when a transcript was minted by another provider's
+// Anthropic-shim (z.ai/GLM) and replayed here after a cross-provider model rewrite or profile
+// hop — same failure mode as the thinking-signature case (see stripThinkingBlocks):
+//   1. `server_tool_use.id` not matching Anthropic's own `^srvtoolu_[a-zA-Z0-9_]+$` shape (its
+//      bookkeeping for server-executed tools — web_search, code_execution, ...) → `400
+//      messages.N.content.M.server_tool_use.id: String should match pattern '...'`.
+//   2. A plain `tool_result` block (the CLIENT tool-result type — distinct from named
+//      server-tool result types like `web_search_tool_result`, which legitimately live inline in
+//      an assistant turn) sitting in a NON-`user` message → `400 messages.N: \`tool_result\`
+//      blocks can only be in \`user\` messages`. Some providers' shims inline the whole
+//      tool_use/tool_result round-trip into one assistant turn instead of Anthropic's two-message
+//      dance.
+// Neither can be repaired in place (we don't know what internal state Anthropic keys the id off
+// of, and relocating a misplaced block would be reconstructing history we don't own), so the
+// whole pair is dropped: whichever half is bad marks its id as poisoned, then EVERY block
+// anywhere in the transcript referencing that id (tool_use/server_tool_use by `id`,
+// tool_result/`*_tool_result` by `tool_use_id`) is removed together, else the surviving half
+// dangles the way compact's tool-pairing guard exists to avoid. Only a block that actually
+// violates one of the two rules marks its id — a genuine, correctly-placed Anthropic pair is left
+// untouched. A turn whose only content is a dropped block is kept intact, so the strip never
+// produces an empty content array. Fail-safe: returns the body unchanged on any parse miss or
+// when nothing was stripped (no re-serialization). Pure — never throws.
 const SERVER_TOOL_USE_ID_RE = /^srvtoolu_[a-zA-Z0-9_]+$/;
 
 export function stripBadServerToolUseBlocks(body) {
@@ -283,31 +291,36 @@ export function stripBadServerToolUseBlocks(body) {
     return body;
   }
   if (!Array.isArray(parsed.messages)) return body;
+
+  // Pass 1: find every id that must be purged.
+  const poisonedIds = new Set();
+  for (const msg of parsed.messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (!b) continue;
+      if (b.type === "server_tool_use" && typeof b.id === "string" && !SERVER_TOOL_USE_ID_RE.test(b.id)) {
+        poisonedIds.add(b.id);
+      } else if (b.type === "tool_result" && msg.role !== "user" && typeof b.tool_use_id === "string") {
+        poisonedIds.add(b.tool_use_id);
+      }
+    }
+  }
+  if (poisonedIds.size === 0) return body;
+
+  // Pass 2: drop every block anywhere (either half of a poisoned pair) that references one.
   let changed = false;
-  const droppedIds = new Set();
   for (const msg of parsed.messages) {
     if (!msg || !Array.isArray(msg.content)) continue;
     const filtered = msg.content.filter((b) => {
-      const bad = b && b.type === "server_tool_use" &&
-        typeof b.id === "string" && !SERVER_TOOL_USE_ID_RE.test(b.id);
-      if (bad) droppedIds.add(b.id);
-      return !bad;
+      if (!b) return true;
+      if ((b.type === "server_tool_use" || b.type === "tool_use") && poisonedIds.has(b.id)) return false;
+      if ((b.type === "tool_result" || (typeof b.type === "string" && b.type.endsWith("_tool_result"))) &&
+        poisonedIds.has(b.tool_use_id)) return false;
+      return true;
     });
     if (filtered.length !== msg.content.length && filtered.length > 0) {
       msg.content = filtered;
       changed = true;
-    }
-  }
-  if (droppedIds.size > 0) {
-    for (const msg of parsed.messages) {
-      if (!msg || !Array.isArray(msg.content)) continue;
-      const filtered = msg.content.filter(
-        (b) => !(b && typeof b.type === "string" && b.type.endsWith("_tool_result") && droppedIds.has(b.tool_use_id)),
-      );
-      if (filtered.length !== msg.content.length && filtered.length > 0) {
-        msg.content = filtered;
-        changed = true;
-      }
     }
   }
   if (!changed) return body;
@@ -1911,14 +1924,14 @@ function forward(config, req, res, body, log, nonVisionCache, statsCtx = null, p
     if (body.length !== before) log(`stripThinking: dropped thinking block(s) from "${model}" history -> ${route.base_url}`);
   }
 
-  // Schema-safe cross-provider routing: drop server_tool_use blocks whose id the target would
-  // reject (see stripBadServerToolUseBlocks). Opt-in per route — set on a strict, schema-
-  // validating backend (real Anthropic) that receives transcripts carrying server_tool_use ids
-  // minted by another provider.
+  // Schema-safe cross-provider routing: drop foreign server_tool_use/tool_result bookkeeping
+  // the target would reject (see stripBadServerToolUseBlocks). Opt-in per route — set on a
+  // strict, schema-validating backend (real Anthropic) that receives transcripts carrying
+  // tool-use artifacts minted by another provider.
   if (route.stripServerToolUse) {
     const before = body.length;
     body = stripBadServerToolUseBlocks(body);
-    if (body.length !== before) log(`stripServerToolUse: dropped foreign server_tool_use block(s) from "${model}" history -> ${route.base_url}`);
+    if (body.length !== before) log(`stripServerToolUse: dropped foreign tool-use block(s) from "${model}" history -> ${route.base_url}`);
   }
 
   const visionRoute = pickVisionRoute(config.routes);
