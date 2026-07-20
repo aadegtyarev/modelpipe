@@ -1345,8 +1345,22 @@ async function main() {
       check("P0 default: client gets 200", p0.status, 200);
       check("P0 default: offset 0", ps.offset, 0);
 
-      // P1. z 429 → reactive shift to the "sonnet" step → claude backend serves it. offset → 1.
+      // P1-transient. A TRANSIENT rate-limit (retry-worthy 429, no hard-exhaustion signal) is
+      // over-parallelism, not an outage — it must NOT shift the profile. With no queue/retry/pool
+      // configured here it simply relays the 429 to the client; offset stays 0. (The concurrency
+      // limiter is the real cure in production; the point of THIS check is that no MODEL JUMP happens.)
       zStub.setStatus(429); zStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      const zBeforeT = zStub.received.length;
+      const sonBeforeT = sonStub.received.length;
+      const pT = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P1-TRANSIENT" }] });
+      check("P1-transient: z hit (the head)", zStub.received.length, zBeforeT + 1);
+      check("P1-transient: NO shift to claude (transient limit)", sonStub.received.length, sonBeforeT);
+      check("P1-transient: transient 429 relayed to client", pT.status, 429);
+      check("P1-transient: offset stays 0 (no jump)", ps.offset, 0);
+
+      // P1. z 429 HARD-exhaustion (quota exceeded) → reactive shift to the "sonnet" step → claude
+      //     backend serves it. offset → 1. Only a genuine, long-duration exhaustion jumps models.
+      zStub.setStatus(429); zStub.setBody('{"error":{"message":"quota exceeded"}}');
       sonStub.setStatus(200);
       const zBefore1 = zStub.received.length;
       const p1 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P1-BODY" }] });
@@ -1365,8 +1379,8 @@ async function main() {
       check("P2 pre-route: claude served directly", sonStub.received.length, sonBefore2 + 1);
       check("P2 pre-route: client gets 200", p2.status, 200);
 
-      // P3. Cascade end: at the last step, a further limit has nowhere lower → relayed.
-      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      // P3. Cascade end: at the last step, a further HARD-exhaustion limit has nowhere lower → relayed.
+      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"quota exceeded"}}');
       const p3 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P3" }] });
       check("P3 cascade end: last step's 429 relayed", p3.status, 429);
       check("P3 cascade end: offset stays 1", ps.offset, 1);
@@ -1392,7 +1406,7 @@ async function main() {
       //     pin CLEARS and the resolver falls back to default (native → z), which serves it.
       await postJson(pfPort, "/v1/profiles/pin", { profile: "econ" });
       check("P6 setup: pinned econ", ps.pinned, "econ");
-      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"rate limit exceeded"}}');
+      sonStub.setStatus(429); sonStub.setBody('{"error":{"message":"quota exceeded"}}');
       zStub.setStatus(200);
       const zBefore6 = zStub.received.length;
       const p6 = await request(pfPort, { model: "glm-5.2", messages: [{ role: "user", content: "P6" }] });
