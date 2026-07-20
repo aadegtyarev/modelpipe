@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`install.sh` is now the single install/update path; `scripts/deploy.sh` is gone.** The
+  installer takes the target dir as an argument (`install.sh /opt/modelpipe`, or via
+  `curl … | bash -s -- <dir>`), resolving it as: argument → `$MODELPIPE_HOME` → the checkout the
+  script lives in → `~/modelpipe`. On an existing clone it does `git pull --ff-only` **without**
+  re-running the wizard, so `routes.json` / `.env` are left untouched (pass `--reconfigure` to run
+  it anyway), and it restarts the systemd `--user` `modelpipe` service if one exists. The old
+  artifact-based `scripts/deploy.sh` (releases/ + current symlink + external config/) is removed —
+  the router runs straight from a clone. `docs/deploy.md` and the README rewritten to match.
+  Releases are still cut by tag for a pinned tarball and honest `GET /v1/version`.
+
 ## [0.18.2] - 2026-07-20
 
 ### Added

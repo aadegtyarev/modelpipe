@@ -5,7 +5,8 @@ name: release
 #   git push && git push --tags
 # The tag build runs the full suite, packs the dependency-free tarball (npm pack —
 # exactly the files in package.json "files"), and publishes it as a GitHub Release
-# asset. The deploy host installs THAT artifact (scripts/deploy.sh) — never a git clone.
+# asset for anyone who prefers a pinned tarball over tracking main (install.sh runs
+# the router straight from a clone).
 
 on:
   push:

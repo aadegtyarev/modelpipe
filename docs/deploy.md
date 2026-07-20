@@ -1,42 +1,68 @@
 # Deploy
 
-modelpipe ships as a **release artifact**, not a git checkout — so the deploy host is never
-confused with a dev clone, and config is never clobbered by an update.
+modelpipe runs straight from a git clone. `install.sh` clones (or updates) the repo and, on a
+fresh install, runs the setup wizard; config lives in the clone and is never touched by updates.
 
-## Cutting a release (maintainer, dev repo)
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/aadegtyarev/modelpipe/main/install.sh | bash
+curl -fsSL .../install.sh | bash -s -- /opt/modelpipe   # choose the install dir
+```
+
+The install dir is picked in this order: the positional argument → `$MODELPIPE_HOME` → the
+checkout `install.sh` lives in → `~/modelpipe`. A fresh install clones the repo and runs the
+wizard, which writes `routes.json` + `.env` into the dir.
+
+## Update
+
+Re-run `install.sh` (or `./install.sh` from inside the clone):
+
+```sh
+cd ~/modelpipe && ./install.sh          # git pull --ff-only; wizard is NOT re-run
+```
+
+On an existing install it only fast-forwards the clone — your `routes.json` / `.env` are left
+untouched. Pass `--reconfigure` to run the wizard again. Live routing state (profile pin/offset,
+learned windows, dashboard overrides) lives in `~/.modelpipe` and is likewise untouched.
+
+If a systemd `--user` `modelpipe` service exists, `install.sh` restarts it after the update.
+
+## Run in the background (systemd --user)
+
+Point a unit at the clone's entrypoint + config (see also
+[configuration.md](configuration.md)):
+
+```ini
+# ~/.config/systemd/user/modelpipe.service
+[Unit]
+Description=modelpipe — Anthropic-format model router
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node %h/modelpipe/bin/modelpipe.mjs %h/modelpipe/routes.json --env-file %h/modelpipe/.env
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now modelpipe
+systemctl --user status modelpipe
+```
+
+## Cutting a release (maintainer)
+
+Releases are still tagged so `GET /v1/version` reports a real build and the changelog stays
+honest:
 
 ```sh
 npm version 0.9.0 -m "release %s"   # bumps package.json + creates tag v0.9.0
 git push && git push --tags
 ```
 
-The `v*.*.*` tag triggers `.github/workflows/release.yml`: it runs the full suite, checks the
-tag matches `package.json`, `npm pack`s the dependency-free tarball (exactly the files in
-`package.json` → `files`), and publishes it as a **GitHub Release** asset.
-
-## Installing / upgrading (deploy host)
-
-```sh
-scripts/deploy.sh            # install the latest release
-scripts/deploy.sh v0.9.0     # or a specific version
-```
-
-Requires `node` and an authenticated `gh`. Layout under `$MODELPIPE_HOME`
-(default `~/appimages/modelpipe-deploy`):
-
-```
-releases/<tag>/   unpacked artifact (immutable per version)
-current           symlink → active release (atomic flip on upgrade)
-config/           routes.json + .env  ← PRESERVED across upgrades
-```
-
-Live routing state (profile pin/offset, learned windows, dashboard overrides) lives in
-`~/.modelpipe` and is likewise untouched by upgrades.
-
-The script is idempotent: it downloads+unpacks a version once, seeds `config/` from an older
-git-clone deploy on first run (never overwriting), flips the `current` symlink, writes the
-systemd `--user` unit (pointing at `current` + external `config/`), and restarts. Rollback is
-just `scripts/deploy.sh <older-tag>`.
-
-> **Don't run the router from a git clone in production.** A clone invites accidental commits
-> and drifts from `main`. Develop in the dev repo, release by tag, install the artifact here.
+The `v*.*.*` tag triggers `.github/workflows/release.yml`: it runs the full suite, checks the tag
+matches `package.json`, `npm pack`s the dependency-free tarball, and publishes it as a **GitHub
+Release** asset for anyone who prefers a pinned tarball over tracking `main`.
