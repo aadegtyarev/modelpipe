@@ -46,7 +46,7 @@ import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
-  StatsCollector, QuotaPoller, DASHBOARD_HTML,
+  StatsCollector, QuotaPoller, DASHBOARD_HTML, VERSION,
   createUsageTracker, providerIdFromUrl,
   decompressIfNeeded, decompressBuffer,
 } from "./stats.mjs";
@@ -2528,6 +2528,15 @@ export function createRouter(config, options = {}) {
   const learnedWindows = readJson("compact-learned-windows.json", {}) || {};
 
   const server = http.createServer((req, res) => {
+    // GET /v1/version — the running build's version, ALWAYS available (not gated on `dashboard`).
+    // The single authoritative marker of which code is actually live: a deploy of a released
+    // artifact vs a stale process vs a git clone. Secret-free by construction (a version string).
+    if (req.method === "GET" && req.url === "/v1/version") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ version: VERSION }));
+      return;
+    }
+
     // Dashboard endpoints (before body reading)
     if (dashboard && req.method === "GET") {
       if (req.url === "/dashboard") {

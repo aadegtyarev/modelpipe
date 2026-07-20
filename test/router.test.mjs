@@ -1073,6 +1073,15 @@ async function main() {
     const m11post = await request(routerPort, { model: "claude-opus-4-8", messages: [{ role: "user", content: "POST-STILL-ROUTES" }] });
     check("POST /v1/messages still routes after the models intercept", anthropicStub.received.length, anthropicBefore11 + 1);
     check("POST /v1/messages still 200 after the models intercept", m11post.status, 200);
+
+    // 12. GET /v1/version: the running build's version, ALWAYS available (this router config
+    //     leaves dashboard OFF — the endpoint must answer anyway, since its whole purpose is
+    //     diagnosing which build is live). Secret-free; matches package.json.
+    const { VERSION } = await import("../src/stats.mjs");
+    const m12 = await get(routerPort, "/v1/version");
+    check("GET /v1/version ⇒ 200 (even with dashboard off)", m12.status, 200);
+    check("GET /v1/version: reports package.json version", JSON.parse(m12.body).version, VERSION);
+    check("GET /v1/version: version is a non-empty string", typeof JSON.parse(m12.body).version === "string" && JSON.parse(m12.body).version.length > 0, true);
   } finally {
     process.stderr.write = realStderrWrite;
     delete process.env.TEST_ANTHROPIC_KEY;
