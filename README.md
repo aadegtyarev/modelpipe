@@ -21,10 +21,12 @@ npx github:aadegtyarev/modelpipe init          # config wizard → routes.json +
 npx github:aadegtyarev/modelpipe routes.json   # run the proxy
 ```
 
-Or install persistently (clone into `~/modelpipe`, then run the wizard):
+Or install persistently — clones into `~/modelpipe` (override with a dir argument) and runs
+the wizard:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aadegtyarev/modelpipe/main/install.sh | bash
+curl -fsSL .../install.sh | bash -s -- /opt/modelpipe   # choose the install dir
 ```
 
 ## By hand (dev / quick try)
@@ -36,23 +38,18 @@ cp .env.example .env                   # fill in the keys your routes use
 node bin/modelpipe.mjs routes.json     # runs until Ctrl-C; auto-loads .env next to the config
 ```
 
-> A git clone is for development or a quick try. For an always-on host, don't run from a clone —
-> install a **released artifact** instead (below), so the deploy never drifts from `main` or eats
-> an accidental commit.
-
 ## Deploy (always-on host)
 
-Releases are cut by tag (`npm version … && git push --tags`), which builds a dependency-free
-tarball and publishes it as a GitHub Release. The host installs that artifact — not a checkout —
-with config kept **outside** the artifact so upgrades never touch it:
+Re-run `install.sh` to update — it fast-forwards the clone and leaves your `routes.json` / `.env`
+alone (the wizard is not re-run; pass `--reconfigure` to change config):
 
 ```sh
-scripts/deploy.sh            # install the latest release as a systemd --user service
-scripts/deploy.sh v0.9.0     # a specific version; rollback = re-run with an older tag
+cd ~/modelpipe && ./install.sh        # git pull --ff-only, then restart the service if present
 ```
 
-`routes.json` / `.env` live in `~/appimages/modelpipe-deploy/config/` and routing state in
-`~/.modelpipe` — both preserved across upgrades. Full flow in **[docs/deploy.md](docs/deploy.md)**.
+Run it in the background as a systemd `--user` service pointing at the clone. If that service
+exists, `install.sh` restarts it after each update. Full flow — unit file included — in
+**[docs/deploy.md](docs/deploy.md)**.
 
 Then point your client at it:
 
