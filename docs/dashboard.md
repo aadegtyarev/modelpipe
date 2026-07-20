@@ -54,6 +54,7 @@ Override per-model at runtime via Settings (⚙) or `config.tokenPrices`.
 
 | Endpoint | Returns / does |
 | --- | --- |
+| `GET /v1/version` | The running build's version: `{version}`. **Always available — not gated on `dashboard`** — so you can confirm which build is actually live (a deployed artifact vs a stale process). Shown in the dashboard's header badge. |
 | `GET /v1/stats` | Per-model usage, session totals, timeline. |
 | `GET /v1/quotas` | Real provider balances (DeepSeek, OpenRouter). |
 | `GET /v1/sessions` | Archived session history (up to 20). |

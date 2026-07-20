@@ -628,6 +628,20 @@ export class QuotaPoller {
   }
 }
 
+// ── Version ───────────────────────────────────────────────────────────────────
+// Read package.json's version ONCE at module load so it can be surfaced over the API
+// (GET /v1/version) and in the dashboard badge — the single authoritative marker of
+// which build is actually running (a released artifact vs a git clone). Best-effort:
+// a missing/unreadable package.json falls back to "unknown" rather than crashing.
+const PACKAGE_JSON_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+export const VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, "utf8")).version || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 // ── Dashboard HTML ────────────────────────────────────────────────────────────
 // The dashboard page lives as a real, editable file at public/dashboard.html and is
 // read once at module load — no longer a giant template literal buried in this module.

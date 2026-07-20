@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-07-20
+
+### Added
+
+- **`GET /v1/version` + a version badge in the dashboard.** The running build's version is now
+  queryable over HTTP (`{"version":"0.18.2"}`) and shown in the dashboard header badge (the old
+  static `live` label). The endpoint is **not gated on `dashboard`** — it always answers — because
+  its whole purpose is diagnosing which build is actually live: after a deploy you can confirm the
+  new artifact is running instead of a stale process, without shell access to the host. The version
+  is read once from `package.json` at module load (falls back to `"unknown"` if unreadable); the
+  badge falls back to `live` on an older build that lacks the endpoint. Motivated by having no way
+  to tell over the API whether a fix had actually reached the running service.
+
 ## [0.18.1] - 2026-07-20
 
 ### Fixed

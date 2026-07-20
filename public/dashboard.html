@@ -127,7 +127,7 @@ canvas{display:block;width:100%;height:200px}
 </style>
 </head>
 <body>
-<h1>modelpipe <span class="badge">live</span></h1>
+<h1>modelpipe <span class="badge" id="verBadge" title="running build version">live</span></h1>
 <div class="sub">Only measured data — real tokens, real per-token cost on metered providers, real provider balances. Subscription/flat-plan providers show tokens, never a fabricated cost.</div>
 <div class="error" id="e"></div>
 
@@ -937,6 +937,10 @@ function drawChart(timeline){
   for(let i=0;i<bins;i+=step){const x=pad.l+(pw/(bins-1))*i;ctx.fillText(fmtT(start+i*binMs),x,pad.t+ph+12);}
   $("legend").innerHTML=legend.map(l=>'<span><span class="dot" style="background:'+l.color+'"></span>'+escHtml(l.id)+'</span>').join("");
 }
+
+// Version badge: show the running build's version (GET /v1/version). Falls back to "live"
+// if the endpoint is unreachable (e.g. an older build without it).
+fetch("/v1/version").then(r=>r.json()).then(v=>{const b=$("verBadge");if(b&&v&&v.version)b.textContent="v"+v.version;}).catch(()=>{});
 
 load();
 </script>
