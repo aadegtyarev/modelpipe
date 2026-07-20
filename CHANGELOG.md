@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transient 429 no longer jumps models — it queues and self-throttles instead.** A plain
+  rate-limit 429 with no hard-exhaustion signal is OUR over-parallelism (more concurrent requests
+  than the backend serves at once), not a provider outage. Previously, once such a 429 outlived the
+  `auto.retry` budget it stepped the profile ladder down to a weaker fallback model — so two
+  orchestrators sharing one Opus subscription could bounce traffic to a budget model on a momentary
+  spike, then snap back seconds later, over and over. Now a transient 429 NEVER steps the profile:
+  the concurrency limiter's FIFO queue + empirical self-throttle (`reportLimitHit` → lower
+  `effLimit` → requeue) holds the request for the strong model, and on exhaustion an honest 429 is
+  relayed to the client to retry on its own terms. Model jumps stay reserved for a genuine reason to
+  leave the backend: a HARD exhaustion (weekly/monthly quota, credit balance, disabled org/account,
+  payment required — `isRetryWorthy` false), a `529` (the provider signalling its OWN saturation),
+  or a plain `5xx` (provider down). One-line gate in `handleProfileFailover`; the queue, empirical
+  self-throttle, same-target retry, and account rotation are all unchanged and still absorb the
+  transient case. Motivated by a 2-orchestrator setup seeing bursts of faceless 429s on Opus while
+  the daily/weekly token quota sat at ~15–40% utilization — pure ITPM/concurrency throttling that
+  should queue, never downshift.
+
 ## [0.18.0] - 2026-07-18
 
 ### Added

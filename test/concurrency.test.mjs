@@ -295,11 +295,16 @@ async function main() {
     }
   }
 
-  // ── INTEGRATION: queue-wait timeout falls through to model failover ────────
+  // ── INTEGRATION: queue-wait timeout does NOT jump models — it relays a 429 ──
+  // A queue-timeout synthetic 429 is a TRANSIENT over-parallelism signal (we sent more than the
+  // backend serves at once), never a provider outage. It must NOT step the profile ladder to a
+  // weaker model — the request that couldn't get a slot in time is relayed as an honest 429 to the
+  // client (which is free to retry), and the backup is left untouched. This is the core contract:
+  // over-parallelism queues (and, on timeout, 429s) — it never bounces the caller to a lesser model.
   {
     process.env.CONC_KEY = "x";
     const primary = makeGatedStub();   // glm-5.2 — held, so the 2nd request must wait then time out
-    const backup = makeGatedStub();    // deepseek — always-live failover target
+    const backup = makeGatedStub();    // deepseek — would-be failover target; must stay untouched
     backup.setAuto(true);
     const pPort = await listen(primary.server);
     const bPort = await listen(backup.server);
@@ -307,7 +312,6 @@ async function main() {
       listen: { host: "127.0.0.1", port: 0 },
       concurrency: { "glm-5.2": 1 },
       concurrencyQueueTimeoutMs: 1000, // the validated floor — short enough to keep the test quick
-      // A queue-timeout synthetic 429 steps the profile ladder: native → backup (glm-5.2 → deepseek-v4-pro).
       profiles: { native: { bind: {} }, backup: { bind: { "glm-5.2": "deepseek-v4-pro" } } },
       auto: { steps: [{ profile: "native" }, { profile: "backup", when: "limit" }] },
       routes: [
@@ -319,12 +323,12 @@ async function main() {
     try {
       const first = fire(rPort, "glm-5.2");         // takes the single slot, held open at the primary
       await waitFor(() => primary.inFlight === 1);
-      const second = fire(rPort, "glm-5.2");        // queues, waits ~1s, times out → failover → backup
+      const second = fire(rPort, "glm-5.2");        // queues, waits ~1s, times out → relayed 429 (no jump)
       const r2 = await second;
-      check("timeout-failover: queued request rerouted to the backup returns 200", r2.status, 200);
-      check("timeout-failover: the backup backend actually served it", backup.received.length, 1);
-      check("timeout-failover: backup received the rewritten model id", JSON.parse(backup.received[0].body).model, "deepseek-v4-pro");
-      check("timeout-failover: primary still holds only the first request", primary.inFlight, 1);
+      check("timeout-no-jump: queued request relays a 429 (never a model jump)", r2.status, 429);
+      check("timeout-no-jump: backup was NOT hit (no downshift to a weaker model)", backup.received.length, 0);
+      check("timeout-no-jump: primary still holds only the first request", primary.inFlight, 1);
+      check("timeout-no-jump: profile offset stays 0 (no shift)", router._modelpipe.profileState.offset, 0);
       primary.setAuto(true); primary.releaseAll();
       await first;
     } finally {
@@ -389,12 +393,14 @@ async function main() {
     } finally { delete process.env.CONC_KEY; await close(router); await close(stub.server); }
   }
 
-  // C) a PERSISTENTLY 429 backend exhausts the requeue budget and falls through to the normal
-  // failover cascade (a profile step here) rather than requeuing forever.
+  // C) a PERSISTENTLY 429 backend exhausts the requeue budget, then relays an honest 429 —
+  // a transient rate-limit is over-parallelism, NOT a reason to jump to a weaker model. Even when
+  // it never recovers, the request is capped at the requeue budget and the caller gets a 429 to
+  // retry on its own terms; the profile ladder is NOT stepped and the backup stays untouched.
   {
     process.env.CONC_KEY = "x";
     const primary = makeCountingStub(() => 429); // never recovers
-    const backup = makeGatedStub(); backup.setAuto(true); // always-live failover target
+    const backup = makeGatedStub(); backup.setAuto(true); // would-be failover target; must stay untouched
     const pPort = await listen(primary.server);
     const bPort = await listen(backup.server);
     const router = createRouter({
@@ -416,8 +422,9 @@ async function main() {
     try {
       const r = await fire(rPort, "glm-5.2");
       check("self-throttle exhausted: requeue budget capped (1 initial + MAX attempts)", primary.received.length, 1 + 3);
-      check("self-throttle exhausted: falls through to the profile-step failover", r.status, 200);
-      check("self-throttle exhausted: backup actually served it", backup.received.length, 1);
+      check("self-throttle exhausted: relays an honest 429 (no jump to a weaker model)", r.status, 429);
+      check("self-throttle exhausted: backup was NOT hit (no model jump)", backup.received.length, 0);
+      check("self-throttle exhausted: profile offset stays 0 (no shift)", router._modelpipe.profileState.offset, 0);
     } finally { delete process.env.CONC_KEY; await close(router); await close(primary.server); await close(backup.server); }
   }
 

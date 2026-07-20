@@ -1608,6 +1608,17 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
   if (!ps || !config.profiles) { giveUpOrLastResort(); return; }
 
   const errorClass = errorClassOf(status);
+  // A TRANSIENT 429 — a plain rate-limit with no hard-exhaustion signal — is OUR over-parallelism,
+  // not a provider outage: the client fired more concurrent requests than the backend will serve at
+  // once. The concurrency limiter's FIFO queue + empirical self-throttle (reportLimitHit → lower
+  // effLimit → requeue) is the correct cure — the request WAITS for the strong model, it doesn't get
+  // bounced to a weaker one. So such a 429 must NEVER step the profile ladder down. What DOES still
+  // shift: a HARD exhaustion (weekly/monthly quota, credit balance, disabled org/account, payment
+  // required — a 429/400 with isRetryWorthy false, a genuine multi-day block), a 529 "overloaded"
+  // (the PROVIDER signalling its OWN saturation, not ours), or a plain 5xx (provider actually down).
+  // Without this gate, a transient 429 that outlives the retry budget jumps to the fallback profile —
+  // exactly the "10 orchestrators overwhelm Opus so we bounce to a weaker model" behaviour to avoid.
+  const transientLimit = status === 429 && isRetryWorthy(status, buffered);
   if (ps.pinned) {
     ctx.log(`profile: failover under manual pin "${ps.pinned}" — clearing pin (safety armed)`);
     ps.pinned = null;
@@ -1619,7 +1630,7 @@ function handleProfileFailover(ctx, status, buffered, headers, hop) {
   const steps = (config.auto && Array.isArray(config.auto.steps)) ? config.auto.steps : [];
   const last = steps.length - 1;
   const curEff = basePos < 0 ? -1 : Math.min(basePos + (ps.offset || 0), last);
-  if (curEff >= 0 && ctx.profileEffIndex === curEff && curEff < last && stepAdvancesOn(config, curEff, errorClass)) {
+  if (!transientLimit && curEff >= 0 && ctx.profileEffIndex === curEff && curEff < last && stepAdvancesOn(config, curEff, errorClass)) {
     ps.offset = (curEff + 1) - basePos;
     ps.shiftedAt = now; ps.attempts = 0;
     persistProfileState(ps);
